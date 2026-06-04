@@ -1,0 +1,25 @@
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# auwsx runtime data (lives in ~/.local/share/auwsx and ~/.auwsx — never in-repo)
+.auwsx/
+
+# Node (v0.2 React)
+node_modules/
+dist/
+build/
+.vite/
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local env
+.env
+.env.local
+
+# Skills cache (skills/ is a bundle source; consumers install via auwsx-core::skills)
+skills/.cache/

@@ -1,0 +1,27 @@
+[package]
+name = "auwsx-web"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "auwsx web front-end. v0.2 ship target. Thin axum translator over the daemon IPC socket."
+
+[[bin]]
+name = "auwsx-web"
+path = "src/main.rs"
+
+[dependencies]
+auwsx-core = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+# rust-embed = { workspace = true }  # for embedding built React bundle
