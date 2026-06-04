@@ -31,7 +31,7 @@ notify = { workspace = true }
 nix = { workspace = true }
 directories = { workspace = true }
 
-# wsx-core = { workspace = true }   # TODO uncomment after wsx-core lib crate is extracted
+wsx-core = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
