@@ -35,3 +35,8 @@ wsx-core = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
+
+[dev-dependencies]
+tokio = { workspace = true }
+sqlx = { workspace = true }
+tempfile = "3"
