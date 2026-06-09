@@ -17,8 +17,10 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 ## Key Files (planned, mostly stubs at scaffold time)
 
 - `crates/auwsx-core/src/state.rs` — `IssueStatus` enum + scheduler classes + transition matrix
-- `crates/auwsx-core/src/pipeline.rs` — one async fn per actionable phase
-- `crates/auwsx-core/src/scheduler.rs` — per-project tokio ticker (issues + routines)
+- `crates/auwsx-core/src/pipeline.rs` — pure `plan_phase` (status→role) + `execute` (worktree→prompt→spawn→record); ports in `Deps`
+- `crates/auwsx-core/src/scheduler.rs` — pure `decide` (issues→`Decision`s) + `Scheduler` runtime (per-tick dispatch, running-set, soft-gate, teardown)
+- `crates/auwsx-core/src/{clock,worktree,prompt}.rs` — ports/adapters: `Clock`+`SystemClock`; `Worktrees`+`WsxWorktrees` (wsx-core); per-phase prompt builder
+- `crates/auwsx-core/src/agent/mod.rs` also defines the `AgentExecutor` port + `SubprocessExecutor` (the test seam for the drive loop)
 - `crates/auwsx-core/src/backlog.rs` — backlog_items CRUD (source/approval) + triage/consolidation
 - `crates/auwsx-core/src/steering.rs` — append-only steering into in-flight issues
 - `crates/auwsx-core/src/main_jobs.rs` — main-workspace lifecycle, queued ops

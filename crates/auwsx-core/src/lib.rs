@@ -23,6 +23,7 @@
 
 pub mod agent;
 pub mod backlog;
+pub mod clock;
 pub mod config;
 pub mod db;
 pub mod events;
@@ -32,10 +33,12 @@ pub mod launchd;
 pub mod main_jobs;
 pub mod notify;
 pub mod pipeline;
+pub mod prompt;
 pub mod routines;
 pub mod scheduler;
 pub mod skills;
 pub mod state;
 pub mod steering;
+pub mod worktree;
 
 pub use anyhow::{Error, Result};

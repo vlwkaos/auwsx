@@ -360,9 +360,16 @@ impl Parsed {
 // Runtime glue
 // ---------------------------------------------------------------------------
 
-/// Run the daemon in the foreground until SIGINT or a `Shutdown` command.
+/// Run the daemon in the foreground until SIGINT or a `Shutdown` command. Runs
+/// the IPC server and the autonomous scheduler concurrently over one DB + event
+/// bus; the agents the scheduler spawns call back through this same socket.
 pub async fn run_daemon() -> Result<()> {
+    use auwsx_core::agent::subprocess_executor;
+    use auwsx_core::clock;
     use auwsx_core::db::Db;
+    use auwsx_core::scheduler::Scheduler;
+    use auwsx_core::worktree::WsxWorktrees;
+    use std::time::Duration;
 
     let db = Db::open().await.context("opening database")?;
     let bus = events::channel();
@@ -376,10 +383,36 @@ pub async fn run_daemon() -> Result<()> {
         }
     });
 
+    // Scheduler tick cadence: how often issue status is re-read and dispatched.
+    // Short so the loop reacts promptly when an agent advances an issue; the
+    // running-set prevents re-spawning a still-live agent.
+    let tick_secs = std::env::var("AUWSX_TICK_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10)
+        .max(1);
+    let scheduler = Scheduler::new(
+        db.clone(),
+        clock::system(),
+        subprocess_executor(),
+        Arc::new(WsxWorktrees),
+        bus.clone(),
+        socket.clone(),
+        Duration::from_secs(tick_secs),
+    );
+    let sched_stop = Arc::new(Notify::new());
+    let sched_stop_run = sched_stop.clone();
+    let sched_task = tokio::spawn(async move { scheduler.run(sched_stop_run).await });
+
     println!("auwsx daemon listening on {}", socket.display());
-    ipc::serve(db, bus, &socket, shutdown)
-        .await
-        .context("ipc server")?;
+    println!("scheduler ticking every {tick_secs}s");
+    let serve_result = ipc::serve(db, bus, &socket, shutdown).await;
+
+    // IPC server stopped (SIGINT or `daemon stop`) — drain the scheduler too.
+    sched_stop.notify_one();
+    let _ = sched_task.await;
+
+    serve_result.context("ipc server")?;
     println!("auwsx daemon stopped");
     Ok(())
 }

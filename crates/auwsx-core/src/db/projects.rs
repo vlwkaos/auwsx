@@ -110,6 +110,19 @@ pub struct NewProject<'a> {
 }
 
 impl Project {
+    /// The agent command template for a phase role. `Review` falls back to the
+    /// work command when `review_agent_cmd` is unset (a fresh work-agent session
+    /// is still a valid third eye).
+    pub fn agent_cmd_for(&self, role: crate::db::agent_runs::Role) -> &str {
+        use crate::db::agent_runs::Role;
+        match role {
+            Role::Main => &self.main_agent_cmd,
+            Role::Plan => &self.plan_agent_cmd,
+            Role::Work => &self.work_agent_cmd,
+            Role::Review => self.review_agent_cmd.as_deref().unwrap_or(&self.work_agent_cmd),
+        }
+    }
+
     fn from_row(row: &SqliteRow) -> Result<Self> {
         let merge_raw: String = row.try_get("merge_mode")?;
         let policy_raw: String = row.try_get("completion_policy")?;

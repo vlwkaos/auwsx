@@ -24,6 +24,7 @@ pub mod opencode;
 
 use crate::Result;
 use anyhow::{anyhow, Context};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
@@ -198,6 +199,31 @@ fn classify(status: &std::process::ExitStatus) -> ExitKind {
     } else {
         ExitKind::Killed
     }
+}
+
+/// Port the pipeline spawns through. The production adapter ([`SubprocessExecutor`])
+/// delegates to [`run`]; tests substitute a fake that reads `AUWSX_ISSUE_ID` from
+/// `spec.env` and applies the status change a real agent would make via the
+/// control CLI — making the whole drive loop deterministic without real agents.
+#[async_trait]
+pub trait AgentExecutor: Send + Sync {
+    async fn execute(&self, spec: AgentSpec<'_>) -> Result<AgentOutcome>;
+}
+
+/// Production executor: spawns the real agent process.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubprocessExecutor;
+
+#[async_trait]
+impl AgentExecutor for SubprocessExecutor {
+    async fn execute(&self, spec: AgentSpec<'_>) -> Result<AgentOutcome> {
+        run(spec).await
+    }
+}
+
+/// Convenience: a shared production executor behind the port.
+pub fn subprocess_executor() -> std::sync::Arc<dyn AgentExecutor> {
+    std::sync::Arc::new(SubprocessExecutor)
 }
 
 #[cfg(test)]

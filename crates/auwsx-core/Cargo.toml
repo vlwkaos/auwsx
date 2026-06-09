@@ -39,4 +39,5 @@ path = "src/lib.rs"
 [dev-dependencies]
 tokio = { workspace = true }
 sqlx = { workspace = true }
+async-trait = { workspace = true }
 tempfile = "3"
