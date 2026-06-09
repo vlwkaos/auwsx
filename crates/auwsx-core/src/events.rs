@@ -46,4 +46,16 @@ pub enum Event {
     },
 }
 
-// TODO: pub fn channel() -> (broadcast::Sender<Event>, broadcast::Receiver<Event>)
+/// Capacity of the broadcast buffer. A slow subscriber that lags past this many
+/// events gets a `RecvError::Lagged` (and should resync from the DB) rather than
+/// blocking the daemon — events are advisory, the DB is the source of truth.
+pub const CHANNEL_CAPACITY: usize = 1024;
+
+/// Create the daemon's event bus. The daemon holds the [`Sender`]; each IPC
+/// `Subscribe` connection gets a [`Receiver`] via `sender.subscribe()`.
+///
+/// [`Sender`]: tokio::sync::broadcast::Sender
+/// [`Receiver`]: tokio::sync::broadcast::Receiver
+pub fn channel() -> tokio::sync::broadcast::Sender<Event> {
+    tokio::sync::broadcast::Sender::new(CHANNEL_CAPACITY)
+}

@@ -23,6 +23,16 @@ Pairs to keep in lockstep (`src/db/migrations/0001_init.sql` is source of truth)
 | `backlog::Source` (snake) | `backlog_items.source` |
 | `backlog::Approval` (snake) | `backlog_items.approval` |
 | `steering::SteeringSource` (snake) | `steering.source` |
+| `db::projects::MergeMode` (snake) | `projects.merge_mode` |
+| `db::projects::CompletionPolicy` (snake) | `projects.completion_policy` |
+| `db::findings::Severity` (snake) | `findings.severity` |
+| `db::findings::FindingStatus` (snake) | `findings.status` |
+
+These enums use hand-rolled `as_str`/`from_str` (NOT serde) for the SQL bind,
+mirroring `IssueStatus`. `tests/crud.rs` proves parity at runtime with a
+positive-control insert per enum (a valid `as_str()` value must pass the CHECK)
+plus a `from_str(as_str()) == Some(v)` round-trip — so a drift fails a test, not
+just the diff below.
 
 Check:
 ```bash

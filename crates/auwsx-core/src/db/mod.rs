@@ -22,6 +22,19 @@ use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+// Typed row + CRUD modules for the core entities that have no behaviour module
+// of their own. (backlog_items + steering live in the top-level `backlog` /
+// `steering` modules, alongside their gating logic.)
+pub mod findings;
+pub mod issues;
+pub mod projects;
+pub mod subtasks;
+
+pub use findings::Finding;
+pub use issues::Issue;
+pub use projects::Project;
+pub use subtasks::Subtask;
+
 /// Embedded migration set. `sqlx::migrate!` reads `./migrations/` at compile
 /// time relative to this file, so the SQL is baked into the binary; no
 /// runtime filesystem dependency for migrations.

@@ -11,18 +11,30 @@
 //! TUI auto-starts the daemon (forks + waits for socket) if none is running.
 
 mod app;
+mod cli;
 mod editor;
 mod input;
 mod ui;
 
 use anyhow::Result;
+use cli::CliAction;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // TODO: clap-less arg parse (we want to stay light); dispatch to subcommand.
-    // TODO: ensure inside tmux (same constraint wsx has) — error out otherwise.
-    // TODO: connect to daemon socket; auto-start if absent.
-    // TODO: run app::App::run() — ratatui loop subscribed to Event stream.
-    eprintln!("auwsx scaffold — see plan ~/.claude/plans/current-wsx-is-agent-cosmic-gadget.md");
-    Ok(())
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match cli::parse(&args)? {
+        CliAction::Daemon => cli::run_daemon().await,
+        CliAction::Request(cmd) => cli::run_request(cmd).await,
+        CliAction::Help => {
+            cli::print_usage();
+            Ok(())
+        }
+        // TODO(tui slice): ensure inside tmux, auto-start daemon, run the
+        // ratatui loop subscribed to the IPC Event stream. Until then, point the
+        // user at the working CLI surface.
+        CliAction::Tui => {
+            eprintln!("auwsx: TUI not yet implemented — run `auwsx help` for the CLI.");
+            Ok(())
+        }
+    }
 }

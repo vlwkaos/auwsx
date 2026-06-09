@@ -24,9 +24,11 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - `crates/auwsx-core/src/main_jobs.rs` — main-workspace lifecycle, queued ops
 - `crates/auwsx-core/src/routines.rs` — cron routines (incl. built-ins: triage, deepsleep, dream, morning-summary)
 - `crates/auwsx-core/src/inbox.rs` — `notify` watcher on `~/.auwsx/inbox/*.txt`
-- `crates/auwsx-core/src/agent/{claude,codex,opencode}.rs` — `AgentRunner` impls
-- `crates/auwsx-core/src/ipc.rs` — Unix-socket `Command`/`Event` protocol
+- `crates/auwsx-core/src/agent/{claude,codex,opencode}.rs` — `AgentRunner` impls (stubs)
+- `crates/auwsx-core/src/ipc.rs` — Unix-socket `Command`/`Response`/`Event` protocol + `serve`/`request`/`EventStream` + unit-testable `dispatch`
+- `crates/auwsx-core/src/db/{projects,issues,subtasks,findings}.rs` — typed row structs + CRUD (issues/backlog/steering/findings persistence; `db/mod.rs` re-exports the row types)
 - `crates/auwsx-core/src/db/migrations/0001_init.sql` — full schema
+- `crates/auwsx-tui/src/cli.rs` — `auwsx` CLI: pure `parse` (arg grammar) + `run_daemon`/`run_request` IPC client glue
 - `crates/auwsx-tui/src/app.rs` — ratatui top-level state + view router
 - `crates/auwsx-tui/src/input.rs` — keybind table
 

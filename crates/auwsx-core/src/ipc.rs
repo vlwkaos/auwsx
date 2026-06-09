@@ -1,78 +1,651 @@
-//! Unix-socket Command/Event protocol. Plan Step 7.
+//! Unix-socket Command/Response/Event protocol. Design: revised issue model.
 //!
-//! Socket path: `$XDG_RUNTIME_DIR/auwsx.sock` (fallback `~/.cache/auwsx/sock`).
-//! Wire format: JSON-lines (one Command or Event per line, terminated by `\n`).
+//! Socket path: `$AUWSX_SOCK`, else `$XDG_RUNTIME_DIR/auwsx.sock`, else the
+//! platform cache dir, else `$TMPDIR/auwsx.sock`. Wire format is JSON-lines: one
+//! [`Command`] or [`Response`] per `\n`-terminated line.
 //!
-//! Front-ends (TUI v0.1, web v0.2) connect, send Commands, subscribe to Events.
-//! The daemon owns the SQLite write path. Multiple clients can connect simultaneously.
+//! The daemon owns the only SQLite write path. Both front-ends (TUI/web) and the
+//! agent control CLI are clients; they issue the SAME [`Command`] set. (Agent
+//! scoping — restricting a spawned agent to its own issue — is layered on top by
+//! the runner via a per-run token; this module carries every op.)
+//!
+//! [`dispatch`] is the pure request handler (DB + event bus in, [`Response`]
+//! out) and is unit-tested directly without a socket; [`serve`] / [`request`]
+//! are the thin transport around it.
 
+use crate::backlog::{self, Approval, BacklogItem, Source};
+use crate::db::{
+    findings::{self, Finding, NewFinding, Severity},
+    issues::{self, Issue},
+    projects::{self, NewProject, Project},
+    subtasks::{self, Subtask},
+    Db,
+};
 use crate::events::Event;
+use crate::state::IssueStatus;
+use crate::steering::{self, Steering, SteeringSource};
+use crate::Result;
+use anyhow::Context;
+use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{broadcast, Notify};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One request from a client to the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
     Ping,
 
-    // Project CRUD
+    // --- projects ---
     ListProjects,
-    AddProject { repo_path: String, agent: String, schedule_min: u32 },
-    PatchProject { project_id: i64, /* TODO field set */ },
-    DeleteProject { project_id: i64 },
+    GetProject {
+        project_id: i64,
+    },
+    AddProject {
+        name: String,
+        repo_path: String,
+        default_branch: String,
+        main_agent_cmd: String,
+        plan_agent_cmd: String,
+        work_agent_cmd: String,
+        review_agent_cmd: Option<String>,
+    },
 
-    // Task CRUD
-    ListTasks { project_id: i64 },
-    NewTaskDirect { project_id: i64, title: String, description: Option<String> },
-    PatchTaskBody { task_id: i64, title: Option<String>, description: Option<String> },
-    RunTaskNow { task_id: i64 },
-    CompleteTask { task_id: i64 },
-    DeleteTask { task_id: i64 },
+    // --- backlog ---
+    ListBacklog {
+        project_id: i64,
+        approval: Option<Approval>,
+    },
+    AddBacklog {
+        project_id: i64,
+        text: String,
+        source: Source,
+    },
+    ApproveBacklog {
+        item_id: i64,
+    },
+    DismissBacklog {
+        item_id: i64,
+    },
+    /// Promote approved, ungrouped backlog items into issues (one issue each).
+    Triage {
+        project_id: i64,
+    },
 
-    // Drafts
-    ListDrafts { project_id: i64 },
-    AddDraft { project_id: i64, body: String },
-    EditDraft { draft_id: i64, body: String },
-    DeleteDraft { draft_id: i64 },
-    TriageNow { project_id: i64 },
+    // --- issues ---
+    ListIssues {
+        project_id: i64,
+        status: Option<IssueStatus>,
+    },
+    GetIssue {
+        issue_id: i64,
+    },
+    AddIssue {
+        project_id: i64,
+        title: String,
+        description: Option<String>,
+    },
+    SetIssueStatus {
+        issue_id: i64,
+        status: IssueStatus,
+        /// Human override: skip the legal-transition check.
+        force: bool,
+    },
 
-    // Followups
-    ListFollowups { task_id: i64 },
-    AddFollowup { task_id: i64, body: String },
-    EditFollowup { followup_id: i64, body: String },
-    DeleteFollowup { followup_id: i64 },
+    // --- subtasks ---
+    ListSubtasks {
+        issue_id: i64,
+    },
+    AddSubtask {
+        issue_id: i64,
+        ord: i64,
+        text: String,
+    },
+    CompleteSubtask {
+        subtask_id: i64,
+    },
 
-    // Feedback
-    SubmitFeedback { task_id: i64, body: String },
+    // --- findings ---
+    ListFindings {
+        issue_id: i64,
+        open_only: bool,
+    },
+    AddFinding {
+        issue_id: i64,
+        review_round: i64,
+        severity: Severity,
+        lens: Option<String>,
+        title: String,
+        detail: Option<String>,
+        file_ref: Option<String>,
+    },
+    AcceptFinding {
+        finding_id: i64,
+        rationale: String,
+    },
+    RejectFinding {
+        finding_id: i64,
+        rationale: String,
+    },
+    DismissFinding {
+        finding_id: i64,
+    },
 
-    // Routines
-    ListRoutines { project_id: i64 },
-    AddRoutine { project_id: i64, name: String, cron: String, prompt: String, output_target: Option<String> },
-    PatchRoutine { routine_id: i64, /* TODO field set */ },
-    DeleteRoutine { routine_id: i64 },
-    RunRoutineNow { routine_id: i64 },
-    ToggleRoutine { routine_id: i64, enabled: bool },
+    // --- steering ---
+    ListSteering {
+        issue_id: i64,
+        pending_only: bool,
+    },
+    AddSteering {
+        issue_id: i64,
+        source: SteeringSource,
+        note: String,
+    },
+    ConsumeSteering {
+        issue_id: i64,
+    },
 
-    // Main jobs
-    ListMainJobs { project_id: i64 },
-    EnqueueOneoff { project_id: i64, kind: String, prompt: Option<String> },
-
-    // Subscription
+    // --- lifecycle ---
+    /// Open an event subscription on this connection (server streams
+    /// `Response::Event` lines until the client disconnects).
     Subscribe,
+    /// Ask the daemon to shut down gracefully.
+    Shutdown,
 }
 
+/// One reply from the daemon. Request/response is one [`Response`] per
+/// [`Command`]; a `Subscribe` connection then streams `Event` variants.
+///
+/// Adjacent tagging (`kind` + `data`) is required, not internal tagging: several
+/// variants wrap a primitive (`Id(i64)`), a sequence (`Projects(Vec<_>)`), or an
+/// option (`Project(Option<_>)`), none of which serde_json can serialize under
+/// an internal `tag`. Adjacent tagging puts the payload in its own `data` field,
+/// so every variant shape round-trips.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
     Ok,
     Err { message: String },
-    Projects(serde_json::Value),
-    Tasks(serde_json::Value),
-    Drafts(serde_json::Value),
-    Followups(serde_json::Value),
-    Routines(serde_json::Value),
-    MainJobs(serde_json::Value),
+    Id(i64),
+    Projects(Vec<Project>),
+    Project(Option<Project>),
+    Backlog(Vec<BacklogItem>),
+    Issues(Vec<Issue>),
+    Issue(Option<Issue>),
+    Subtasks(Vec<Subtask>),
+    Findings(Vec<Finding>),
+    Steering(Vec<Steering>),
+    Triaged { created_issue_ids: Vec<i64> },
     Event(Event),
 }
 
-// TODO: server: listen on socket, accept connections, spawn per-client tasks
-// TODO: client: connect, send Command, await Response stream
+impl Response {
+    fn err(e: impl std::fmt::Display) -> Self {
+        Response::Err {
+            message: e.to_string(),
+        }
+    }
+}
+
+/// Resolve the socket path: `$AUWSX_SOCK` override, then `$XDG_RUNTIME_DIR`,
+/// then the platform cache dir, then `$TMPDIR`.
+pub fn default_socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUWSX_SOCK") {
+        return PathBuf::from(p);
+    }
+    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+        if !rt.is_empty() {
+            return PathBuf::from(rt).join("auwsx.sock");
+        }
+    }
+    if let Some(dirs) = ProjectDirs::from("", "", "auwsx") {
+        return dirs.cache_dir().join("auwsx.sock");
+    }
+    std::env::temp_dir().join("auwsx.sock")
+}
+
+/// Daemon wall clock (epoch ms). The daemon is the single clock owner; the CRUD
+/// layer takes `now` explicitly so it stays deterministic under test.
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Handle one command against the database, emitting events for state changes.
+/// `now` is the timestamp to stamp writes with (injected for testability).
+///
+/// `Subscribe`/`Shutdown` are lifecycle signals handled by the transport layer;
+/// here they just return `Ok`.
+pub async fn dispatch(
+    db: &Db,
+    events: &broadcast::Sender<Event>,
+    now: i64,
+    cmd: Command,
+) -> Response {
+    match dispatch_inner(db, events, now, cmd).await {
+        Ok(resp) => resp,
+        Err(e) => Response::err(e),
+    }
+}
+
+async fn dispatch_inner(
+    db: &Db,
+    events: &broadcast::Sender<Event>,
+    now: i64,
+    cmd: Command,
+) -> Result<Response> {
+    let pool = db.pool();
+    Ok(match cmd {
+        Command::Ping | Command::Subscribe | Command::Shutdown => Response::Ok,
+
+        // --- projects ---
+        Command::ListProjects => Response::Projects(projects::list(pool).await?),
+        Command::GetProject { project_id } => {
+            Response::Project(projects::get(pool, project_id).await?)
+        }
+        Command::AddProject {
+            name,
+            repo_path,
+            default_branch,
+            main_agent_cmd,
+            plan_agent_cmd,
+            work_agent_cmd,
+            review_agent_cmd,
+        } => {
+            let id = projects::create(
+                pool,
+                NewProject {
+                    name: &name,
+                    repo_path: &repo_path,
+                    default_branch: &default_branch,
+                    main_agent_cmd: &main_agent_cmd,
+                    plan_agent_cmd: &plan_agent_cmd,
+                    work_agent_cmd: &work_agent_cmd,
+                    review_agent_cmd: review_agent_cmd.as_deref(),
+                },
+                now,
+            )
+            .await?;
+            Response::Id(id)
+        }
+
+        // --- backlog ---
+        Command::ListBacklog {
+            project_id,
+            approval,
+        } => {
+            let items = match approval {
+                Some(a) => backlog::list_by_approval(pool, project_id, a).await?,
+                None => backlog::list_by_project(pool, project_id).await?,
+            };
+            Response::Backlog(items)
+        }
+        Command::AddBacklog {
+            project_id,
+            text,
+            source,
+        } => {
+            let id = backlog::add(pool, project_id, &text, source, None, now).await?;
+            emit(
+                events,
+                Event::BacklogChanged {
+                    item_id: id,
+                    project_id,
+                    approval: source.default_approval().as_str().to_string(),
+                },
+            );
+            Response::Id(id)
+        }
+        Command::ApproveBacklog { item_id } => {
+            backlog::approve(pool, item_id, now).await?;
+            emit_backlog_changed(events, pool, item_id, "approved").await;
+            Response::Ok
+        }
+        Command::DismissBacklog { item_id } => {
+            backlog::dismiss(pool, item_id, now).await?;
+            emit_backlog_changed(events, pool, item_id, "dismissed").await;
+            Response::Ok
+        }
+        Command::Triage { project_id } => {
+            let created = backlog::run_triage(pool, project_id, now).await?;
+            Response::Triaged {
+                created_issue_ids: created,
+            }
+        }
+
+        // --- issues ---
+        Command::ListIssues { project_id, status } => {
+            let issues = match status {
+                Some(s) => issues::list_by_status(pool, project_id, s).await?,
+                None => issues::list_by_project(pool, project_id).await?,
+            };
+            Response::Issues(issues)
+        }
+        Command::GetIssue { issue_id } => Response::Issue(issues::get(pool, issue_id).await?),
+        Command::AddIssue {
+            project_id,
+            title,
+            description,
+        } => {
+            let id = issues::create(pool, project_id, &title, description.as_deref(), now).await?;
+            Response::Id(id)
+        }
+        Command::SetIssueStatus {
+            issue_id,
+            status,
+            force,
+        } => {
+            if force {
+                issues::force_status(pool, issue_id, status, now).await?;
+            } else {
+                issues::transition(pool, issue_id, status, now).await?;
+            }
+            emit(events, Event::IssueStatus { issue_id, status });
+            Response::Ok
+        }
+
+        // --- subtasks ---
+        Command::ListSubtasks { issue_id } => {
+            Response::Subtasks(subtasks::list_by_issue(pool, issue_id).await?)
+        }
+        Command::AddSubtask {
+            issue_id,
+            ord,
+            text,
+        } => Response::Id(subtasks::add(pool, issue_id, ord, &text, now).await?),
+        Command::CompleteSubtask { subtask_id } => {
+            subtasks::mark_done(pool, subtask_id, now).await?;
+            Response::Ok
+        }
+
+        // --- findings ---
+        Command::ListFindings {
+            issue_id,
+            open_only,
+        } => {
+            let f = if open_only {
+                findings::list_open(pool, issue_id).await?
+            } else {
+                findings::list_by_issue(pool, issue_id).await?
+            };
+            Response::Findings(f)
+        }
+        Command::AddFinding {
+            issue_id,
+            review_round,
+            severity,
+            lens,
+            title,
+            detail,
+            file_ref,
+        } => {
+            let id = findings::add(
+                pool,
+                NewFinding {
+                    issue_id,
+                    review_round,
+                    severity,
+                    lens: lens.as_deref(),
+                    title: &title,
+                    detail: detail.as_deref(),
+                    file_ref: file_ref.as_deref(),
+                },
+                now,
+            )
+            .await?;
+            emit(events, Event::FindingAdded { finding_id: id, issue_id });
+            Response::Id(id)
+        }
+        Command::AcceptFinding {
+            finding_id,
+            rationale,
+        } => {
+            findings::accept(pool, finding_id, &rationale, now).await?;
+            Response::Ok
+        }
+        Command::RejectFinding {
+            finding_id,
+            rationale,
+        } => {
+            findings::reject(pool, finding_id, &rationale, now).await?;
+            Response::Ok
+        }
+        Command::DismissFinding { finding_id } => {
+            findings::dismiss(pool, finding_id, now).await?;
+            Response::Ok
+        }
+
+        // --- steering ---
+        Command::ListSteering {
+            issue_id,
+            pending_only: _,
+        } => {
+            // Only pending steering has a CRUD reader today (it is the meaningful
+            // set — consumed notes are history); `pending_only` is reserved for a
+            // future "all steering" view.
+            Response::Steering(steering::list_pending(pool, issue_id).await?)
+        }
+        Command::AddSteering {
+            issue_id,
+            source,
+            note,
+        } => {
+            let id = steering::add(pool, issue_id, source, &note, now).await?;
+            emit(events, Event::SteeringAdded { steering_id: id, issue_id });
+            Response::Id(id)
+        }
+        Command::ConsumeSteering { issue_id } => {
+            steering::consume_all(pool, issue_id, now).await?;
+            Response::Ok
+        }
+    })
+}
+
+/// Send an event, ignoring "no subscribers" (events are advisory).
+fn emit(events: &broadcast::Sender<Event>, ev: Event) {
+    let _ = events.send(ev);
+}
+
+/// Look up a backlog item's project to emit a `BacklogChanged` after a state
+/// change. Best-effort: a lookup miss just skips the event.
+async fn emit_backlog_changed(
+    events: &broadcast::Sender<Event>,
+    pool: &sqlx::SqlitePool,
+    item_id: i64,
+    approval: &str,
+) {
+    if let Ok(Some(item)) = backlog::get(pool, item_id).await {
+        emit(
+            events,
+            Event::BacklogChanged {
+                item_id,
+                project_id: item.project_id,
+                approval: approval.to_string(),
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+/// Run the IPC server until `shutdown` is notified (a `Shutdown` command also
+/// triggers it). Binds `socket`, removing a stale file first; removes the file
+/// on exit. Each connection is served on its own task.
+pub async fn serve(
+    db: Db,
+    events: broadcast::Sender<Event>,
+    socket: &Path,
+    shutdown: Arc<Notify>,
+) -> Result<()> {
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket dir {}", parent.display()))?;
+    }
+    // A leftover socket from a crashed daemon would make bind() fail with
+    // EADDRINUSE even though nobody is listening; clear it first.
+    if socket.exists() {
+        std::fs::remove_file(socket).ok();
+    }
+    let listener = UnixListener::bind(socket)
+        .with_context(|| format!("binding unix socket {}", socket.display()))?;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted.context("accepting connection")?;
+                let db = db.clone();
+                let events = events.clone();
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_conn(stream, db, events, shutdown).await {
+                        tracing::debug!("ipc connection ended: {e:#}");
+                    }
+                });
+            }
+        }
+    }
+
+    std::fs::remove_file(socket).ok();
+    Ok(())
+}
+
+async fn handle_conn(
+    stream: UnixStream,
+    db: Db,
+    events: broadcast::Sender<Event>,
+    shutdown: Arc<Notify>,
+) -> Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cmd: Command = match serde_json::from_str(&line) {
+            Ok(c) => c,
+            Err(e) => {
+                write_line(&mut write_half, &Response::err(format!("bad command: {e}"))).await?;
+                continue;
+            }
+        };
+
+        match cmd {
+            Command::Subscribe => {
+                write_line(&mut write_half, &Response::Ok).await?;
+                stream_events(&mut write_half, events.subscribe()).await?;
+                return Ok(()); // subscription owns the connection for its lifetime
+            }
+            Command::Shutdown => {
+                write_line(&mut write_half, &Response::Ok).await?;
+                shutdown.notify_one();
+                return Ok(());
+            }
+            other => {
+                let resp = dispatch(&db, &events, now_ms(), other).await;
+                write_line(&mut write_half, &resp).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Forward broadcast events to a subscribed client until it disconnects or the
+/// channel closes. A lagging client (buffer overrun) is skipped forward, not
+/// dropped — it should resync from the DB.
+async fn stream_events<W>(write: &mut W, mut rx: broadcast::Receiver<Event>) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                if write_line(write, &Response::Event(ev)).await.is_err() {
+                    break; // client gone
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    Ok(())
+}
+
+async fn write_line<W>(write: &mut W, resp: &Response) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut buf = serde_json::to_vec(resp)?;
+    buf.push(b'\n');
+    write.write_all(&buf).await?;
+    write.flush().await?;
+    Ok(())
+}
+
+/// One-shot request/response: connect, send `cmd`, read one `Response`.
+pub async fn request(socket: &Path, cmd: &Command) -> Result<Response> {
+    let mut stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connecting to daemon at {}", socket.display()))?;
+    let mut buf = serde_json::to_vec(cmd)?;
+    buf.push(b'\n');
+    stream.write_all(&buf).await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).await?;
+    if n == 0 {
+        anyhow::bail!("daemon closed connection without responding");
+    }
+    Ok(serde_json::from_str(&line)?)
+}
+
+/// A live event subscription. Each [`next`](EventStream::next) yields one
+/// daemon [`Event`]; `None` means the daemon closed the connection.
+pub struct EventStream {
+    lines: tokio::io::Lines<BufReader<UnixStream>>,
+}
+
+impl EventStream {
+    /// Connect and open a subscription. Consumes the leading `Response::Ok`
+    /// acknowledgement so the first [`next`](EventStream::next) yields an event.
+    pub async fn connect(socket: &Path) -> Result<Self> {
+        let mut stream = UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("connecting to daemon at {}", socket.display()))?;
+        let mut buf = serde_json::to_vec(&Command::Subscribe)?;
+        buf.push(b'\n');
+        stream.write_all(&buf).await?;
+        stream.flush().await?;
+
+        let mut lines = BufReader::new(stream).lines();
+        // Drain the Ok ack.
+        match lines.next_line().await? {
+            Some(_) => {}
+            None => anyhow::bail!("daemon closed subscription immediately"),
+        }
+        Ok(EventStream { lines })
+    }
+
+    /// Next event, or `None` when the daemon disconnects.
+    pub async fn next(&mut self) -> Result<Option<Event>> {
+        let Some(line) = self.lines.next_line().await? else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<Response>(&line)? {
+            Response::Event(ev) => Ok(Some(ev)),
+            other => anyhow::bail!("expected event, got {other:?}"),
+        }
+    }
+}
