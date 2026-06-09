@@ -33,6 +33,14 @@ observers + command issuers over a JSON-lines Unix socket (see
 coding/ipc-protocol.md). One command surface, two callers (agent control CLI vs
 human TUI), scoped per-caller.
 
+The daemon now runs an **autonomous scheduler + pipeline**, not just IPC: it
+ticks each project, drives actionable issues through their phases by spawning
+agent subprocesses that call back over the socket, and tears down worktrees at
+DONE. The scheduler/pipeline, the ports & adapters seam (Clock / AgentExecutor /
+Worktrees), and the agent callback contract are detailed in
+coding/scheduler-pipeline.md. (Still stubs: main_jobs queue, routines, inbox
+watcher, config load/save — see plan.md.)
+
 ## Core principles
 
 - **Status as sync marker** (see domain/issue-model.md): the scheduler is a

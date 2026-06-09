@@ -44,9 +44,21 @@ All via `/write-test` (blind writer + adversarial reviewer; never inline).
 `cli.rs` `#[cfg(test)]` (48, in-file since `auwsx-tui` is bin-only),
 `state` (46), `db_smoke` (19) = **383**.
 
+## Autonomy loop (shipped 2026-06-09, commit `ced3c47`)
+
+On top of the spine, the daemon now drives issues autonomously: a scheduler
+ticker + pipeline phase fns + worktree lifecycle, all behind ports & adapters
+(Clock / AgentExecutor / Worktrees) so the drive loop is deterministically
+testable. Design + seams in coding/scheduler-pipeline.md.
+
+**Verified LIVE**: the real daemon drove an issue CONSOLIDATING→PLANNING→PLANNED
+via real agent subprocesses that called back over the socket
+(`auwsx issue status …`), created a real git worktree at PLANNING, then parked
+correctly at the PLANNED soft gate. **416 tests green** (33 new in
+`tests/autonomy.rs`).
+
 ## Not yet built (handed to plan.md)
 
-scheduler ticker, pipeline phase fns, worktree lifecycle, main_jobs queue +
-routines, inbox watcher, config load/save, TUI v0.1. Pipeline phases are blocked
-on net-new per-phase prompt design (the stale PRD's prompts must NOT be reused)
-and mechanizing the agent-vs-TUI socket caller scoping.
+main_jobs queue + routines, inbox watcher, config load/save, per-run agent token
+scoping, launchd, TUI v0.1, and exposing completion_policy + gate timeouts on
+`project add` (needed to close the live loop to DONE without raw SQL).
