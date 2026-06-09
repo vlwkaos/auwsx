@@ -1,31 +1,10 @@
-//! opencode CLI runner. Plan Step 4.
+//! opencode CLI: default headless command template.
 //!
-//! Headless invocation:
-//!   echo "<prompt>" | opencode run --dangerously-skip-permissions -q --format json
-//!
-//! Like Codex, no `/skill` resolution. Inline-substitute via skills::inline_for_agent.
+//! Like Codex, no `/skill` resolution — skills are inlined into the prompt. This
+//! template has NO `{prompt}` token, so `super::run` feeds the prompt on the
+//! child's stdin (the `echo "<prompt>" | opencode run …` shape without a shell).
 
-use super::{AgentHandle, AgentRunner};
-use crate::Result;
-use async_trait::async_trait;
-use std::path::Path;
+pub const NAME: &str = "opencode";
 
-pub struct OpenCode;
-
-#[async_trait]
-impl AgentRunner for OpenCode {
-    fn name(&self) -> &'static str {
-        "opencode"
-    }
-
-    async fn run(
-        &self,
-        _cwd: &Path,
-        _tmux_session: &str,
-        _prompt: &str,
-        _log_path: &Path,
-    ) -> Result<AgentHandle> {
-        // TODO: inline-substitute, pipe prompt via stdin to opencode run in tmux session.
-        todo!("opencode::run")
-    }
-}
+/// Recommended default command template for `projects.*_agent_cmd`.
+pub const DEFAULT_CMD: &str = "opencode run --dangerously-skip-permissions -q --format json";

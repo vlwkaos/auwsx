@@ -25,11 +25,13 @@ use std::str::FromStr;
 // Typed row + CRUD modules for the core entities that have no behaviour module
 // of their own. (backlog_items + steering live in the top-level `backlog` /
 // `steering` modules, alongside their gating logic.)
+pub mod agent_runs;
 pub mod findings;
 pub mod issues;
 pub mod projects;
 pub mod subtasks;
 
+pub use agent_runs::AgentRun;
 pub use findings::Finding;
 pub use issues::Issue;
 pub use projects::Project;
