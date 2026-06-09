@@ -1,142 +1,246 @@
-//! Task state machine. Plan Step 3.
+//! Issue state machine. Design: ~/.claude/plans/current-wsx-is-agent-cosmic-gadget.md
 //!
-//! Lifecycle:
-//!   BACKLOG → QUEUED → PREPARING → ITERATING(n) → QA(n) →
-//!     PENDING_FEEDBACK(n) → READY(n+1) → ITERATING(n+1) → ... →
-//!   COMPLETING → KNOWLEDGE_PROPAGATING → DONE
+//! **Status is the synchronization marker.** The scheduler does not track
+//! processes; on each tick it reads an issue's status and acts by its class:
 //!
-//! Failures land in FAILED from any non-terminal state. User-initiated cancel
-//! is handled at the DB layer (row delete + worktree/session cleanup), not
-//! through a state transition — Failed is reserved for genuine errors.
+//! ```text
+//!   Actionable  -> spawn the phase's agent
+//!   HumanGated  -> wait (a soft-gated one auto-releases when wait_until passes)
+//!   Terminal    -> archive
+//! ```
 //!
-//! Iteration number `n` is stored on the `tasks` row separately; this enum
-//! is dataless so transitions are cheap to reason about.
+//! An agent exits whenever it wants; whatever status it set via the control CLI
+//! before exiting decides whether the scheduler continues or halts. Crash-resume
+//! is free: a died agent leaves status untouched, so the next tick respawns it.
 //!
-//! This module is intentionally DB-agnostic: serialization to/from SQLite
-//! goes through `as_str` / `from_str`, called by `db`.
+//! Lifecycle (autonomous transitions only — human override can force any jump,
+//! handled out-of-band and logged, NOT encoded here):
+//!
+//! ```text
+//!   CONSOLIDATING ─┬─> PLANNING ─> PLANNED ─> IMPLEMENTING ─> REVIEW ⇄ NEEDS_FIX
+//!                  │                                            │  │
+//!                  └─> ABSORBED (delegated as steering)         │  └─> AUDIT ─> ENDED
+//!                                                               │              │
+//!                                       REVIEW_BLOCKED <────────┘              v
+//!                                                                          COMPLETING ─> DONE
+//!                                                                              │
+//!                                                                          CONFLICTED ⇄ CONFLICT_BLOCKED
+//! ```
+//!
+//! Loop counters (`review_round`, `conflict_attempts`) and the soft-gate
+//! deadline (`wait_until`) live on the `issues` row, not in this enum, so the
+//! enum stays dataless and transitions are cheap to reason about.
+//!
+//! DB-agnostic: serialization goes through `as_str` / `from_str`, and the set
+//! of ids MUST match the `issues.status` CHECK domain in `0001_init.sql`.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum TaskStatus {
-    Backlog,
-    Queued,
-    Preparing,
-    Iterating,
-    Qa,
-    PendingFeedback,
-    Ready,
+pub enum IssueStatus {
+    // --- consolidation (pre-worktree) ---
+    Consolidating,
+    // --- planning ---
+    Planning,
+    Planned,
+    PlanBlocked,
+    // --- implementation + quality loop ---
+    Implementing,
+    Review,
+    NeedsFix,
+    ReviewBlocked,
+    Audit,
+    // --- completion ---
+    Ended,
     Completing,
-    KnowledgePropagating,
+    Conflicted,
+    ConflictBlocked,
+    // --- terminal ---
     Done,
+    Absorbed,
     Failed,
 }
 
-impl TaskStatus {
-    /// Stable string id used as the SQLite `status` column. Must match the
-    /// CHECK domain in `0001_init.sql` exactly.
+/// How the scheduler treats a status on its tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerClass {
+    /// Spawn the phase's agent.
+    Actionable,
+    /// Wait for a human (a soft-gated one also auto-releases on `wait_until`).
+    HumanGated,
+    /// No further transitions.
+    Terminal,
+}
+
+impl IssueStatus {
+    /// Stable string id used as the SQLite `status` column and the IPC wire
+    /// form. Must match the `issues.status` CHECK domain in `0001_init.sql`.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Backlog => "BACKLOG",
-            Self::Queued => "QUEUED",
-            Self::Preparing => "PREPARING",
-            Self::Iterating => "ITERATING",
-            Self::Qa => "QA",
-            Self::PendingFeedback => "PENDING_FEEDBACK",
-            Self::Ready => "READY",
+            Self::Consolidating => "CONSOLIDATING",
+            Self::Planning => "PLANNING",
+            Self::Planned => "PLANNED",
+            Self::PlanBlocked => "PLAN_BLOCKED",
+            Self::Implementing => "IMPLEMENTING",
+            Self::Review => "REVIEW",
+            Self::NeedsFix => "NEEDS_FIX",
+            Self::ReviewBlocked => "REVIEW_BLOCKED",
+            Self::Audit => "AUDIT",
+            Self::Ended => "ENDED",
             Self::Completing => "COMPLETING",
-            Self::KnowledgePropagating => "KNOWLEDGE_PROPAGATING",
+            Self::Conflicted => "CONFLICTED",
+            Self::ConflictBlocked => "CONFLICT_BLOCKED",
             Self::Done => "DONE",
+            Self::Absorbed => "ABSORBED",
             Self::Failed => "FAILED",
         }
     }
 
-    /// Inverse of [`as_str`]. Used by `db` when loading a row.
+    /// Inverse of [`as_str`]. Used by `db` / IPC when loading a value.
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
-            "BACKLOG" => Self::Backlog,
-            "QUEUED" => Self::Queued,
-            "PREPARING" => Self::Preparing,
-            "ITERATING" => Self::Iterating,
-            "QA" => Self::Qa,
-            "PENDING_FEEDBACK" => Self::PendingFeedback,
-            "READY" => Self::Ready,
+            "CONSOLIDATING" => Self::Consolidating,
+            "PLANNING" => Self::Planning,
+            "PLANNED" => Self::Planned,
+            "PLAN_BLOCKED" => Self::PlanBlocked,
+            "IMPLEMENTING" => Self::Implementing,
+            "REVIEW" => Self::Review,
+            "NEEDS_FIX" => Self::NeedsFix,
+            "REVIEW_BLOCKED" => Self::ReviewBlocked,
+            "AUDIT" => Self::Audit,
+            "ENDED" => Self::Ended,
             "COMPLETING" => Self::Completing,
-            "KNOWLEDGE_PROPAGATING" => Self::KnowledgePropagating,
+            "CONFLICTED" => Self::Conflicted,
+            "CONFLICT_BLOCKED" => Self::ConflictBlocked,
             "DONE" => Self::Done,
+            "ABSORBED" => Self::Absorbed,
             "FAILED" => Self::Failed,
             _ => return None,
         })
     }
 
-    /// Whether this status accepts followup attachment.
-    /// Plan Step 3.8: followups valid only while parent ∈ {ITER, QA, PEND_FB, READY}.
-    pub fn accepts_followups(&self) -> bool {
+    /// Scheduler treatment for this status.
+    pub fn scheduler_class(&self) -> SchedulerClass {
+        use IssueStatus::*;
+        match self {
+            Consolidating | Planning | Implementing | Review | NeedsFix | Audit | Conflicted
+            | Completing => SchedulerClass::Actionable,
+            Planned | PlanBlocked | ReviewBlocked | ConflictBlocked | Ended => {
+                SchedulerClass::HumanGated
+            }
+            Done | Absorbed | Failed => SchedulerClass::Terminal,
+        }
+    }
+
+    /// The scheduler spawns an agent for this status on its tick.
+    pub fn is_actionable(&self) -> bool {
+        self.scheduler_class() == SchedulerClass::Actionable
+    }
+
+    /// The scheduler waits for a human at this status.
+    pub fn is_human_gated(&self) -> bool {
+        self.scheduler_class() == SchedulerClass::HumanGated
+    }
+
+    /// Terminal: no further transitions.
+    pub fn is_terminal(&self) -> bool {
+        self.scheduler_class() == SchedulerClass::Terminal
+    }
+
+    /// A human-gated status the scheduler auto-releases once `wait_until`
+    /// expires (vs. one that waits indefinitely for an explicit human action).
+    ///
+    /// `PLANNED` is always soft. `ENDED` is soft only when the project's
+    /// `completion_policy = 'soft'`, which this dataless enum can't know — the
+    /// scheduler ORs that policy in.
+    pub fn is_soft_gated(&self) -> bool {
+        matches!(self, Self::Planned)
+    }
+
+    /// Has a worktree and a locked plan, so it can host delegated work. The
+    /// only statuses into which consolidation may fold a similar backlog task
+    /// as steering, and the only ones a human may steer.
+    pub fn is_working_phase(&self) -> bool {
         matches!(
             self,
-            Self::Iterating | Self::Qa | Self::PendingFeedback | Self::Ready
+            Self::Implementing | Self::Review | Self::NeedsFix | Self::Audit
         )
     }
 
-    /// Whether the scheduler will pick this task on its tick.
-    /// Plan Step 3: only Queued (fresh) and Ready (post-feedback) are pickable.
-    pub fn is_schedulable(&self) -> bool {
-        matches!(self, Self::Queued | Self::Ready)
-    }
-
-    /// Whether this is a terminal status (no more transitions).
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Failed)
+    /// Whether append-only steering may be attached. Same set as
+    /// [`is_working_phase`] — steering never touches `plan.md`, so it is only
+    /// meaningful once the plan is locked and a worktree exists.
+    pub fn accepts_steering(&self) -> bool {
+        self.is_working_phase()
     }
 }
 
 #[derive(Debug, Error)]
 pub enum TransitionError {
     #[error("illegal transition: {from:?} -> {to:?}")]
-    Illegal {
-        from: TaskStatus,
-        to: TaskStatus,
-    },
+    Illegal { from: IssueStatus, to: IssueStatus },
 }
 
-/// Returns true if `from -> to` is a legal transition.
+/// Returns true if `from -> to` is a legal autonomous transition.
 ///
-/// Most transitions are linear; the two non-linear cases:
-///   - `Qa -> Ready`         — followup auto-advance (Plan Step 3.8)
-///   - `PendingFeedback -> Completing` — user marks task COMPLETE
+/// This is the contract the pipeline + IPC obey. Human override (`issue status
+/// set --force`) deliberately bypasses it (and is logged to `agent_runs`), so
+/// the matrix only encodes what the system does on its own.
 ///
-/// Failure transitions are allowed from every active phase that has actual
-/// agent or pipeline work (Preparing through KnowledgePropagating). The
-/// Backlog, Queued, Ready, Done states have no in-flight work to fail; user
-/// cancellation in those cases is handled at the DB level (delete the row),
-/// not through Failed.
-pub fn is_legal_transition(from: TaskStatus, to: TaskStatus) -> bool {
-    use TaskStatus::*;
+/// `FAILED` is reachable from every non-terminal phase (abort / error).
+/// `ABSORBED` is reachable only from `CONSOLIDATING` (delegation self-close).
+pub fn is_legal_transition(from: IssueStatus, to: IssueStatus) -> bool {
+    use IssueStatus::*;
     matches!(
         (from, to),
-        (Backlog, Queued)
-            | (Queued, Preparing)
-            | (Preparing, Iterating)
-            | (Preparing, Failed)
-            | (Iterating, Qa)
-            | (Iterating, Failed)
-            | (Qa, PendingFeedback)
-            | (Qa, Ready)
-            | (Qa, Failed)
-            | (PendingFeedback, Ready)
-            | (PendingFeedback, Completing)
-            | (Ready, Iterating)
-            | (Completing, KnowledgePropagating)
+        // consolidation
+        (Consolidating, Planning)
+            | (Consolidating, Absorbed)
+            | (Consolidating, Failed)
+            // planning
+            | (Planning, Planned)
+            | (Planning, PlanBlocked)
+            | (Planning, Failed)
+            | (Planned, Implementing)
+            | (Planned, Planning)        // human rejects plan -> replan
+            | (Planned, Failed)
+            | (PlanBlocked, Planning)
+            | (PlanBlocked, Failed)
+            // implementation + quality loop
+            | (Implementing, Review)
+            | (Implementing, Failed)
+            | (Review, NeedsFix)
+            | (Review, Audit)
+            | (Review, ReviewBlocked)
+            | (Review, Failed)
+            | (NeedsFix, Review)
+            | (NeedsFix, ReviewBlocked)
+            | (NeedsFix, Failed)
+            | (ReviewBlocked, NeedsFix)
+            | (ReviewBlocked, Audit)
+            | (ReviewBlocked, Failed)
+            | (Audit, Ended)
+            | (Audit, NeedsFix)          // good-to-go found issues
+            | (Audit, Failed)
+            // completion
+            | (Ended, Completing)
+            | (Ended, Failed)
+            | (Completing, Done)
+            | (Completing, Conflicted)
             | (Completing, Failed)
-            | (KnowledgePropagating, Done)
-            | (KnowledgePropagating, Failed)
+            | (Conflicted, Completing)
+            | (Conflicted, ConflictBlocked)
+            | (Conflicted, Failed)
+            | (ConflictBlocked, Completing)
+            | (ConflictBlocked, Conflicted)
+            | (ConflictBlocked, Failed)
     )
 }
 
-/// Convenience wrapper: typed error version of `is_legal_transition`.
-pub fn check_transition(from: TaskStatus, to: TaskStatus) -> Result<(), TransitionError> {
+/// Typed-error wrapper over [`is_legal_transition`].
+pub fn check_transition(from: IssueStatus, to: IssueStatus) -> Result<(), TransitionError> {
     if is_legal_transition(from, to) {
         Ok(())
     } else {
@@ -147,390 +251,566 @@ pub fn check_transition(from: TaskStatus, to: TaskStatus) -> Result<(), Transiti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::hash_map::DefaultHasher;
     use std::collections::HashSet;
-    use std::hash::{Hash, Hasher};
 
-    const ALL_VARIANTS: &[TaskStatus] = &[
-        TaskStatus::Backlog,
-        TaskStatus::Queued,
-        TaskStatus::Preparing,
-        TaskStatus::Iterating,
-        TaskStatus::Qa,
-        TaskStatus::PendingFeedback,
-        TaskStatus::Ready,
-        TaskStatus::Completing,
-        TaskStatus::KnowledgePropagating,
-        TaskStatus::Done,
-        TaskStatus::Failed,
+    // --- exhaustive ground truth -------------------------------------------
+
+    /// All 16 variants. Used to prove every table-driven loop covers the whole
+    /// domain; a compile error here forces this list to track the enum.
+    const ALL: [IssueStatus; 16] = [
+        IssueStatus::Consolidating,
+        IssueStatus::Planning,
+        IssueStatus::Planned,
+        IssueStatus::PlanBlocked,
+        IssueStatus::Implementing,
+        IssueStatus::Review,
+        IssueStatus::NeedsFix,
+        IssueStatus::ReviewBlocked,
+        IssueStatus::Audit,
+        IssueStatus::Ended,
+        IssueStatus::Completing,
+        IssueStatus::Conflicted,
+        IssueStatus::ConflictBlocked,
+        IssueStatus::Done,
+        IssueStatus::Absorbed,
+        IssueStatus::Failed,
     ];
 
-    /// Single source of truth for the stable SCREAMING_SNAKE_CASE ids.
-    /// Any change here is a wire/SQLite-format break and must be intentional.
-    const ID_TABLE: &[(TaskStatus, &str)] = &[
-        (TaskStatus::Backlog, "BACKLOG"),
-        (TaskStatus::Queued, "QUEUED"),
-        (TaskStatus::Preparing, "PREPARING"),
-        (TaskStatus::Iterating, "ITERATING"),
-        (TaskStatus::Qa, "QA"),
-        (TaskStatus::PendingFeedback, "PENDING_FEEDBACK"),
-        (TaskStatus::Ready, "READY"),
-        (TaskStatus::Completing, "COMPLETING"),
-        (TaskStatus::KnowledgePropagating, "KNOWLEDGE_PROPAGATING"),
-        (TaskStatus::Done, "DONE"),
-        (TaskStatus::Failed, "FAILED"),
+    /// Spec section A: variant -> canonical id. Independent restatement of the
+    /// contract (NOT read from the impl), so a wrong id is caught here.
+    const STR_IDS: [(IssueStatus, &str); 16] = [
+        (IssueStatus::Consolidating, "CONSOLIDATING"),
+        (IssueStatus::Planning, "PLANNING"),
+        (IssueStatus::Planned, "PLANNED"),
+        (IssueStatus::PlanBlocked, "PLAN_BLOCKED"),
+        (IssueStatus::Implementing, "IMPLEMENTING"),
+        (IssueStatus::Review, "REVIEW"),
+        (IssueStatus::NeedsFix, "NEEDS_FIX"),
+        (IssueStatus::ReviewBlocked, "REVIEW_BLOCKED"),
+        (IssueStatus::Audit, "AUDIT"),
+        (IssueStatus::Ended, "ENDED"),
+        (IssueStatus::Completing, "COMPLETING"),
+        (IssueStatus::Conflicted, "CONFLICTED"),
+        (IssueStatus::ConflictBlocked, "CONFLICT_BLOCKED"),
+        (IssueStatus::Done, "DONE"),
+        (IssueStatus::Absorbed, "ABSORBED"),
+        (IssueStatus::Failed, "FAILED"),
     ];
 
-    const LEGAL_TRANSITIONS: &[(TaskStatus, TaskStatus)] = &[
-        (TaskStatus::Backlog, TaskStatus::Queued),
-        (TaskStatus::Queued, TaskStatus::Preparing),
-        (TaskStatus::Preparing, TaskStatus::Iterating),
-        (TaskStatus::Preparing, TaskStatus::Failed),
-        (TaskStatus::Iterating, TaskStatus::Qa),
-        (TaskStatus::Iterating, TaskStatus::Failed),
-        (TaskStatus::Qa, TaskStatus::PendingFeedback),
-        (TaskStatus::Qa, TaskStatus::Ready),
-        (TaskStatus::Qa, TaskStatus::Failed),
-        (TaskStatus::PendingFeedback, TaskStatus::Ready),
-        (TaskStatus::PendingFeedback, TaskStatus::Completing),
-        (TaskStatus::Ready, TaskStatus::Iterating),
-        (TaskStatus::Completing, TaskStatus::KnowledgePropagating),
-        (TaskStatus::Completing, TaskStatus::Failed),
-        (TaskStatus::KnowledgePropagating, TaskStatus::Done),
-        (TaskStatus::KnowledgePropagating, TaskStatus::Failed),
+    /// Spec section B: the scheduler-class partition, stated independently.
+    const ACTIONABLE: [IssueStatus; 8] = [
+        IssueStatus::Consolidating,
+        IssueStatus::Planning,
+        IssueStatus::Implementing,
+        IssueStatus::Review,
+        IssueStatus::NeedsFix,
+        IssueStatus::Audit,
+        IssueStatus::Conflicted,
+        IssueStatus::Completing,
+    ];
+    const HUMAN_GATED: [IssueStatus; 5] = [
+        IssueStatus::Planned,
+        IssueStatus::PlanBlocked,
+        IssueStatus::ReviewBlocked,
+        IssueStatus::ConflictBlocked,
+        IssueStatus::Ended,
+    ];
+    const TERMINAL: [IssueStatus; 3] = [
+        IssueStatus::Done,
+        IssueStatus::Absorbed,
+        IssueStatus::Failed,
     ];
 
-    // ---------- as_str / from_str ----------
+    /// Spec section C: the working-phase / steering set.
+    const WORKING_PHASE: [IssueStatus; 4] = [
+        IssueStatus::Implementing,
+        IssueStatus::Review,
+        IssueStatus::NeedsFix,
+        IssueStatus::Audit,
+    ];
 
-    #[test]
-    fn as_str_exact_literals_for_every_variant() {
-        for (v, want) in ID_TABLE {
-            assert_eq!(v.as_str(), *want, "as_str mismatch for {v:?}");
-        }
-        assert_eq!(ID_TABLE.len(), ALL_VARIANTS.len(), "ID_TABLE must cover all variants");
+    /// Spec section D: the COMPLETE legal-transition set, restated by hand.
+    const LEGAL: [(IssueStatus, IssueStatus); 37] = [
+        (IssueStatus::Consolidating, IssueStatus::Planning),
+        (IssueStatus::Consolidating, IssueStatus::Absorbed),
+        (IssueStatus::Consolidating, IssueStatus::Failed),
+        (IssueStatus::Planning, IssueStatus::Planned),
+        (IssueStatus::Planning, IssueStatus::PlanBlocked),
+        (IssueStatus::Planning, IssueStatus::Failed),
+        (IssueStatus::Planned, IssueStatus::Implementing),
+        (IssueStatus::Planned, IssueStatus::Planning),
+        (IssueStatus::Planned, IssueStatus::Failed),
+        (IssueStatus::PlanBlocked, IssueStatus::Planning),
+        (IssueStatus::PlanBlocked, IssueStatus::Failed),
+        (IssueStatus::Implementing, IssueStatus::Review),
+        (IssueStatus::Implementing, IssueStatus::Failed),
+        (IssueStatus::Review, IssueStatus::NeedsFix),
+        (IssueStatus::Review, IssueStatus::Audit),
+        (IssueStatus::Review, IssueStatus::ReviewBlocked),
+        (IssueStatus::Review, IssueStatus::Failed),
+        (IssueStatus::NeedsFix, IssueStatus::Review),
+        (IssueStatus::NeedsFix, IssueStatus::ReviewBlocked),
+        (IssueStatus::NeedsFix, IssueStatus::Failed),
+        (IssueStatus::ReviewBlocked, IssueStatus::NeedsFix),
+        (IssueStatus::ReviewBlocked, IssueStatus::Audit),
+        (IssueStatus::ReviewBlocked, IssueStatus::Failed),
+        (IssueStatus::Audit, IssueStatus::Ended),
+        (IssueStatus::Audit, IssueStatus::NeedsFix),
+        (IssueStatus::Audit, IssueStatus::Failed),
+        (IssueStatus::Ended, IssueStatus::Completing),
+        (IssueStatus::Ended, IssueStatus::Failed),
+        (IssueStatus::Completing, IssueStatus::Done),
+        (IssueStatus::Completing, IssueStatus::Conflicted),
+        (IssueStatus::Completing, IssueStatus::Failed),
+        (IssueStatus::Conflicted, IssueStatus::Completing),
+        (IssueStatus::Conflicted, IssueStatus::ConflictBlocked),
+        (IssueStatus::Conflicted, IssueStatus::Failed),
+        (IssueStatus::ConflictBlocked, IssueStatus::Completing),
+        (IssueStatus::ConflictBlocked, IssueStatus::Conflicted),
+        (IssueStatus::ConflictBlocked, IssueStatus::Failed),
+    ];
+
+    fn legal_set() -> HashSet<(IssueStatus, IssueStatus)> {
+        LEGAL.iter().copied().collect()
     }
 
-    #[test]
-    fn from_str_screaming_snake_literals_match_table() {
-        for (v, s) in ID_TABLE {
-            let parsed = TaskStatus::from_str(s)
-                .unwrap_or_else(|| panic!("from_str({s:?}) returned None"));
-            assert_eq!(parsed, *v, "from_str mismatch for {s:?}");
-        }
-    }
+    // --- enum/table drift guards -------------------------------------------
+    //
+    // The `[IssueStatus; 16]` annotation on ALL only fails to compile if a
+    // variant is *removed* (list too long) or a duplicate pads it back to 16.
+    // It does NOT catch a 17th variant being *added*: ALL would silently stay
+    // length-16 and every table-driven loop below would skip the new variant.
+    // The exhaustive match here is the real guard: adding a variant makes this
+    // test fail to compile (non-exhaustive match), forcing ALL/STR_IDS/the
+    // partition tables to be updated.
 
     #[test]
-    fn as_str_and_from_str_roundtrip_every_variant() {
-        for v in ALL_VARIANTS {
-            let s = v.as_str();
-            let parsed = TaskStatus::from_str(s)
-                .unwrap_or_else(|| panic!("from_str({s:?}) returned None for variant {v:?}"));
-            assert_eq!(parsed, *v, "roundtrip mismatch: {v:?} -> {s:?} -> {parsed:?}");
-        }
-    }
-
-    #[test]
-    fn from_str_empty_string_returns_none() {
-        assert_eq!(TaskStatus::from_str(""), None);
-    }
-
-    #[test]
-    fn from_str_lowercase_returns_none() {
-        assert_eq!(TaskStatus::from_str("iterating"), None);
-    }
-
-    #[test]
-    fn from_str_unknown_word_returns_none() {
-        assert_eq!(TaskStatus::from_str("FOO"), None);
-    }
-
-    #[test]
-    fn from_str_trailing_whitespace_returns_none() {
-        assert_eq!(TaskStatus::from_str("READY "), None);
-    }
-
-    #[test]
-    fn from_str_leading_whitespace_returns_none() {
-        assert_eq!(TaskStatus::from_str(" READY"), None);
-    }
-
-    #[test]
-    fn from_str_mixed_case_returns_none() {
-        for bad in ["Ready", "pendingFeedback", "Pending_Feedback", "Knowledge_Propagating"] {
-            assert_eq!(TaskStatus::from_str(bad), None, "from_str must reject {bad:?}");
-        }
-    }
-
-    #[test]
-    fn from_str_partial_prefix_returns_none() {
-        for bad in ["READ", "PENDING", "KNOWLEDGE", "ITERAT"] {
-            assert_eq!(TaskStatus::from_str(bad), None, "from_str must reject prefix {bad:?}");
-        }
-    }
-
-    #[test]
-    fn from_str_extra_underscore_returns_none() {
-        assert_eq!(TaskStatus::from_str("PENDING__FEEDBACK"), None);
-        assert_eq!(TaskStatus::from_str("_READY"), None);
-        assert_eq!(TaskStatus::from_str("READY_"), None);
-    }
-
-    // ---------- predicate sets ----------
-
-    #[test]
-    fn accepts_followups_exhaustive() {
-        use TaskStatus::*;
-        let expected = |v: TaskStatus| matches!(v, Iterating | Qa | PendingFeedback | Ready);
-        for v in ALL_VARIANTS {
-            assert_eq!(v.accepts_followups(), expected(*v), "accepts_followups mismatch for {v:?}");
-        }
-    }
-
-    #[test]
-    fn is_schedulable_exhaustive() {
-        use TaskStatus::*;
-        let expected = |v: TaskStatus| matches!(v, Queued | Ready);
-        for v in ALL_VARIANTS {
-            assert_eq!(v.is_schedulable(), expected(*v), "is_schedulable mismatch for {v:?}");
-        }
-    }
-
-    #[test]
-    fn is_terminal_exhaustive() {
-        use TaskStatus::*;
-        let expected = |v: TaskStatus| matches!(v, Done | Failed);
-        for v in ALL_VARIANTS {
-            assert_eq!(v.is_terminal(), expected(*v), "is_terminal mismatch for {v:?}");
-        }
-    }
-
-    #[test]
-    fn terminal_implies_not_schedulable_and_not_accepts_followups() {
-        for v in ALL_VARIANTS {
-            if v.is_terminal() {
-                assert!(!v.accepts_followups(), "{v:?} is terminal but accepts followups");
-                assert!(!v.is_schedulable(), "{v:?} is terminal but is schedulable");
+    fn given_the_enum_when_exhaustively_matched_then_all_table_lists_it() {
+        // Map every variant to its position in ALL. A new variant => compile
+        // error here (missing arm); a variant missing from ALL => assertion.
+        fn assert_in_all(v: IssueStatus) {
+            match v {
+                IssueStatus::Consolidating
+                | IssueStatus::Planning
+                | IssueStatus::Planned
+                | IssueStatus::PlanBlocked
+                | IssueStatus::Implementing
+                | IssueStatus::Review
+                | IssueStatus::NeedsFix
+                | IssueStatus::ReviewBlocked
+                | IssueStatus::Audit
+                | IssueStatus::Ended
+                | IssueStatus::Completing
+                | IssueStatus::Conflicted
+                | IssueStatus::ConflictBlocked
+                | IssueStatus::Done
+                | IssueStatus::Absorbed
+                | IssueStatus::Failed => {}
             }
+            assert!(ALL.contains(&v), "{v:?} missing from ALL");
+        }
+        for v in ALL {
+            assert_in_all(v);
         }
     }
 
     #[test]
-    fn every_variant_either_terminal_schedulable_or_intermediate_no_overlap() {
-        let mut terminal = 0;
-        let mut schedulable = 0;
-        let mut other = 0;
-        for v in ALL_VARIANTS {
-            assert!(
-                !(v.is_terminal() && v.is_schedulable()),
-                "{v:?} is both terminal and schedulable"
+    fn given_all_table_when_collected_then_16_distinct_variants() {
+        // Guards against a duplicate entry masking a missing variant inside the
+        // fixed-length [_; 16] literal.
+        let set: HashSet<IssueStatus> = ALL.into_iter().collect();
+        assert_eq!(set.len(), 16, "ALL must list 16 distinct variants");
+    }
+
+    #[test]
+    fn given_str_ids_table_when_collected_then_covers_every_variant_once() {
+        let keys: HashSet<IssueStatus> = STR_IDS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(keys.len(), 16, "STR_IDS must map every variant exactly once");
+        for v in ALL {
+            assert!(keys.contains(&v), "STR_IDS missing {v:?}");
+        }
+    }
+
+    // --- A. string ids ------------------------------------------------------
+
+    #[test]
+    fn given_each_variant_when_as_str_then_matches_spec_id() {
+        for (v, id) in STR_IDS {
+            assert_eq!(v.as_str(), id, "as_str mismatch for {v:?}");
+        }
+    }
+
+    #[test]
+    fn given_canonical_id_when_from_str_then_returns_that_variant() {
+        for (v, id) in STR_IDS {
+            assert_eq!(IssueStatus::from_str(id), Some(v), "from_str({id:?})");
+        }
+    }
+
+    #[test]
+    fn given_every_variant_when_round_tripped_through_as_str_then_unchanged() {
+        for v in ALL {
+            assert_eq!(IssueStatus::from_str(v.as_str()), Some(v), "round-trip {v:?}");
+        }
+    }
+
+    #[test]
+    fn given_distinct_variants_when_as_str_then_ids_are_unique() {
+        let ids: HashSet<&str> = ALL.iter().map(|v| v.as_str()).collect();
+        assert_eq!(ids.len(), ALL.len(), "as_str ids must be unique");
+    }
+
+    #[test]
+    fn given_empty_string_when_from_str_then_none() {
+        assert_eq!(IssueStatus::from_str(""), None);
+    }
+
+    #[test]
+    fn given_lowercase_id_when_from_str_then_none() {
+        assert_eq!(IssueStatus::from_str("planning"), None);
+    }
+
+    #[test]
+    fn given_mixed_case_id_when_from_str_then_none() {
+        assert_eq!(IssueStatus::from_str("Planning"), None);
+    }
+
+    #[test]
+    fn given_leading_whitespace_id_when_from_str_then_none() {
+        assert_eq!(IssueStatus::from_str(" PLANNING"), None);
+    }
+
+    #[test]
+    fn given_trailing_whitespace_id_when_from_str_then_none() {
+        assert_eq!(IssueStatus::from_str("PLANNING "), None);
+    }
+
+    #[test]
+    fn given_partial_prefix_when_from_str_then_none() {
+        // "READ" is a prefix of nothing valid; "PENDING" is a foreign token.
+        assert_eq!(IssueStatus::from_str("READ"), None);
+        assert_eq!(IssueStatus::from_str("PENDING"), None);
+        assert_eq!(IssueStatus::from_str("REVIEW_BLO"), None);
+    }
+
+    #[test]
+    fn given_unknown_token_when_from_str_then_none() {
+        assert_eq!(IssueStatus::from_str("FOO"), None);
+    }
+
+    #[test]
+    fn given_extra_underscores_when_from_str_then_none() {
+        assert_eq!(IssueStatus::from_str("PLAN__BLOCKED"), None);
+        assert_eq!(IssueStatus::from_str("_PLANNING"), None);
+        assert_eq!(IssueStatus::from_str("PLANNING_"), None);
+    }
+
+    // --- B. scheduler-class partition --------------------------------------
+
+    #[test]
+    fn given_actionable_set_when_scheduler_class_then_actionable() {
+        for v in ACTIONABLE {
+            assert_eq!(v.scheduler_class(), SchedulerClass::Actionable, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn given_human_gated_set_when_scheduler_class_then_human_gated() {
+        for v in HUMAN_GATED {
+            assert_eq!(v.scheduler_class(), SchedulerClass::HumanGated, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn given_terminal_set_when_scheduler_class_then_terminal() {
+        for v in TERMINAL {
+            assert_eq!(v.scheduler_class(), SchedulerClass::Terminal, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn given_all_variants_when_partitioned_by_class_then_each_in_exactly_one() {
+        let a: HashSet<IssueStatus> = ACTIONABLE.into_iter().collect();
+        let h: HashSet<IssueStatus> = HUMAN_GATED.into_iter().collect();
+        let t: HashSet<IssueStatus> = TERMINAL.into_iter().collect();
+        // non-overlapping
+        assert!(a.is_disjoint(&h));
+        assert!(a.is_disjoint(&t));
+        assert!(h.is_disjoint(&t));
+        // exhaustive cover
+        assert_eq!(a.len() + h.len() + t.len(), ALL.len());
+        for v in ALL {
+            let count = a.contains(&v) as u8 + h.contains(&v) as u8 + t.contains(&v) as u8;
+            assert_eq!(count, 1, "{v:?} must be in exactly one class");
+        }
+    }
+
+    #[test]
+    fn given_each_variant_when_is_actionable_then_agrees_with_class() {
+        for v in ALL {
+            assert_eq!(
+                v.is_actionable(),
+                v.scheduler_class() == SchedulerClass::Actionable,
+                "{v:?}"
             );
-            if v.is_terminal() {
-                terminal += 1;
-            } else if v.is_schedulable() {
-                schedulable += 1;
-            } else {
-                other += 1;
+        }
+    }
+
+    #[test]
+    fn given_each_variant_when_is_human_gated_then_agrees_with_class() {
+        for v in ALL {
+            assert_eq!(
+                v.is_human_gated(),
+                v.scheduler_class() == SchedulerClass::HumanGated,
+                "{v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_each_variant_when_is_terminal_then_agrees_with_class() {
+        for v in ALL {
+            assert_eq!(
+                v.is_terminal(),
+                v.scheduler_class() == SchedulerClass::Terminal,
+                "{v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_each_variant_when_three_predicates_checked_then_exactly_one_true() {
+        for v in ALL {
+            let count =
+                v.is_actionable() as u8 + v.is_human_gated() as u8 + v.is_terminal() as u8;
+            assert_eq!(count, 1, "{v:?} must satisfy exactly one predicate");
+        }
+    }
+
+    // --- C. soft-gate / working-phase / steering ---------------------------
+
+    #[test]
+    fn given_planned_when_is_soft_gated_then_true() {
+        assert!(IssueStatus::Planned.is_soft_gated());
+    }
+
+    #[test]
+    fn given_any_non_planned_when_is_soft_gated_then_false() {
+        for v in ALL {
+            if v != IssueStatus::Planned {
+                assert!(!v.is_soft_gated(), "{v:?} must not be soft-gated");
             }
         }
-        assert_eq!(terminal, 2, "expected 2 terminal variants");
-        assert_eq!(schedulable, 2, "expected 2 schedulable variants");
-        assert_eq!(terminal + schedulable + other, ALL_VARIANTS.len());
     }
 
-    // ---------- transitions ----------
-
     #[test]
-    fn every_legal_transition_is_accepted() {
-        assert_eq!(LEGAL_TRANSITIONS.len(), 16, "expected 16 legal transitions");
-        for (from, to) in LEGAL_TRANSITIONS {
-            assert!(is_legal_transition(*from, *to), "expected legal transition: {from:?} -> {to:?}");
+    fn given_working_phase_set_when_is_working_phase_then_true() {
+        for v in WORKING_PHASE {
+            assert!(v.is_working_phase(), "{v:?}");
         }
     }
 
     #[test]
-    fn illegal_transitions_complement_is_exhaustive() {
-        let legal_set: HashSet<(TaskStatus, TaskStatus)> =
-            LEGAL_TRANSITIONS.iter().copied().collect();
-        for from in ALL_VARIANTS {
-            for to in ALL_VARIANTS {
-                let expected_legal = legal_set.contains(&(*from, *to));
+    fn given_non_working_phase_when_is_working_phase_then_false() {
+        let working: HashSet<IssueStatus> = WORKING_PHASE.into_iter().collect();
+        for v in ALL {
+            if !working.contains(&v) {
+                assert!(!v.is_working_phase(), "{v:?} must not be a working phase");
+            }
+        }
+    }
+
+    #[test]
+    fn given_each_variant_when_accepts_steering_then_equals_is_working_phase() {
+        for v in ALL {
+            assert_eq!(v.accepts_steering(), v.is_working_phase(), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn given_terminal_variants_when_predicates_checked_then_inert() {
+        for v in TERMINAL {
+            assert!(!v.is_actionable(), "{v:?} actionable");
+            assert!(!v.is_soft_gated(), "{v:?} soft-gated");
+            assert!(!v.is_working_phase(), "{v:?} working-phase");
+            assert!(!v.accepts_steering(), "{v:?} accepts-steering");
+        }
+    }
+
+    // --- D. transition matrix ----------------------------------------------
+
+    #[test]
+    fn given_full_pair_space_when_is_legal_transition_then_matches_legal_set_exactly() {
+        let legal = legal_set();
+        for from in ALL {
+            for to in ALL {
+                let expected = legal.contains(&(from, to));
                 assert_eq!(
-                    is_legal_transition(*from, *to),
-                    expected_legal,
-                    "is_legal_transition({from:?}, {to:?}) mismatch",
+                    is_legal_transition(from, to),
+                    expected,
+                    "{from:?} -> {to:?}: expected {expected}"
                 );
             }
         }
     }
 
     #[test]
-    fn legal_transitions_never_self_loop() {
-        for v in ALL_VARIANTS {
-            assert!(
-                !is_legal_transition(*v, *v),
-                "self-loop {v:?} -> {v:?} must be illegal",
-            );
+    fn given_legal_set_when_counted_then_has_no_duplicates() {
+        // Guards the hand-written LEGAL table itself against accidental dupes.
+        assert_eq!(legal_set().len(), LEGAL.len(), "LEGAL table has duplicates");
+    }
+
+    #[test]
+    fn given_any_variant_when_self_transition_then_illegal() {
+        for v in ALL {
+            assert!(!is_legal_transition(v, v), "self-loop {v:?} -> {v:?}");
         }
     }
 
     #[test]
-    fn terminal_has_no_outgoing_legal_transitions() {
-        for from in ALL_VARIANTS.iter().filter(|v| v.is_terminal()) {
-            for to in ALL_VARIANTS {
+    fn given_terminal_states_when_any_outgoing_transition_then_illegal() {
+        for from in TERMINAL {
+            for to in ALL {
                 assert!(
-                    !is_legal_transition(*from, *to),
-                    "terminal {from:?} must not transition to {to:?}",
+                    !is_legal_transition(from, to),
+                    "terminal {from:?} must have no outgoing edge, got {from:?} -> {to:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn backlog_to_iterating_is_illegal() {
-        assert!(!is_legal_transition(TaskStatus::Backlog, TaskStatus::Iterating));
-    }
-
-    #[test]
-    fn done_to_failed_is_illegal_because_done_is_terminal() {
-        assert!(!is_legal_transition(TaskStatus::Done, TaskStatus::Failed));
-    }
-
-    #[test]
-    fn failed_to_ready_is_illegal_because_failed_is_terminal() {
-        assert!(!is_legal_transition(TaskStatus::Failed, TaskStatus::Ready));
-    }
-
-    #[test]
-    fn ready_to_qa_is_illegal_must_iterate_first() {
-        assert!(!is_legal_transition(TaskStatus::Ready, TaskStatus::Qa));
-    }
-
-    #[test]
-    fn knowledge_propagating_to_iterating_is_illegal_one_way() {
-        assert!(!is_legal_transition(TaskStatus::KnowledgePropagating, TaskStatus::Iterating));
-    }
-
-    #[test]
-    fn backlog_to_failed_is_illegal_no_in_flight_work() {
-        assert!(!is_legal_transition(TaskStatus::Backlog, TaskStatus::Failed));
-    }
-
-    #[test]
-    fn queued_to_failed_is_illegal_no_in_flight_work() {
-        assert!(!is_legal_transition(TaskStatus::Queued, TaskStatus::Failed));
-    }
-
-    // ---------- check_transition ----------
-
-    #[test]
-    fn check_transition_agrees_with_is_legal_transition_for_all_pairs() {
-        for from in ALL_VARIANTS {
-            for to in ALL_VARIANTS {
-                let legal = is_legal_transition(*from, *to);
-                let checked = check_transition(*from, *to);
-                match (legal, checked) {
-                    (true, Ok(())) => {}
-                    (false, Err(TransitionError::Illegal { from: f, to: t })) => {
-                        assert_eq!(f, *from, "error.from for {from:?} -> {to:?}");
-                        assert_eq!(t, *to, "error.to for {from:?} -> {to:?}");
-                    }
-                    (true, Err(e)) => panic!("legal {from:?} -> {to:?} returned Err({e:?})"),
-                    (false, Ok(())) => panic!("illegal {from:?} -> {to:?} returned Ok"),
-                }
+    fn given_absorbed_target_when_source_not_consolidating_then_illegal() {
+        for from in ALL {
+            if from != IssueStatus::Consolidating {
+                assert!(
+                    !is_legal_transition(from, IssueStatus::Absorbed),
+                    "only CONSOLIDATING may reach ABSORBED, got {from:?}"
+                );
             }
         }
     }
 
     #[test]
-    fn check_transition_illegal_returns_err_with_matching_fields() {
-        let from = TaskStatus::Backlog;
-        let to = TaskStatus::Iterating;
+    fn given_every_non_terminal_when_to_failed_then_legal() {
+        let terminal: HashSet<IssueStatus> = TERMINAL.into_iter().collect();
+        for from in ALL {
+            if !terminal.contains(&from) {
+                assert!(
+                    is_legal_transition(from, IssueStatus::Failed),
+                    "FAILED must be reachable from {from:?}"
+                );
+            }
+        }
+    }
+
+    // --- check_transition typed wrapper ------------------------------------
+
+    #[test]
+    fn given_full_pair_space_when_check_transition_then_ok_iff_legal() {
+        let legal = legal_set();
+        for from in ALL {
+            for to in ALL {
+                let is_ok = check_transition(from, to).is_ok();
+                assert_eq!(
+                    is_ok,
+                    legal.contains(&(from, to)),
+                    "check_transition {from:?} -> {to:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_illegal_pair_when_check_transition_then_err_carries_same_from_and_to() {
+        let from = IssueStatus::Done;
+        let to = IssueStatus::Failed; // terminal source -> always illegal
         match check_transition(from, to) {
             Err(TransitionError::Illegal { from: f, to: t }) => {
-                assert_eq!(f, from, "error.from should equal arg");
-                assert_eq!(t, to, "error.to should equal arg");
+                assert_eq!(f, from);
+                assert_eq!(t, to);
             }
-            Ok(()) => panic!("expected Err for illegal transition {from:?} -> {to:?}"),
+            Ok(()) => panic!("expected Illegal error for {from:?} -> {to:?}"),
         }
     }
 
     #[test]
-    fn check_transition_error_display_format() {
-        let err = check_transition(TaskStatus::Backlog, TaskStatus::Iterating)
-            .expect_err("should be illegal");
-        let rendered = format!("{err}");
-        assert_eq!(
-            rendered, "illegal transition: Backlog -> Iterating",
-            "thiserror Display must match documented format",
-        );
+    fn given_illegal_transition_error_when_displayed_then_matches_spec_format() {
+        let err = TransitionError::Illegal {
+            from: IssueStatus::Done,
+            to: IssueStatus::Failed,
+        };
+        assert_eq!(err.to_string(), "illegal transition: Done -> Failed");
     }
 
-    // ---------- serde ----------
+    #[test]
+    fn given_every_illegal_pair_when_displayed_then_uses_debug_variant_names() {
+        // Independently derive the expected message from Debug formatting and
+        // confirm check_transition's error renders identically across the space.
+        let legal = legal_set();
+        for from in ALL {
+            for to in ALL {
+                if legal.contains(&(from, to)) {
+                    continue;
+                }
+                let err = check_transition(from, to).expect_err("must be illegal");
+                let expected = format!("illegal transition: {from:?} -> {to:?}");
+                assert_eq!(err.to_string(), expected);
+            }
+        }
+    }
+
+    // --- E. serde -----------------------------------------------------------
 
     #[test]
-    fn serde_roundtrip_every_variant_matches_as_str() {
-        for v in ALL_VARIANTS {
-            let json = serde_json::to_string(v)
-                .unwrap_or_else(|e| panic!("serialize failed for {v:?}: {e}"));
-            let inner = json
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .unwrap_or_else(|| panic!("expected quoted JSON string, got {json}"));
-            assert_eq!(inner, v.as_str(), "serde JSON body should equal as_str() for {v:?}");
-            let back: TaskStatus = serde_json::from_str(&json)
-                .unwrap_or_else(|e| panic!("deserialize failed for {json}: {e}"));
-            assert_eq!(back, *v, "serde roundtrip mismatch for {v:?}");
+    fn given_each_variant_when_serialized_then_json_is_quoted_canonical_id() {
+        for (v, id) in STR_IDS {
+            let json = serde_json::to_string(&v).expect("serialize");
+            assert_eq!(json, format!("\"{id}\""), "serialize {v:?}");
         }
     }
 
     #[test]
-    fn serde_pending_feedback_serializes_to_screaming_snake_literal() {
-        let json = serde_json::to_string(&TaskStatus::PendingFeedback).unwrap();
-        assert_eq!(json, "\"PENDING_FEEDBACK\"");
-    }
-
-    #[test]
-    fn serde_deserialize_rejects_lowercase_and_unknown() {
-        for bad in ["\"ready\"", "\"Ready\"", "\"FOO\"", "\"\"", "\"PENDING_FEEDBACK \""] {
-            let r: Result<TaskStatus, _> = serde_json::from_str(bad);
-            assert!(r.is_err(), "deserialize must reject {bad}");
+    fn given_quoted_canonical_id_when_deserialized_then_returns_variant() {
+        for (v, id) in STR_IDS {
+            let parsed: IssueStatus =
+                serde_json::from_str(&format!("\"{id}\"")).expect("deserialize");
+            assert_eq!(parsed, v, "deserialize {id:?}");
         }
     }
 
     #[test]
-    fn serde_deserialize_rejects_non_string_json() {
-        for bad in ["1", "null", "true", "{}", "[]", "{\"Ready\":null}"] {
-            let r: Result<TaskStatus, _> = serde_json::from_str(bad);
-            assert!(r.is_err(), "deserialize must reject non-string JSON: {bad}");
+    fn given_each_variant_when_round_tripped_through_json_then_unchanged() {
+        for v in ALL {
+            let json = serde_json::to_string(&v).expect("serialize");
+            let back: IssueStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, v, "json round-trip {v:?}");
         }
     }
 
-    // ---------- derives: Hash / Eq / Copy ----------
-
-    fn hash_of<T: Hash>(t: &T) -> u64 {
-        let mut h = DefaultHasher::new();
-        t.hash(&mut h);
-        h.finish()
+    #[test]
+    fn given_lowercase_json_string_when_deserialized_then_err() {
+        assert!(serde_json::from_str::<IssueStatus>("\"planning\"").is_err());
     }
 
     #[test]
-    fn hash_eq_consistency_for_all_variants() {
-        for v in ALL_VARIANTS {
-            let copy = *v;
-            assert_eq!(v, &copy);
-            assert_eq!(hash_of(v), hash_of(&copy), "hash differs for equal {v:?}");
+    fn given_unknown_json_string_when_deserialized_then_err() {
+        assert!(serde_json::from_str::<IssueStatus>("\"FOO\"").is_err());
+    }
+
+    #[test]
+    fn given_whitespace_padded_json_string_when_deserialized_then_err() {
+        assert!(serde_json::from_str::<IssueStatus>("\" PLANNING\"").is_err());
+        assert!(serde_json::from_str::<IssueStatus>("\"PLANNING \"").is_err());
+    }
+
+    #[test]
+    fn given_non_string_json_when_deserialized_then_err() {
+        for json in ["1", "null", "true", "{}", "[]"] {
+            assert!(
+                serde_json::from_str::<IssueStatus>(json).is_err(),
+                "non-string JSON {json} must fail"
+            );
         }
-        let set: HashSet<TaskStatus> = ALL_VARIANTS.iter().copied().collect();
-        assert_eq!(set.len(), ALL_VARIANTS.len(), "HashSet must hold every variant uniquely");
-    }
-
-    #[test]
-    fn copy_semantics_does_not_move() {
-        let v = TaskStatus::Ready;
-        let _a = is_legal_transition(v, TaskStatus::Iterating);
-        let _b = is_legal_transition(v, TaskStatus::Qa);
-        let _c = v.is_schedulable();
-        let _d: TaskStatus = v;
     }
 }
-

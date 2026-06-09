@@ -16,11 +16,11 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 
 ## Key Files (planned, mostly stubs at scaffold time)
 
-- `crates/auwsx-core/src/state.rs` — `TaskStatus` enum + transition matrix
-- `crates/auwsx-core/src/pipeline.rs` — one async fn per state transition
-- `crates/auwsx-core/src/scheduler.rs` — per-project tokio ticker (tasks + routines)
-- `crates/auwsx-core/src/drafts.rs` — drafts CRUD + triage execution
-- `crates/auwsx-core/src/followups.rs` — followups + `decide_next_step`
+- `crates/auwsx-core/src/state.rs` — `IssueStatus` enum + scheduler classes + transition matrix
+- `crates/auwsx-core/src/pipeline.rs` — one async fn per actionable phase
+- `crates/auwsx-core/src/scheduler.rs` — per-project tokio ticker (issues + routines)
+- `crates/auwsx-core/src/backlog.rs` — backlog_items CRUD (source/approval) + triage/consolidation
+- `crates/auwsx-core/src/steering.rs` — append-only steering into in-flight issues
 - `crates/auwsx-core/src/main_jobs.rs` — main-workspace lifecycle, queued ops
 - `crates/auwsx-core/src/routines.rs` — cron routines (incl. built-ins: triage, deepsleep, dream, morning-summary)
 - `crates/auwsx-core/src/inbox.rs` — `notify` watcher on `~/.auwsx/inbox/*.txt`
@@ -37,3 +37,5 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - Skills bundled in `skills/`; copied to `~/.claude/skills/` on first run only if missing (never overwrite user copies).
 - All filesystem state outside the repo: `~/.local/share/auwsx/state.db`, `~/.auwsx/inbox/`, `<task-worktree>/.auwsx/`.
 - No AI attribution in commits or PRs.
+
+- Uncertain about project term/schema/convention/prior decision → `/seek <topic>` first (lightweight KB lookup; same tier as grep/Glob).

@@ -5,36 +5,33 @@
 //! short fields; let UIs query DB for full rows when rendering.
 
 use crate::main_jobs::MainJobStatus;
-use crate::state::TaskStatus;
+use crate::state::IssueStatus;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    TaskStatus {
-        task_id: i64,
-        status: TaskStatus,
-        iteration: u32,
+    IssueStatus {
+        issue_id: i64,
+        status: IssueStatus,
     },
-    TaskLog {
-        task_id: i64,
-        iteration: u32,
+    IssueLog {
+        issue_id: i64,
+        phase: String,
         chunk: String,
     },
-    DraftCreated {
-        draft_id: i64,
+    BacklogChanged {
+        item_id: i64,
         project_id: i64,
+        approval: String, // "pending" | "approved" | "dismissed"
     },
-    DraftResolved {
-        draft_id: i64,
-        state: String, // "consumed" | "discarded"
+    FindingAdded {
+        finding_id: i64,
+        issue_id: i64,
     },
-    FollowupCreated {
-        followup_id: i64,
-        task_id: i64,
-    },
-    FollowupDeleted {
-        followup_id: i64,
+    SteeringAdded {
+        steering_id: i64,
+        issue_id: i64,
     },
     MainJobStatus {
         main_job_id: i64,

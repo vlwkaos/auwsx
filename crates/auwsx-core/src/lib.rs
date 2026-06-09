@@ -4,13 +4,13 @@
 //!
 //! Module map (each file references the plan section that drives its behaviour):
 //!
-//! - [`state`]      — `TaskStatus` enum + transition matrix (Plan Step 3)
+//! - [`state`]      — `IssueStatus` enum + transition matrix (Plan Step 3)
 //! - [`pipeline`]   — async fn per state transition; orchestrator (Plan Step 3, 3.8)
-//! - [`scheduler`]  — per-project tokio ticker (tasks + routines) (Plan Step 3, 3.6)
+//! - [`scheduler`]  — per-project tokio ticker (issues + routines) (Plan Step 3, 3.6)
 //! - [`main_jobs`]  — main-workspace lifecycle, queued ops (Plan Step 3.5)
 //! - [`routines`]   — cron routines (incl. built-ins) (Plan Step 3.6)
-//! - [`drafts`]     — drafts CRUD + triage execution (Plan Step 3.7)
-//! - [`followups`]  — followups CRUD + decide_next_step (Plan Step 3.8)
+//! - [`backlog`]    — backlog_items CRUD + triage/consolidation (Plan Step 3.7)
+//! - [`steering`]   — append-only steering into in-flight issues (Plan Step 3.8)
 //! - [`inbox`]      — file-watch async input channel (Plan Step 3.65)
 //! - [`notify`]     — system notifications (Plan Step 7 / north star §5)
 //! - [`launchd`]    — daemon install/uninstall (Plan Step 7 / north star §1)
@@ -22,11 +22,10 @@
 //! - [`config`]     — global + per-project TOML
 
 pub mod agent;
+pub mod backlog;
 pub mod config;
 pub mod db;
-pub mod drafts;
 pub mod events;
-pub mod followups;
 pub mod inbox;
 pub mod ipc;
 pub mod launchd;
@@ -37,5 +36,6 @@ pub mod routines;
 pub mod scheduler;
 pub mod skills;
 pub mod state;
+pub mod steering;
 
 pub use anyhow::{Error, Result};

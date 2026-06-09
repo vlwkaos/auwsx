@@ -1,39 +1,33 @@
-//! Pipeline orchestrator. Plan Step 3, 3.5, 3.8.
+//! Pipeline orchestrator. Plan Step 3.
 //!
-//! Each state transition is either a deterministic app action OR a single
-//! focused agent invocation. The agent NEVER sees the whole pipeline — it
-//! gets a tight per-step prompt. The app glues steps together by writing
-//! deterministic artifacts (`.auwsx/plan.md`, `progress.md`, `summary.md`,
-//! `feedback-{n}.md`, `signal-done`) and reading them back.
+//! The pipeline is a state machine, NOT one mega-prompt. auwsx owns transitions,
+//! invocation, and artifact I/O (deterministic); the agent owns the cognitive
+//! work within a phase. The contract between them is the control CLI (`auwsx
+//! ...` over IPC) plus durable `.auwsx/` artifacts — auwsx never parses prose.
 //!
-//! Core API (to be implemented):
+//! Each `IssueStatus` that is [`crate::state::IssueStatus::is_actionable`] maps
+//! to one phase function here. The scheduler spawns the phase's agent; the agent
+//! sets the next status via the control CLI before it exits; the next tick
+//! advances or halts based purely on that status.
 //!
-//! ```ignore
-//! pub async fn prepare(task: &Task) -> Result<()>;            // pure: create wt, copy env, post-create hooks
-//! pub async fn iterate(task: &Task, n: u32) -> Result<()>;    // agent call (impl/recall/plan/progress)
-//! pub async fn qa(task: &Task, n: u32) -> Result<()>;         // agent call (/backpressure post)
-//! pub async fn decide_next_step(task: &Task, n: u32) -> NextStep;   // explicit fb > followups > PEND_FB
-//! pub async fn complete_commit(task: &Task) -> Result<()>;    // /commit
-//! pub async fn complete_merge(task: &Task) -> Result<()>;     // /gh-pr or local merge
-//! pub async fn propagate_knowledge(task: &Task) -> Result<()>; // /memo + /dream on main
-//! pub async fn cleanup(task: &Task) -> Result<()>;            // kill sessions, delete wt
+//! Phase → role (see `projects.*_agent_cmd`):
+//!
+//! ```text
+//!   CONSOLIDATING  main   delegate-as-steering vs. standalone (no worktree yet)
+//!   PLANNING       plan   write plan.md + subtasks            (worktree created)
+//!   IMPLEMENTING   work   code + progress.md
+//!   REVIEW         review fresh session: findings (3rd eye + devil's advocate)
+//!   NEEDS_FIX      work   adjudicate findings on record, fix
+//!   AUDIT          work   /good-to-go
+//!   COMPLETING     work   rebase + --no-ff merge (+ /memo, post-merge /dream)
 //! ```
 //!
-//! Per-iteration prompts are minimal (Plan Step 3 — "Agent prompts" subsection).
-//! Followup-handoff rules live in `followups::decide_next_step`.
+//! Per-phase prompts are minimal and inline the phase-relevant bundled skill
+//! (see `skills`). Loop caps (`review_max_rounds`, `conflict_max_attempts`) and
+//! the soft-gate deadline live on the `issues` row.
 
-use crate::Result;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum NextStep {
-    /// Followups concat → feedback-{n}.md, auto-advance to READY.
-    AutoAdvanceFromFollowups { followup_ids: Vec<i64> },
-    /// Explicit feedback file present, auto-advance to READY.
-    AutoAdvanceFromExplicit,
-    /// Nothing to do — wait for user.
-    AwaitFeedback,
-}
-
-// TODO: implement transitions per plan. Each fn takes a `&Db`, a `&Task`,
-// and an `&dyn AgentRunner`; emits Events; returns Result<()>.
+// TODO: one async fn per actionable phase, each taking `&Db`, the issue row,
+//       and an `&dyn AgentRunner`; writing the per-phase prompt + context,
+//       spawning the agent, logging to `agent_runs`, and emitting Events.
+// TODO: worktree lifecycle — create at CONSOLIDATING->PLANNING (standalone),
+//       tear down at DONE.

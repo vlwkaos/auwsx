@@ -8,12 +8,17 @@
 //! re-uses if present. Called on daemon start AND on every scheduler tick
 //! (cheap; just shells `tmux has-session` first).
 //!
-//! MainJob queue: serialized through the `-main-agent` session. Sources:
-//!   - post_merge — after a task hits DONE
+//! MainJob queue: serialized through the `-main-agent` session, so routines and
+//! the pipeline's own main-branch ops never race (one main writer per project).
+//! Sources:
+//!   - post_merge — after an issue hits DONE
 //!   - routine — fired by cron/triage scheduler
 //!   - user_oneoff — explicit UI click ([/dream], [/release], custom)
 //!
-//! State: QUEUED → RUNNING → DONE | FAILED. Logs to `<repo>/.auwsx/main/log-{ts}.md`.
+//! State: QUEUED → RUNNING → DONE | FAILED | REJECTED. REJECTED is a `knowledge`
+//! routine whose diff escaped its configured writable_paths (auwsx owns the
+//! commit + path-scope check, so it refuses and flags). Logs to
+//! `<repo>/.auwsx/main/log-{ts}.md`.
 
 use crate::Result;
 use serde::{Deserialize, Serialize};
@@ -33,6 +38,7 @@ pub enum MainJobStatus {
     Running,
     Done,
     Failed,
+    Rejected,
 }
 
 // TODO: ensure_main_sessions(project) — idempotent tmux create

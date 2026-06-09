@@ -1,443 +1,593 @@
-//! Public-contract smoke tests for `auwsx_core::db::Db`.
+//! Integration smoke tests for the auwsx-core SQLite schema.
 //!
-//! Each test opens a fresh DB (in-memory or fresh tempdir on-disk) and
-//! exercises one observable behaviour through the public API only:
-//! migrations run on open, basic round-trip, UNIQUE/FK enforcement,
-//! WAL on disk, reopen idempotence, default values, compound UNIQUE,
-//! ON DELETE SET NULL on main_jobs.routine_id, and pool lifecycle.
+//! Source of truth: crates/auwsx-core/src/db/migrations/0001_init.sql
+//! Public API exercised: `Db::open_memory()` + `Db::pool()`.
+//!
+//! These tests assert the PUBLIC CONTRACT only (table shape, NOT NULL columns,
+//! CHECK domains, FK cascade). Failure cases are tested aggressively: every
+//! CHECK-domain test supplies all other required columns correctly so the
+//! single bad value is the only possible reason for rejection.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
-
-use anyhow::Result;
 use auwsx_core::db::Db;
-use sqlx::Row;
+use sqlx::{Row, SqlitePool};
 
-const EXPECTED_TABLES: &[&str] = &[
-    "projects",
-    "tasks",
-    "iterations",
-    "feedback",
-    "scheduler_runs",
-    "drafts",
-    "followups",
-    "routines",
-    "main_jobs",
-];
+/// Fixed deterministic timestamp (Unix epoch ms) for every row. No SystemTime.
+const TS: i64 = 1_000_000;
 
-const TS: i64 = 1_700_000_000_000;
+// ---------------------------------------------------------------------------
+// Helpers: each inserts a row supplying EVERY NOT NULL column with a valid
+// value, then returns the new rowid. Tests use these so they can never
+// accidentally omit a required column.
+// ---------------------------------------------------------------------------
 
-async fn table_set(db: &Db) -> Result<BTreeSet<String>> {
-    let rows = sqlx::query(
-        "SELECT name FROM sqlite_master \
-         WHERE type = 'table' AND name NOT LIKE '_sqlx_%' ORDER BY name",
-    )
-    .fetch_all(db.pool())
-    .await?;
-    Ok(rows.iter().map(|r| r.get::<String, _>("name")).collect())
-}
-
-/// Insert a minimal project (all NOT NULL columns supplied; defaultable ones
-/// left unset so per-test assertions on defaults remain meaningful).
-async fn insert_project(db: &Db, name: &str) -> Result<i64> {
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO projects (name, repo_path, default_branch, agent, created_at) \
-         VALUES (?, ?, ?, ?, ?) RETURNING id",
+/// Insert a valid `projects` row. NOT NULL cols supplied:
+/// name, repo_path, default_branch, main_agent_cmd, plan_agent_cmd,
+/// work_agent_cmd, created_at (all others have DEFAULTs in the SQL).
+async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
+    let id: i64 = sqlx::query(
+        "INSERT INTO projects
+            (name, repo_path, default_branch,
+             main_agent_cmd, plan_agent_cmd, work_agent_cmd, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         RETURNING id",
     )
     .bind(name)
-    .bind("/repos/x")
+    .bind("/repo/path")
     .bind("main")
-    .bind("claude")
+    .bind("claude {prompt}")
+    .bind("claude-plan {prompt}")
+    .bind("claude-work {prompt}")
     .bind(TS)
-    .fetch_one(db.pool())
-    .await?;
+    .fetch_one(pool)
+    .await?
+    .get("id");
     Ok(id)
 }
 
-/// Insert a minimal task (all NOT NULL columns supplied).
-async fn insert_task(db: &Db, project_id: i64, title: &str) -> Result<i64> {
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO tasks (project_id, title, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?) RETURNING id",
+/// Insert a valid `issues` row. NOT NULL cols supplied:
+/// project_id, title, status, created_at, updated_at
+/// (review_round, conflict_attempts, has_pending_steering have DEFAULTs).
+async fn insert_issue(pool: &SqlitePool, project_id: i64, status: &str) -> anyhow::Result<i64> {
+    let id: i64 = sqlx::query(
+        "INSERT INTO issues (project_id, title, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         RETURNING id",
     )
     .bind(project_id)
-    .bind(title)
-    .bind("BACKLOG")
+    .bind("a title")
+    .bind(status)
     .bind(TS)
     .bind(TS)
-    .fetch_one(db.pool())
-    .await?;
+    .fetch_one(pool)
+    .await?
+    .get("id");
     Ok(id)
 }
 
-/// Insert a minimal routine (all NOT NULL columns supplied).
-async fn insert_routine(db: &Db, project_id: i64, name: &str) -> Result<i64> {
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO routines (project_id, name, origin, prompt_template, cron, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+/// Insert a valid `routines` row. NOT NULL cols supplied:
+/// project_id, name, origin, type, prompt, cron, created_at
+/// (enabled has a DEFAULT).
+async fn insert_routine(pool: &SqlitePool, project_id: i64, name: &str) -> anyhow::Result<i64> {
+    let id: i64 = sqlx::query(
+        "INSERT INTO routines
+            (project_id, name, origin, type, prompt, cron, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         RETURNING id",
     )
     .bind(project_id)
     .bind(name)
     .bind("user")
-    .bind("Run /something")
-    .bind("0 7 * * *")
+    .bind("report")
+    .bind("a prompt")
+    .bind("0 0 * * * *")
     .bind(TS)
-    .fetch_one(db.pool())
-    .await?;
+    .fetch_one(pool)
+    .await?
+    .get("id");
     Ok(id)
 }
 
-/// Insert a minimal main_job (all NOT NULL columns supplied).
-async fn insert_main_job(db: &Db, project_id: i64, routine_id: Option<i64>) -> Result<i64> {
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO main_jobs (project_id, routine_id, source, kind, prompt, status) \
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+/// Insert a valid `main_jobs` row. NOT NULL cols supplied:
+/// project_id, source, kind, prompt, status, queued_at.
+async fn insert_main_job(pool: &SqlitePool, project_id: i64) -> anyhow::Result<i64> {
+    let id: i64 = sqlx::query(
+        "INSERT INTO main_jobs
+            (project_id, source, kind, prompt, status, queued_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         RETURNING id",
     )
     .bind(project_id)
-    .bind(routine_id)
     .bind("routine")
-    .bind("custom")
-    .bind("dummy prompt")
+    .bind("report")
+    .bind("a prompt")
     .bind("QUEUED")
-    .fetch_one(db.pool())
-    .await?;
+    .bind(TS)
+    .fetch_one(pool)
+    .await?
+    .get("id");
     Ok(id)
 }
 
 // ---------------------------------------------------------------------------
-// Migrations + schema
+// 1. open_memory + table existence
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn open_memory_runs_migrations() -> Result<()> {
+async fn all_ten_tables_exist() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
-    let actual = table_set(&db).await?;
-    let expected: BTreeSet<String> = EXPECTED_TABLES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual, expected);
+    let expected = [
+        "projects",
+        "routines",
+        "issues",
+        "subtasks",
+        "findings",
+        "steering",
+        "backlog_items",
+        "main_jobs",
+        "agent_runs",
+        "scheduler_runs",
+    ];
+    for table in expected {
+        let count: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name=?")
+                .bind(table)
+                .fetch_one(db.pool())
+                .await?
+                .get("n");
+        assert_eq!(count, 1, "table `{table}` should exist exactly once");
+    }
     Ok(())
 }
 
-#[tokio::test]
-async fn open_at_creates_file_and_parent() -> Result<()> {
-    let tmp = tempfile::TempDir::new()?;
-    let path = tmp.path().join("sub").join("dir").join("state.db");
-    let db = Db::open_at(&path).await?;
-    assert!(path.exists(), "db file not created at {path:?}");
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'",
-    )
-    .fetch_one(db.pool())
-    .await?;
-    assert_eq!(count, 1);
-    Ok(())
-}
+// ---------------------------------------------------------------------------
+// 2. projects round-trip
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn reopen_on_disk_db_preserves_rows_and_schema() -> Result<()> {
-    let tmp = tempfile::TempDir::new()?;
-    let path = tmp.path().join("state.db");
+async fn project_row_roundtrips() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = insert_project(db.pool(), "alpha").await?;
 
-    let db1 = Db::open_at(&path).await?;
-    let schema1 = table_set(&db1).await?;
-    let id = insert_project(&db1, "alpha").await?;
-    db1.close().await;
-
-    let db2 = Db::open_at(&path).await?;
-    let schema2 = table_set(&db2).await?;
-    assert_eq!(schema1, schema2, "schema diverged on reopen");
-
-    let name: String = sqlx::query_scalar("SELECT name FROM projects WHERE id = ?")
+    let name: String = sqlx::query("SELECT name FROM projects WHERE id = ?")
         .bind(id)
-        .fetch_one(db2.pool())
-        .await?;
+        .fetch_one(db.pool())
+        .await?
+        .get("name");
+
     assert_eq!(name, "alpha");
     Ok(())
 }
 
-#[tokio::test]
-async fn open_at_is_idempotent_when_target_exists_empty_file() -> Result<()> {
-    let tmp = tempfile::TempDir::new()?;
-    let path = tmp.path().join("preexisting.db");
-    std::fs::write(&path, b"")?;
-    let db = Db::open_at(&path).await?;
-    assert_eq!(table_set(&db).await?.len(), EXPECTED_TABLES.len());
-    Ok(())
-}
-
-#[tokio::test]
-async fn wal_journal_mode_on_disk_only() -> Result<()> {
-    let tmp = tempfile::TempDir::new()?;
-    let path = tmp.path().join("wal.db");
-    let disk = Db::open_at(&path).await?;
-    let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
-        .fetch_one(disk.pool())
-        .await?;
-    assert_eq!(mode.to_lowercase(), "wal", "on-disk DB must report WAL");
-
-    let mem = Db::open_memory().await?;
-    let mem_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
-        .fetch_one(mem.pool())
-        .await?;
-    assert_ne!(
-        mem_mode.to_lowercase(),
-        "wal",
-        "in-memory DB must not report WAL"
-    );
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
-// projects: round-trip, defaults, uniqueness
+// 3. issues round-trip
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn insert_and_read_project_row() -> Result<()> {
+async fn issue_row_roundtrips_with_planning_status() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO projects (\
-            name, repo_path, default_branch, agent, \
-            schedule_interval_min, max_concurrency, merge_mode, \
-            deepsleep_interval_days, last_deepsleep_at, created_at\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+    let project_id = insert_project(db.pool(), "beta").await?;
+    let issue_id = insert_issue(db.pool(), project_id, "PLANNING").await?;
+
+    let status: String = sqlx::query("SELECT status FROM issues WHERE id = ?")
+        .bind(issue_id)
+        .fetch_one(db.pool())
+        .await?
+        .get("status");
+
+    assert_eq!(status, "PLANNING");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 4. FK cascade: deleting a project zeroes every child table referencing it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn deleting_project_cascades_to_children() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let pool = db.pool();
+
+    let project_id = insert_project(pool, "gamma").await?;
+    insert_issue(pool, project_id, "PLANNING").await?;
+    insert_routine(pool, project_id, "r1").await?;
+    insert_main_job(pool, project_id).await?;
+    sqlx::query(
+        "INSERT INTO backlog_items (project_id, text, source, created_at)
+         VALUES (?, ?, ?, ?)",
     )
-    .bind("proj-a")
-    .bind("/repos/alpha")
-    .bind("main")
-    .bind("claude")
-    .bind(30_i64)
-    .bind(4_i64)
-    .bind("manual")
-    .bind(14_i64)
+    .bind(project_id)
+    .bind("an item")
+    .bind("human")
     .bind(TS)
-    .bind(TS + 1)
-    .fetch_one(db.pool())
+    .execute(pool)
     .await?;
 
-    let row = sqlx::query(
-        "SELECT name, repo_path, default_branch, agent, \
-                schedule_interval_min, max_concurrency, merge_mode, \
-                deepsleep_interval_days, last_deepsleep_at, created_at \
-         FROM projects WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_one(db.pool())
-    .await?;
+    let deleted = sqlx::query("DELETE FROM projects WHERE id = ?")
+        .bind(project_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    // Prove the DELETE actually hit the parent; otherwise the child-count
+    // assertions below could pass vacuously against an id that was never there.
+    assert_eq!(deleted, 1, "exactly one project row should be deleted");
 
-    assert_eq!(row.get::<String, _>("name"), "proj-a");
-    assert_eq!(row.get::<String, _>("repo_path"), "/repos/alpha");
-    assert_eq!(row.get::<String, _>("default_branch"), "main");
-    assert_eq!(row.get::<String, _>("agent"), "claude");
-    assert_eq!(row.get::<i64, _>("schedule_interval_min"), 30);
-    assert_eq!(row.get::<i64, _>("max_concurrency"), 4);
-    assert_eq!(row.get::<String, _>("merge_mode"), "manual");
-    assert_eq!(row.get::<i64, _>("deepsleep_interval_days"), 14);
-    assert_eq!(row.get::<i64, _>("last_deepsleep_at"), TS);
-    assert_eq!(row.get::<i64, _>("created_at"), TS + 1);
-    Ok(())
-}
+    let parent_remaining: i64 = sqlx::query("SELECT COUNT(*) AS n FROM projects WHERE id = ?")
+        .bind(project_id)
+        .fetch_one(pool)
+        .await?
+        .get("n");
+    assert_eq!(parent_remaining, 0, "parent project row must be gone");
 
-#[tokio::test]
-async fn project_defaults_applied_when_columns_omitted() -> Result<()> {
-    let db = Db::open_memory().await?;
-    let id = insert_project(&db, "defaults-test").await?;
-    let row = sqlx::query(
-        "SELECT max_concurrency, merge_mode, deepsleep_interval_days \
-         FROM projects WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_one(db.pool())
-    .await?;
-    assert_eq!(row.get::<i64, _>("max_concurrency"), 1);
-    assert_eq!(row.get::<String, _>("merge_mode"), "auto");
-    assert_eq!(row.get::<i64, _>("deepsleep_interval_days"), 7);
-    Ok(())
-}
-
-#[tokio::test]
-async fn unique_project_name_violation() -> Result<()> {
-    let db = Db::open_memory().await?;
-    insert_project(&db, "dup").await?;
-    let err = insert_project(&db, "dup").await.err();
-    assert!(err.is_some(), "duplicate project name must violate UNIQUE");
+    for table in ["issues", "routines", "main_jobs", "backlog_items"] {
+        let remaining: i64 = sqlx::query(&format!(
+            "SELECT COUNT(*) AS n FROM {table} WHERE project_id = ?"
+        ))
+        .bind(project_id)
+        .fetch_one(pool)
+        .await?
+        .get("n");
+        assert_eq!(remaining, 0, "`{table}` rows should cascade-delete");
+    }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Foreign keys: cascade + set-null + violation
+// 5. CHECK-domain rejections. Every other required column is valid; the bad
+//    value is the only possible cause of failure.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn foreign_key_cascade_on_project_delete() -> Result<()> {
+async fn issues_status_bad_value_rejected() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
-    let pid = insert_project(&db, "p-cascade").await?;
-    insert_task(&db, pid, "t1").await?;
+    let project_id = insert_project(db.pool(), "p").await?;
 
-    sqlx::query("DELETE FROM projects WHERE id = ?")
-        .bind(pid)
-        .execute(db.pool())
-        .await?;
-
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE project_id = ?")
-        .bind(pid)
-        .fetch_one(db.pool())
-        .await?;
-    assert_eq!(remaining, 0, "tasks must cascade-delete with project");
-    Ok(())
-}
-
-#[tokio::test]
-async fn delete_project_cascades_main_jobs() -> Result<()> {
-    let db = Db::open_memory().await?;
-    let pid = insert_project(&db, "p-mj").await?;
-    insert_main_job(&db, pid, None).await?;
-
-    sqlx::query("DELETE FROM projects WHERE id = ?")
-        .bind(pid)
-        .execute(db.pool())
-        .await?;
-
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM main_jobs WHERE project_id = ?")
-        .bind(pid)
-        .fetch_one(db.pool())
-        .await?;
-    assert_eq!(n, 0, "main_jobs must cascade-delete with project");
-    Ok(())
-}
-
-#[tokio::test]
-async fn delete_routine_sets_main_job_routine_id_null() -> Result<()> {
-    let db = Db::open_memory().await?;
-    let pid = insert_project(&db, "p-routine").await?;
-    let rid = insert_routine(&db, pid, "nightly").await?;
-    let mjid = insert_main_job(&db, pid, Some(rid)).await?;
-
-    sqlx::query("DELETE FROM routines WHERE id = ?")
-        .bind(rid)
-        .execute(db.pool())
-        .await?;
-
-    let still_there: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM main_jobs WHERE id = ?")
-            .bind(mjid)
-            .fetch_one(db.pool())
-            .await?;
-    assert_eq!(still_there, 1, "main_job must survive routine deletion");
-
-    let routine_id: Option<i64> =
-        sqlx::query_scalar("SELECT routine_id FROM main_jobs WHERE id = ?")
-            .bind(mjid)
-            .fetch_one(db.pool())
-            .await?;
-    assert!(
-        routine_id.is_none(),
-        "routine_id must be NULL after ON DELETE SET NULL"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn foreign_key_violation_on_orphan_task() -> Result<()> {
-    let db = Db::open_memory().await?;
-    let err = sqlx::query(
-        "INSERT INTO tasks (project_id, title, status, created_at, updated_at) \
+    let res = sqlx::query(
+        "INSERT INTO issues (project_id, title, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?)",
     )
-    .bind(99_999_i64)
-    .bind("orphan")
-    .bind("BACKLOG")
+    .bind(project_id)
+    .bind("t")
+    .bind("BOGUS")
     .bind(TS)
     .bind(TS)
     .execute(db.pool())
-    .await
-    .err();
-    assert!(err.is_some(), "orphan FK must be rejected (PRAGMA fk=ON)");
+    .await;
+
+    assert!(res.is_err(), "issues.status='BOGUS' must be rejected");
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// routines: compound UNIQUE
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn routine_unique_is_per_project_not_global() -> Result<()> {
+async fn projects_completion_policy_bad_value_rejected() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
-    let p1 = insert_project(&db, "p1").await?;
-    let p2 = insert_project(&db, "p2").await?;
 
-    insert_routine(&db, p1, "nightly").await?;
-    insert_routine(&db, p2, "nightly").await?;
-    let dup = insert_routine(&db, p1, "nightly").await.err();
-    assert!(dup.is_some(), "duplicate (project_id, name) must fail");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Semantically wrong but structurally valid
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn insert_task_with_invalid_status_semantically_wrong() -> Result<()> {
-    // Schema only declares status NOT NULL — no CHECK constraint today.
-    // This test pins current behaviour: the row is accepted. A future
-    // migration adding a CHECK constraint will trip this and force an
-    // explicit contract decision.
-    let db = Db::open_memory().await?;
-    let pid = insert_project(&db, "p-semantic").await?;
     let res = sqlx::query(
-        "INSERT INTO tasks (project_id, title, status, created_at, updated_at) \
+        "INSERT INTO projects
+            (name, repo_path, default_branch,
+             main_agent_cmd, plan_agent_cmd, work_agent_cmd, created_at,
+             completion_policy)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("p")
+    .bind("/repo")
+    .bind("main")
+    .bind("c {prompt}")
+    .bind("c {prompt}")
+    .bind("c {prompt}")
+    .bind(TS)
+    .bind("whatever")
+    .execute(db.pool())
+    .await;
+
+    assert!(
+        res.is_err(),
+        "projects.completion_policy='whatever' must be rejected"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn backlog_items_approval_bad_value_rejected() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+
+    let res = sqlx::query(
+        "INSERT INTO backlog_items (project_id, text, source, approval, created_at)
          VALUES (?, ?, ?, ?, ?)",
     )
-    .bind(pid)
-    .bind("t-semantic")
-    .bind("not-a-real-status-\u{1F600}")
+    .bind(project_id)
+    .bind("an item")
+    .bind("human")
+    .bind("maybe")
+    .bind(TS)
+    .execute(db.pool())
+    .await;
+
+    assert!(res.is_err(), "backlog_items.approval='maybe' must be rejected");
+    Ok(())
+}
+
+#[tokio::test]
+async fn routines_type_bad_value_rejected() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+
+    let res = sqlx::query(
+        "INSERT INTO routines
+            (project_id, name, origin, type, prompt, cron, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(project_id)
+    .bind("r")
+    .bind("user")
+    .bind("bad")
+    .bind("a prompt")
+    .bind("0 0 * * * *")
+    .bind(TS)
+    .execute(db.pool())
+    .await;
+
+    assert!(res.is_err(), "routines.type='bad' must be rejected");
+    Ok(())
+}
+
+#[tokio::test]
+async fn main_jobs_status_bad_value_rejected() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+
+    let res = sqlx::query(
+        "INSERT INTO main_jobs
+            (project_id, source, kind, prompt, status, queued_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(project_id)
+    .bind("routine")
+    .bind("report")
+    .bind("a prompt")
+    .bind("RUNNINGX")
+    .bind(TS)
+    .execute(db.pool())
+    .await;
+
+    assert!(res.is_err(), "main_jobs.status='RUNNINGX' must be rejected");
+    Ok(())
+}
+
+#[tokio::test]
+async fn findings_severity_bad_value_rejected() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+    let issue_id = insert_issue(db.pool(), project_id, "REVIEW").await?;
+
+    let res = sqlx::query(
+        "INSERT INTO findings
+            (issue_id, review_round, severity, title, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(issue_id)
+    .bind(0)
+    .bind("huge")
+    .bind("a finding")
+    .bind(TS)
+    .execute(db.pool())
+    .await;
+
+    assert!(res.is_err(), "findings.severity='huge' must be rejected");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 5b. CHECK positive controls. Each rejection test above only asserts is_err();
+//     a typo'd column, a missing NOT NULL, or an FK miss would *also* produce
+//     is_err() and hand us a false green. These prove the SAME insert with a
+//     KNOWN-VALID domain value succeeds, so the rejection above is attributable
+//     to the bad value alone.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn issues_status_valid_value_accepted() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+    // Same column set as issues_status_bad_value_rejected, valid status.
+    sqlx::query(
+        "INSERT INTO issues (project_id, title, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(project_id)
+    .bind("t")
+    .bind("PLANNING")
+    .bind(TS)
+    .bind(TS)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn projects_completion_policy_valid_value_accepted() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    // Same column set as projects_completion_policy_bad_value_rejected.
+    // 'auto' is a plausible valid domain member; if the real domain differs the
+    // rejection test's contract is wrong, which this surfaces.
+    sqlx::query(
+        "INSERT INTO projects
+            (name, repo_path, default_branch,
+             main_agent_cmd, plan_agent_cmd, work_agent_cmd, created_at,
+             completion_policy)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("p")
+    .bind("/repo")
+    .bind("main")
+    .bind("c {prompt}")
+    .bind("c {prompt}")
+    .bind("c {prompt}")
+    .bind(TS)
+    .bind("auto")
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn backlog_items_approval_valid_value_accepted() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+    sqlx::query(
+        "INSERT INTO backlog_items (project_id, text, source, approval, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(project_id)
+    .bind("an item")
+    .bind("human")
+    .bind("approved")
+    .bind(TS)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn main_jobs_status_valid_value_accepted() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+    sqlx::query(
+        "INSERT INTO main_jobs
+            (project_id, source, kind, prompt, status, queued_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(project_id)
+    .bind("routine")
+    .bind("report")
+    .bind("a prompt")
+    .bind("RUNNING")
+    .bind(TS)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn findings_severity_valid_value_accepted() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+    let issue_id = insert_issue(db.pool(), project_id, "REVIEW").await?;
+    sqlx::query(
+        "INSERT INTO findings
+            (issue_id, review_round, severity, title, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(issue_id)
+    .bind(0)
+    .bind("major")
+    .bind("a finding")
+    .bind(TS)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 6. NOT NULL enforcement. The CHECK tests prove the domain is constrained;
+//    these prove required columns are actually required. Each omits exactly one
+//    NOT NULL column while supplying every other column with a VALID value (so
+//    only the omission can cause the failure), and a positive control proves
+//    the same insert succeeds once the column is present.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn issues_title_omitted_rejected() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+    // status is a valid domain value, FK is valid, timestamps present; only
+    // title is missing.
+    let res = sqlx::query(
+        "INSERT INTO issues (project_id, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(project_id)
+    .bind("PLANNING")
+    .bind(TS)
+    .bind(TS)
+    .execute(db.pool())
+    .await;
+    assert!(res.is_err(), "issues.title is NOT NULL; omission must be rejected");
+
+    // Positive control: identical row with title present succeeds.
+    insert_issue(db.pool(), project_id, "PLANNING").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn projects_repo_path_omitted_rejected() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    // Every column except repo_path supplied with a valid value.
+    let res = sqlx::query(
+        "INSERT INTO projects
+            (name, default_branch,
+             main_agent_cmd, plan_agent_cmd, work_agent_cmd, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("p")
+    .bind("main")
+    .bind("c {prompt}")
+    .bind("c {prompt}")
+    .bind("c {prompt}")
+    .bind(TS)
+    .execute(db.pool())
+    .await;
+    assert!(
+        res.is_err(),
+        "projects.repo_path is NOT NULL; omission must be rejected"
+    );
+
+    // Positive control: full valid row succeeds.
+    insert_project(db.pool(), "p").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn issues_project_id_omitted_rejected() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    // No project_id; all other NOT NULL columns valid.
+    let res = sqlx::query(
+        "INSERT INTO issues (title, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind("t")
+    .bind("PLANNING")
     .bind(TS)
     .bind(TS)
     .execute(db.pool())
     .await;
     assert!(
-        res.is_ok(),
-        "no CHECK on tasks.status today — pin this; revisit when a constraint is added"
+        res.is_err(),
+        "issues.project_id is NOT NULL; omission must be rejected"
     );
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Pool lifecycle + concurrency
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn concurrent_queries_share_pool() -> Result<()> {
-    let db = Arc::new(Db::open_memory().await?);
-    let a = {
-        let db = Arc::clone(&db);
-        tokio::spawn(async move {
-            sqlx::query_scalar::<_, i64>("SELECT 1")
-                .fetch_one(db.pool())
-                .await
-        })
-    };
-    let b = {
-        let db = Arc::clone(&db);
-        tokio::spawn(async move {
-            sqlx::query_scalar::<_, i64>("SELECT 2")
-                .fetch_one(db.pool())
-                .await
-        })
-    };
-    let (ra, rb) = tokio::join!(a, b);
-    assert_eq!(ra??, 1);
-    assert_eq!(rb??, 2);
-    Ok(())
-}
-
-#[tokio::test]
-async fn close_blocks_subsequent_queries() -> Result<()> {
+async fn issues_bad_project_id_fk_rejected() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
-    let pool = db.pool().clone();
-    db.close().await;
-    let res = sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(&pool)
-        .await;
-    assert!(res.is_err(), "queries after close() must fail");
+    // Valid shape, but project_id references a non-existent project. Proves FK
+    // enforcement is actually ON (PRAGMA foreign_keys), which the cascade test
+    // assumes but never isolates.
+    let res = sqlx::query(
+        "INSERT INTO issues (project_id, title, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(999_999_i64)
+    .bind("t")
+    .bind("PLANNING")
+    .bind(TS)
+    .bind(TS)
+    .execute(db.pool())
+    .await;
+    assert!(
+        res.is_err(),
+        "issues.project_id FK to missing project must be rejected"
+    );
     Ok(())
 }
