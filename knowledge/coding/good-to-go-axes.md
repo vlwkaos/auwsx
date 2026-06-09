@@ -27,6 +27,8 @@ Pairs to keep in lockstep (`src/db/migrations/0001_init.sql` is source of truth)
 | `db::projects::CompletionPolicy` (snake) | `projects.completion_policy` |
 | `db::findings::Severity` (snake) | `findings.severity` |
 | `db::findings::FindingStatus` (snake) | `findings.status` |
+| `db::agent_runs::Role` (snake) | `agent_runs.role` |
+| `agent::ExitKind` (snake) | `agent_runs.exit_kind` |
 
 These enums use hand-rolled `as_str`/`from_str` (NOT serde) for the SQL bind,
 mirroring `IssueStatus`. `tests/crud.rs` proves parity at runtime with a
