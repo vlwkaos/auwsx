@@ -86,6 +86,9 @@ async fn add_project(db: &Db, bus: &tokio::sync::broadcast::Sender<Event>, name:
                 plan_agent_cmd: "p {prompt}".to_string(),
                 work_agent_cmd: "w {prompt}".to_string(),
                 review_agent_cmd: None,
+                completion_policy: None,
+                plan_gate_timeout_min: None,
+                completion_soft_timeout_min: None,
             },
         )
         .await,
@@ -106,6 +109,9 @@ async fn backlog_seed_project(db: &Db) -> anyhow::Result<i64> {
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
         },
         TS,
     )
@@ -163,6 +169,9 @@ async fn given_duplicate_name_when_add_project_then_err() -> anyhow::Result<()> 
             plan_agent_cmd: "p".to_string(),
             work_agent_cmd: "w".to_string(),
             review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
         },
     )
     .await;
@@ -1250,6 +1259,9 @@ async fn given_running_server_when_request_add_project_then_id() -> anyhow::Resu
             plan_agent_cmd: "p".to_string(),
             work_agent_cmd: "w".to_string(),
             review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
         },
     )
     .await?;
@@ -1288,6 +1300,9 @@ async fn given_running_server_when_request_list_projects_then_projects_vec() -> 
             plan_agent_cmd: "p".to_string(),
             work_agent_cmd: "w".to_string(),
             review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
         },
     )
     .await?;

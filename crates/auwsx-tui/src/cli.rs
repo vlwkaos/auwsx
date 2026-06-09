@@ -8,6 +8,7 @@
 use anyhow::{bail, Context, Result};
 use auwsx_core::backlog::{Approval, Source};
 use auwsx_core::db::findings::Severity;
+use auwsx_core::db::projects::CompletionPolicy;
 use auwsx_core::events;
 use auwsx_core::ipc::{self, Command, Response};
 use auwsx_core::state::IssueStatus;
@@ -39,7 +40,9 @@ USAGE:
   auwsx ping                    check the daemon is up
 
   auwsx project add <name> <repo_path> --branch <b> \\
-        --main <cmd> --plan <cmd> --work <cmd> [--review <cmd>]
+        --main <cmd> --plan <cmd> --work <cmd> [--review <cmd>] \\
+        [--completion-policy manual|soft|auto] \\
+        [--plan-gate-timeout <min>] [--completion-timeout <min>]
   auwsx project ls
 
   auwsx backlog add <project_id> <text...> [--source human|agent|routine|inbox]
@@ -111,6 +114,15 @@ fn parse_project(args: &[String]) -> Result<CliAction> {
             plan_agent_cmd: p.req_flag("plan")?,
             work_agent_cmd: p.req_flag("work")?,
             review_agent_cmd: p.flag("review"),
+            completion_policy: match p.flag("completion-policy") {
+                Some(s) => Some(
+                    CompletionPolicy::from_str(&s)
+                        .with_context(|| format!("invalid --completion-policy {s:?}"))?,
+                ),
+                None => None,
+            },
+            plan_gate_timeout_min: p.opt_int("plan-gate-timeout")?,
+            completion_soft_timeout_min: p.opt_int("completion-timeout")?,
         },
         "ls" | "list" => Command::ListProjects,
         other => bail!("unknown `project` subcommand: {other}"),
@@ -334,6 +346,19 @@ impl Parsed {
             .with_context(|| format!("<{name}> must be an integer, got {raw:?}"))
     }
 
+    /// Parse an optional `--key <int>` flag. Absent ⇒ `None`; present-but-not-an
+    /// integer ⇒ `Err` (so `--plan-gate-timeout abc` is rejected, not silently
+    /// dropped).
+    fn opt_int(&self, key: &str) -> Result<Option<i64>> {
+        match self.flag(key) {
+            None => Ok(None),
+            Some(raw) => raw
+                .parse::<i64>()
+                .map(Some)
+                .with_context(|| format!("--{key} must be an integer, got {raw:?}")),
+        }
+    }
+
     /// Join positionals from `idx` to the end into one space-separated string.
     fn rest_from(&self, idx: usize, name: &str) -> Result<String> {
         if idx >= self.positionals.len() {
@@ -461,6 +486,13 @@ fn print_response(resp: Response) -> bool {
             println!("repo:   {}", p.repo_path);
             println!("branch: {}", p.default_branch);
             println!("agents: main={} plan={} work={}", p.main_agent_cmd, p.plan_agent_cmd, p.work_agent_cmd);
+            println!(
+                "policy: completion={} plan_gate={}min completion_soft={}min concurrency={}",
+                p.completion_policy.as_str(),
+                p.plan_gate_timeout_min,
+                p.completion_soft_timeout_min,
+                p.max_concurrency
+            );
         }
         Response::Project(None) => println!("not found"),
         Response::Backlog(items) => {
@@ -607,6 +639,9 @@ mod tests {
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
                 review_agent_cmd: None,
+                completion_policy: None,
+                plan_gate_timeout_min: None,
+                completion_soft_timeout_min: None,
             })
         );
     }
@@ -627,6 +662,9 @@ mod tests {
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
                 review_agent_cmd: Some("rc".to_string()),
+                completion_policy: None,
+                plan_gate_timeout_min: None,
+                completion_soft_timeout_min: None,
             })
         );
     }
@@ -979,5 +1017,282 @@ mod tests {
                 pending_only: true,
             })
         );
+    }
+
+    // --- project add: completion-policy / gate-timeout flags ----------------
+
+    #[test]
+    fn given_baseline_when_parsed_then_addproject_with_all_optional_fields_none() {
+        assert_eq!(
+            parse(&argv(&[
+                "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::AddProject {
+                name: "demo".to_string(),
+                repo_path: "/repo".to_string(),
+                default_branch: "main".to_string(),
+                main_agent_cmd: "mc".to_string(),
+                plan_agent_cmd: "pc".to_string(),
+                work_agent_cmd: "wc".to_string(),
+                review_agent_cmd: None,
+                completion_policy: None,
+                plan_gate_timeout_min: None,
+                completion_soft_timeout_min: None,
+            })
+        );
+    }
+
+    #[test]
+    fn given_completion_policy_auto_when_parsed_then_policy_some_auto() {
+        let CliAction::Request(Command::AddProject { completion_policy, .. }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-policy", "auto",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(completion_policy, Some(CompletionPolicy::Auto));
+    }
+
+    #[test]
+    fn given_completion_policy_soft_when_parsed_then_policy_some_soft() {
+        let CliAction::Request(Command::AddProject { completion_policy, .. }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-policy", "soft",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(completion_policy, Some(CompletionPolicy::Soft));
+    }
+
+    #[test]
+    fn given_completion_policy_bogus_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-policy", "bogus",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_completion_policy_uppercase_when_parsed_then_err() {
+        // from_str is exact lowercase; `AUTO` is not a known variant.
+        assert!(parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-policy", "AUTO",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_completion_policy_empty_value_via_equals_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-policy=",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_completion_policy_equals_form_when_parsed_then_some_auto() {
+        let CliAction::Request(Command::AddProject { completion_policy, .. }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-policy=auto",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(completion_policy, Some(CompletionPolicy::Auto));
+    }
+
+    #[test]
+    fn given_plan_gate_timeout_zero_when_parsed_then_some_zero() {
+        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--plan-gate-timeout", "0",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(plan_gate_timeout_min, Some(0));
+    }
+
+    #[test]
+    fn given_plan_gate_timeout_fifteen_when_parsed_then_some_fifteen() {
+        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--plan-gate-timeout", "15",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(plan_gate_timeout_min, Some(15));
+    }
+
+    #[test]
+    fn given_plan_gate_timeout_non_integer_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--plan-gate-timeout", "notanint",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_negative_plan_gate_timeout_when_parsed_then_some_negative() {
+        // `-5` is taken as the flag value (not another flag) and i64 accepts it;
+        // no sign validation at the parse layer.
+        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--plan-gate-timeout", "-5",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(plan_gate_timeout_min, Some(-5));
+    }
+
+    #[test]
+    fn given_bare_plan_gate_timeout_flag_at_end_when_parsed_then_none() {
+        // A `--key` with no following value is classified as a boolean flag, so
+        // the optional int reads as absent (None), not an error. ^ pins this.
+        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--plan-gate-timeout",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(plan_gate_timeout_min, None);
+    }
+
+    #[test]
+    fn given_completion_timeout_thirty_when_parsed_then_some_thirty() {
+        let CliAction::Request(Command::AddProject { completion_soft_timeout_min, .. }) =
+            parse(&argv(&[
+                "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+                "--completion-timeout", "30",
+            ]))
+            .unwrap()
+        else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(completion_soft_timeout_min, Some(30));
+    }
+
+    #[test]
+    fn given_completion_timeout_non_integer_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-timeout", "abc",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_large_completion_timeout_when_parsed_then_some_i64_max() {
+        let CliAction::Request(Command::AddProject { completion_soft_timeout_min, .. }) =
+            parse(&argv(&[
+                "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+                "--completion-timeout", "9223372036854775807",
+            ]))
+            .unwrap()
+        else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(completion_soft_timeout_min, Some(i64::MAX));
+    }
+
+    #[test]
+    fn given_all_three_new_flags_when_parsed_then_addproject_carries_each() {
+        assert_eq!(
+            parse(&argv(&[
+                "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+                "--completion-policy", "soft", "--plan-gate-timeout", "0", "--completion-timeout",
+                "45"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::AddProject {
+                name: "demo".to_string(),
+                repo_path: "/repo".to_string(),
+                default_branch: "main".to_string(),
+                main_agent_cmd: "mc".to_string(),
+                plan_agent_cmd: "pc".to_string(),
+                work_agent_cmd: "wc".to_string(),
+                review_agent_cmd: None,
+                completion_policy: Some(CompletionPolicy::Soft),
+                plan_gate_timeout_min: Some(0),
+                completion_soft_timeout_min: Some(45),
+            })
+        );
+    }
+
+    #[test]
+    fn given_completion_timeout_overflow_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-timeout", "9223372036854775808",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_plan_gate_timeout_overflow_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--plan-gate-timeout", "99999999999999999999",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_completion_policy_repeated_when_parsed_then_last_wins_soft() {
+        let CliAction::Request(Command::AddProject { completion_policy, .. }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-policy", "auto", "--completion-policy", "soft",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(completion_policy, Some(CompletionPolicy::Soft));
+    }
+
+    #[test]
+    fn given_completion_policy_whitespace_value_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-policy", " ",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_plan_gate_timeout_equals_form_zero_when_parsed_then_some_zero() {
+        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--plan-gate-timeout=0",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(plan_gate_timeout_min, Some(0));
+    }
+
+    #[test]
+    fn given_policy_only_flag_when_parsed_then_timeouts_stay_none() {
+        let CliAction::Request(Command::AddProject {
+            plan_gate_timeout_min,
+            completion_soft_timeout_min,
+            ..
+        }) = parse(&argv(&[
+            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "--completion-policy", "auto",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!((plan_gate_timeout_min, completion_soft_timeout_min), (None, None));
     }
 }

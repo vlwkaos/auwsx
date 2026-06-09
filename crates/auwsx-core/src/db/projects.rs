@@ -97,6 +97,11 @@ pub struct Project {
 }
 
 /// Required inputs for [`create`]; every other column takes its SQL DEFAULT.
+///
+/// The three `Option` policy fields are overrides: `None` leaves the migration's
+/// DEFAULT in place (so the default lives in exactly one place), `Some` replaces
+/// it. They are the knobs an autonomous run needs to clear its soft gates
+/// (`completion_policy=auto` + `plan_gate_timeout_min=0` ⇒ no human stop).
 #[derive(Debug, Clone)]
 pub struct NewProject<'a> {
     pub name: &'a str,
@@ -107,6 +112,12 @@ pub struct NewProject<'a> {
     pub work_agent_cmd: &'a str,
     /// NULL falls back to `work_agent_cmd` at spawn (still a fresh third-eye).
     pub review_agent_cmd: Option<&'a str>,
+    /// Gate policy for `ENDED -> COMPLETING`. None ⇒ DB default (`manual`).
+    pub completion_policy: Option<CompletionPolicy>,
+    /// Soft-release delay for `PLANNED -> IMPLEMENTING`. None ⇒ DB default.
+    pub plan_gate_timeout_min: Option<i64>,
+    /// Soft-release delay for `ENDED -> COMPLETING` under `soft`. None ⇒ DB default.
+    pub completion_soft_timeout_min: Option<i64>,
 }
 
 impl Project {
@@ -155,7 +166,11 @@ impl Project {
     }
 }
 
-/// Insert a project with default policy. Returns the new id.
+/// Insert a project. Required columns are supplied; all policy columns take
+/// their SQL DEFAULT unless the matching `NewProject` override is `Some`. Any
+/// override is applied in the same call via a `COALESCE` UPDATE (NULL keeps the
+/// just-defaulted value), so the migration remains the single source of truth
+/// for defaults. Returns the new id.
 pub async fn create(pool: &SqlitePool, new: NewProject<'_>, now: i64) -> Result<i64> {
     let id: i64 = sqlx::query(
         "INSERT INTO projects
@@ -176,6 +191,27 @@ pub async fn create(pool: &SqlitePool, new: NewProject<'_>, now: i64) -> Result<
     .fetch_one(pool)
     .await?
     .get("id");
+
+    // Apply policy overrides only when at least one is set — COALESCE leaves
+    // unspecified columns at their DEFAULT.
+    if new.completion_policy.is_some()
+        || new.plan_gate_timeout_min.is_some()
+        || new.completion_soft_timeout_min.is_some()
+    {
+        sqlx::query(
+            "UPDATE projects SET
+                completion_policy = COALESCE(?, completion_policy),
+                plan_gate_timeout_min = COALESCE(?, plan_gate_timeout_min),
+                completion_soft_timeout_min = COALESCE(?, completion_soft_timeout_min)
+             WHERE id = ?",
+        )
+        .bind(new.completion_policy.map(|p| p.as_str()))
+        .bind(new.plan_gate_timeout_min)
+        .bind(new.completion_soft_timeout_min)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    }
     Ok(id)
 }
 

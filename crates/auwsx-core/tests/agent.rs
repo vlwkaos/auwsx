@@ -43,6 +43,9 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             plan_agent_cmd: "claude-plan {prompt}",
             work_agent_cmd: "claude-work {prompt}",
             review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
         },
         TS,
     )

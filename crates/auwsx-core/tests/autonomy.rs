@@ -510,17 +510,12 @@ async fn drive_project(pool: &SqlitePool) -> anyhow::Result<i64> {
             plan_agent_cmd: "plan {prompt}",
             work_agent_cmd: "work {prompt}",
             review_agent_cmd: None,
+            completion_policy: Some(CompletionPolicy::Auto),
+            plan_gate_timeout_min: Some(0),
+            completion_soft_timeout_min: None,
         },
         TS,
     )
-    .await?;
-    sqlx::query(
-        "UPDATE projects
-           SET completion_policy = 'auto', plan_gate_timeout_min = 0, max_concurrency = 1
-         WHERE id = ?",
-    )
-    .bind(id)
-    .execute(pool)
     .await?;
     Ok(id)
 }

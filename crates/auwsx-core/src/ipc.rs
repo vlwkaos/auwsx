@@ -17,7 +17,7 @@ use crate::backlog::{self, Approval, BacklogItem, Source};
 use crate::db::{
     findings::{self, Finding, NewFinding, Severity},
     issues::{self, Issue},
-    projects::{self, NewProject, Project},
+    projects::{self, CompletionPolicy, NewProject, Project},
     subtasks::{self, Subtask},
     Db,
 };
@@ -53,6 +53,10 @@ pub enum Command {
         plan_agent_cmd: String,
         work_agent_cmd: String,
         review_agent_cmd: Option<String>,
+        /// Policy overrides; `None` leaves the DB DEFAULT untouched.
+        completion_policy: Option<CompletionPolicy>,
+        plan_gate_timeout_min: Option<i64>,
+        completion_soft_timeout_min: Option<i64>,
     },
 
     // --- backlog ---
@@ -258,6 +262,9 @@ async fn dispatch_inner(
             plan_agent_cmd,
             work_agent_cmd,
             review_agent_cmd,
+            completion_policy,
+            plan_gate_timeout_min,
+            completion_soft_timeout_min,
         } => {
             let id = projects::create(
                 pool,
@@ -269,6 +276,9 @@ async fn dispatch_inner(
                     plan_agent_cmd: &plan_agent_cmd,
                     work_agent_cmd: &work_agent_cmd,
                     review_agent_cmd: review_agent_cmd.as_deref(),
+                    completion_policy,
+                    plan_gate_timeout_min,
+                    completion_soft_timeout_min,
                 },
                 now,
             )

@@ -43,6 +43,9 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             plan_agent_cmd: "claude-plan {prompt}",
             work_agent_cmd: "claude-work {prompt}",
             review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
         },
         TS,
     )
@@ -129,6 +132,9 @@ async fn given_review_agent_cmd_some_when_created_then_review_agent_cmd_roundtri
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: Some("reviewer {prompt}"),
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
         },
         TS,
     )
@@ -1811,5 +1817,278 @@ async fn given_dangling_issue_id_when_finding_added_then_err() -> anyhow::Result
     let db = Db::open_memory().await?;
     let res = findings::add(db.pool(), new_finding(999_999), TS).await;
     assert!(res.is_err(), "findings::add with a dangling issue_id must Err");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// projects::create — policy overrides (None keeps DB DEFAULT; Some overrides
+// only that column via COALESCE, leaving siblings at their defaults).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_completion_policy_some_auto_when_created_then_completion_policy_is_auto(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_auto_policy",
+            repo_path: "/repo",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: Some(CompletionPolicy::Auto),
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
+        },
+        TS,
+    )
+    .await?;
+    let row = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(row.completion_policy, CompletionPolicy::Auto);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_completion_policy_some_auto_when_created_then_plan_gate_sibling_stays_10(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_auto_sibling_plan",
+            repo_path: "/repo",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: Some(CompletionPolicy::Auto),
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
+        },
+        TS,
+    )
+    .await?;
+    let row = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(row.plan_gate_timeout_min, 10);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_completion_policy_some_auto_when_created_then_soft_timeout_sibling_stays_60(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_auto_sibling_soft",
+            repo_path: "/repo",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: Some(CompletionPolicy::Auto),
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
+        },
+        TS,
+    )
+    .await?;
+    let row = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(row.completion_soft_timeout_min, 60);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_plan_gate_timeout_some_zero_when_created_then_plan_gate_is_0(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_plan_gate_zero",
+            repo_path: "/repo",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: Some(0),
+            completion_soft_timeout_min: None,
+        },
+        TS,
+    )
+    .await?;
+    let row = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(row.plan_gate_timeout_min, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_plan_gate_timeout_some_zero_when_created_then_completion_policy_sibling_stays_manual(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_plan_gate_zero_sibling",
+            repo_path: "/repo",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: Some(0),
+            completion_soft_timeout_min: None,
+        },
+        TS,
+    )
+    .await?;
+    let row = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(row.completion_policy, CompletionPolicy::Manual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_soft_timeout_30_and_policy_soft_when_created_then_soft_timeout_is_30(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_soft_30",
+            repo_path: "/repo",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: Some(CompletionPolicy::Soft),
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: Some(30),
+        },
+        TS,
+    )
+    .await?;
+    let row = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(row.completion_soft_timeout_min, 30);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_soft_timeout_30_and_policy_soft_when_created_then_completion_policy_is_soft(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_soft_30_policy",
+            repo_path: "/repo",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: Some(CompletionPolicy::Soft),
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: Some(30),
+        },
+        TS,
+    )
+    .await?;
+    let row = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(row.completion_policy, CompletionPolicy::Soft);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_all_three_overrides_when_created_then_each_persists_independently(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_trio",
+            repo_path: "/r",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: Some(CompletionPolicy::Soft),
+            plan_gate_timeout_min: Some(0),
+            completion_soft_timeout_min: Some(45),
+        },
+        TS,
+    )
+    .await?;
+    let p = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(
+        (p.completion_policy, p.plan_gate_timeout_min, p.completion_soft_timeout_min),
+        (CompletionPolicy::Soft, 0, 45)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_negative_plan_gate_timeout_override_when_created_then_stored_verbatim(
+) -> anyhow::Result<()> {
+    // Structurally valid but semantically odd: no CHECK on the timeout columns,
+    // so the override path stores a negative verbatim (and leaves siblings alone).
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_neg",
+            repo_path: "/r",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: Some(-5),
+            completion_soft_timeout_min: None,
+        },
+        TS,
+    )
+    .await?;
+    let p = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!((p.plan_gate_timeout_min, p.completion_soft_timeout_min), (-5, 60));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_soft_timeout_override_alone_when_created_then_persists_and_policy_stays_manual(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "proj_soft_alone",
+            repo_path: "/r",
+            default_branch: "main",
+            main_agent_cmd: "m",
+            plan_agent_cmd: "p",
+            work_agent_cmd: "w",
+            review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: Some(45),
+        },
+        TS,
+    )
+    .await?;
+    let p = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(
+        (p.completion_policy, p.plan_gate_timeout_min, p.completion_soft_timeout_min),
+        (CompletionPolicy::Manual, 10, 45)
+    );
     Ok(())
 }
