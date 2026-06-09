@@ -53,6 +53,35 @@ columns need custom parse.
 | `backlog::run_triage` | v1, no grouping: promote each Approved + ungrouped item into its own CONSOLIDATING issue, set `consumed_issue_id` |
 | `agent_runs` | append-only, two-step `start` (spawn) / `finish` (exit); `issue_id`/`main_job_id` XOR enforced in code |
 
+## create-override-coalesce-default
+
+Exposing a subset of policy columns on a `create` WITHOUT duplicating SQL
+DEFAULTs in Rust. **The migration stays the single source of default values.**
+(Applied to `projects::create`; columns themselves are in domain/db-schema.md.)
+
+- `NewProject` gains `Option` override fields — `completion_policy:
+  Option<CompletionPolicy>`, `plan_gate_timeout_min: Option<i64>`,
+  `completion_soft_timeout_min: Option<i64>`. `None` ⇒ keep DB DEFAULT; `Some`
+  ⇒ override only that column.
+- `create` does the base INSERT (unchanged columns take DEFAULT via RETURNING
+  id), then **conditionally** runs ONE UPDATE only when ≥1 override is `Some`:
+  ```sql
+  UPDATE projects SET
+    completion_policy = COALESCE(?, completion_policy),
+    plan_gate_timeout_min = COALESCE(?, plan_gate_timeout_min),
+    completion_soft_timeout_min = COALESCE(?, completion_soft_timeout_min)
+  WHERE id = ?
+  ```
+  Bind `completion_policy.map(|p| p.as_str())` (Option<&str>), `Option<i64>`
+  direct. `COALESCE(NULL, col)` keeps the just-defaulted value ⇒ siblings
+  untouched.
+- Guard `if a.is_some() || b.is_some() || c.is_some()` skips the no-op write
+  when all `None` (defaults persist on the INSERT alone).
+- **Why not bind defaults from Rust**: would duplicate the migration's DEFAULT
+  in two places. **Why not dynamic SQL**: COALESCE is one static statement.
+- CRUD-layer cousin of the schema-level `review_agent_cmd NULL → work_agent_cmd`
+  fallback in domain/db-schema.md.
+
 ## Note
 
 `db/mod.rs` had NO typed CRUD originally; insert helpers lived in test files — so

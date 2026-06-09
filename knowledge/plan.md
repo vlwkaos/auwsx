@@ -8,9 +8,6 @@ Backlog only. One line per feature. No checklists.
 
 ## TODO
 
-### project-config-cli-flags
-Expose `completion_policy` + gate timeouts on `auwsx project add` so live runs reach DONE without raw SQL.
-
 ### main-jobs-queue
 Per-project main-branch serializer so routines never race the pipeline (one main-branch writer at a time).
 

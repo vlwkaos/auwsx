@@ -60,5 +60,6 @@ correctly at the PLANNED soft gate. **416 tests green** (33 new in
 ## Not yet built (handed to plan.md)
 
 main_jobs queue + routines, inbox watcher, config load/save, per-run agent token
-scoping, launchd, TUI v0.1, and exposing completion_policy + gate timeouts on
-`project add` (needed to close the live loop to DONE without raw SQL).
+scoping, launchd, TUI v0.1. (Exposing completion_policy + gate timeouts on
+`project add` — needed to close the live loop to DONE without raw SQL — was
+since built in `ed72491`; see history/project-config-cli-flags.md.)
