@@ -55,3 +55,25 @@ update the `## Key Files` list in `AGENTS.md` — both the path and its one-line
 description. The design plan (`~/.claude/plans/current-wsx-is-agent-cosmic-gadget.md`)
 is the architecture PRD; it lags the code intentionally during a model pivot and
 is synced as its own task, not gated here.
+
+## TUI action/view exhaustiveness
+
+The ratatui front-end (`auwsx-tui/src/{input,app,ui}`) has two closed sets that
+must stay fully wired — a key binding with no handler is a dead key; a `View`
+with no renderer panics the match:
+
+- Every `input::Action` variant must be **produced** by `input::map_key` AND
+  **consumed** by `app::App::apply` (no orphan affordance).
+- Every `app::View` in `View::ORDER` must have an arm in `ui::draw`'s view match
+  AND in the footer-hint match.
+
+Check:
+```bash
+rg -n 'Action::' crates/auwsx-tui/src/app.rs        # consumed set
+rg -n 'Action::\w+' crates/auwsx-tui/src/input.rs   # produced set
+rg -n 'View::\w+ =>' crates/auwsx-tui/src/ui/mod.rs # both draw + footer arms
+```
+Guarded at runtime by the `ui/mod.rs` render-smoke tests (draw every view at
+normal + tiny size, no panic) and the `input.rs` map_key tests. A missing draw
+arm fails to compile (non-exhaustive match), but a missing footer arm or an
+orphan Action does NOT — so eyeball the produced/consumed sets on UI changes.
