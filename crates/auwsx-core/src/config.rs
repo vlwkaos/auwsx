@@ -23,8 +23,12 @@ pub struct ServerConfig {
     #[serde(default = "default_port")]
     pub port: u16,
 }
-fn default_host() -> String { "127.0.0.1".into() }
-fn default_port() -> u16 { 7777 }
+fn default_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_port() -> u16 {
+    7777
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultsConfig {

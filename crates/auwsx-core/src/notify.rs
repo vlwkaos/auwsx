@@ -12,15 +12,32 @@
 //! Events: task_pending_feedback, task_done, task_failed, routine_failed,
 //! triage_summary, daemon_lifecycle.
 
-use crate::Result;
-
 #[derive(Debug, Clone)]
 pub enum NotifyEvent {
-    TaskPendingFeedback { project: String, title: String, iteration: u32 },
-    TaskDone { project: String, title: String, target: String },
-    TaskFailed { project: String, title: String, phase: String },
-    RoutineFailed { project: String, routine: String },
-    TriageSummary { project: String, created: u32, discarded: u32 },
+    TaskPendingFeedback {
+        project: String,
+        title: String,
+        iteration: u32,
+    },
+    TaskDone {
+        project: String,
+        title: String,
+        target: String,
+    },
+    TaskFailed {
+        project: String,
+        title: String,
+        phase: String,
+    },
+    RoutineFailed {
+        project: String,
+        routine: String,
+    },
+    TriageSummary {
+        project: String,
+        created: u32,
+        discarded: u32,
+    },
     DaemonStarted,
     DaemonRecovered,
 }

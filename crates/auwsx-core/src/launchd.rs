@@ -7,8 +7,6 @@
 //!
 //! The daemon binary path is determined by `std::env::current_exe()` at install time.
 
-use crate::Result;
-
 pub const LAUNCHD_LABEL: &str = "com.vlwkaos.auwsx";
 
 // TODO: install_launchd() — generate plist, write, `launchctl bootstrap`

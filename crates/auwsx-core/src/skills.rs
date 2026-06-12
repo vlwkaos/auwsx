@@ -8,8 +8,6 @@
 //! For non-Claude agents that lack a skill loader, `inline_for_agent(name)`
 //! returns the SKILL.md body as raw text to be substituted into the prompt.
 
-use crate::Result;
-
 pub const BUNDLED_SKILLS: &[&str] = &[
     "recall",
     "backpressure",

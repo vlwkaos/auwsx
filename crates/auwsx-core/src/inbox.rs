@@ -16,8 +16,6 @@
 //!
 //! Designed for async drop-in: append from vim/ssh/Termius/Obsidian, walk away.
 
-use crate::Result;
-
 // TODO: spawn_watcher(project_id, project_name, inbox_dir) -> JoinHandle
 // TODO: parse_line(line) -> InboxLine { Comment | Draft | FollowupForCurrent | FollowupForId(id) }
 // TODO: dispatch + log writers
