@@ -29,12 +29,14 @@ pub mod agent_runs;
 pub mod findings;
 pub mod issues;
 pub mod projects;
+pub mod scheduler_runs;
 pub mod subtasks;
 
 pub use agent_runs::AgentRun;
 pub use findings::Finding;
 pub use issues::Issue;
 pub use projects::Project;
+pub use scheduler_runs::SchedulerRun;
 pub use subtasks::Subtask;
 
 /// Embedded migration set. `sqlx::migrate!` reads `./migrations/` at compile

@@ -171,6 +171,19 @@ pub async fn finish(
     Ok(())
 }
 
+pub async fn set_pid(pool: &SqlitePool, run_id: i64, pid: i64) -> Result<()> {
+    let n = sqlx::query("UPDATE agent_runs SET pid = ? WHERE id = ?")
+        .bind(pid)
+        .bind(run_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(anyhow!("agent_run {run_id} not found"));
+    }
+    Ok(())
+}
+
 pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<AgentRun>> {
     let row = sqlx::query("SELECT * FROM agent_runs WHERE id = ?")
         .bind(id)
@@ -185,5 +198,28 @@ pub async fn list_by_issue(pool: &SqlitePool, issue_id: i64) -> Result<Vec<Agent
         .bind(issue_id)
         .fetch_all(pool)
         .await?;
+    rows.iter().map(AgentRun::from_row).collect()
+}
+
+/// Recent runs for a project, newest first. Includes issue runs through the
+/// issue's project relation and main-job runs through the main job relation.
+pub async fn recent_by_project(
+    pool: &SqlitePool,
+    project_id: i64,
+    limit: i64,
+) -> Result<Vec<AgentRun>> {
+    let rows = sqlx::query(
+        "SELECT ar.* FROM agent_runs ar
+         LEFT JOIN issues i ON i.id = ar.issue_id
+         LEFT JOIN main_jobs mj ON mj.id = ar.main_job_id
+         WHERE i.project_id = ? OR mj.project_id = ?
+         ORDER BY ar.id DESC
+         LIMIT ?",
+    )
+    .bind(project_id)
+    .bind(project_id)
+    .bind(limit.max(0))
+    .fetch_all(pool)
+    .await?;
     rows.iter().map(AgentRun::from_row).collect()
 }
