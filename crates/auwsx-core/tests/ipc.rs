@@ -14,16 +14,21 @@
 //! injected via the fixed `now` so writes are deterministic.
 
 use auwsx_core::backlog::{self, Approval, Source};
+use auwsx_core::db::agent_runs::{self, Role, StartRun};
 use auwsx_core::db::findings::Severity;
+use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode};
+use auwsx_core::db::scheduler_runs::{self, SchedulerRunSource};
 use auwsx_core::db::{issues, Db};
 use auwsx_core::events::{self, Event};
 use auwsx_core::ipc::{self, Command, Response};
+use auwsx_core::routines::RoutineType;
 use auwsx_core::state::IssueStatus;
 use auwsx_core::steering::SteeringSource;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 /// Fixed deterministic timestamp (epoch ms). No SystemTime in dispatch tests.
 const TS: i64 = 1_000_000;
@@ -51,6 +56,13 @@ fn want_triaged(r: Response) -> Vec<i64> {
     match r {
         Response::Triaged { created_issue_ids } => created_issue_ids,
         other => panic!("expected Response::Triaged, got {other:?}"),
+    }
+}
+
+fn want_routines(r: Response) -> Vec<auwsx_core::routines::Routine> {
+    match r {
+        Response::Routines(rs) => rs,
+        other => panic!("expected Response::Routines, got {other:?}"),
     }
 }
 
@@ -95,8 +107,8 @@ async fn add_project(db: &Db, bus: &tokio::sync::broadcast::Sender<Event>, name:
     )
 }
 
-/// Seed a project via direct CRUD (no socket / no `Response::Id`), for transport
-/// tests whose subject is NOT Id serialization.
+/// Seed a project via direct CRUD for transport tests whose subject is not
+/// project creation.
 async fn backlog_seed_project(db: &Db) -> anyhow::Result<i64> {
     use auwsx_core::db::projects::{self, NewProject};
     projects::create(
@@ -136,6 +148,60 @@ async fn given_ping_when_dispatched_then_ok() -> anyhow::Result<()> {
     let bus = events::channel();
     let resp = ipc::dispatch(&db, &bus, TS, Command::Ping).await;
     assert!(is_ok(&resp), "Ping must return Ok, got {resp:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_manual_run_command_without_scheduler_when_dispatched_then_err() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+
+    let resp = ipc::dispatch(&db, &bus, TS, Command::RunSchedulerOnce { project_id: 1 }).await;
+
+    assert!(
+        want_err(resp).contains("daemon runtime"),
+        "manual run dispatch without scheduler must explain the missing runtime"
+    );
+    Ok(())
+}
+
+#[test]
+fn given_new_operator_commands_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
+    let commands = vec![
+        Command::UpdateBacklogText {
+            item_id: 1,
+            text: "edited".to_string(),
+        },
+        Command::RunSchedulerOnce { project_id: 2 },
+        Command::RunIssueNow { issue_id: 3 },
+        Command::RunBacklogNow { item_id: 4 },
+        Command::RunRoutineNow { routine_id: 5 },
+        Command::CreateRoutine {
+            project_id: 6,
+            name: "r".to_string(),
+            routine_type: RoutineType::Knowledge,
+            prompt: "p".to_string(),
+            cron: "0 0 * * * *".to_string(),
+            writable_paths: Some("knowledge/".to_string()),
+            enabled: true,
+        },
+        Command::UpdateRoutine {
+            routine_id: 7,
+            name: "r2".to_string(),
+            routine_type: RoutineType::Idea,
+            prompt: "p2".to_string(),
+            cron: "0 0 * * 1 *".to_string(),
+            writable_paths: None,
+            enabled: false,
+        },
+    ];
+
+    for command in commands {
+        let json = serde_json::to_string(&command)?;
+        let got: Command = serde_json::from_str(&json)?;
+        assert_eq!(got, command);
+    }
     Ok(())
 }
 
@@ -208,10 +274,69 @@ async fn given_existing_project_when_get_project_then_some() -> anyhow::Result<(
 async fn given_missing_project_when_get_project_then_project_none() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
-    match ipc::dispatch(&db, &bus, TS, Command::GetProject { project_id: 999_999 }).await {
-        Response::Project(p) => assert_eq!(p, None, "missing project must be Project(None), not Err"),
+    match ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::GetProject {
+            project_id: 999_999,
+        },
+    )
+    .await
+    {
+        Response::Project(p) => {
+            assert_eq!(p, None, "missing project must be Project(None), not Err")
+        }
         other => panic!("expected Project, got {other:?}"),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_update_project_when_dispatched_then_config_fields_change() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let id = add_project(&db, &bus, "configurable").await;
+
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::UpdateProject {
+            project_id: id,
+            name: "configurable-renamed".to_string(),
+            repo_path: "/repo2".to_string(),
+            default_branch: "trunk".to_string(),
+            main_agent_cmd: "main2 {prompt}".to_string(),
+            plan_agent_cmd: "plan2 {prompt}".to_string(),
+            work_agent_cmd: "work2 {prompt}".to_string(),
+            review_agent_cmd: Some("review2 {prompt}".to_string()),
+            completion_policy: CompletionPolicy::Soft,
+            plan_gate_timeout_min: 3,
+            completion_soft_timeout_min: 4,
+            iteration_timeout_min: 5,
+            main_job_timeout_min: 6,
+            review_max_rounds: 7,
+            conflict_max_attempts: 8,
+            max_concurrency: 9,
+            schedule_interval_min: Some(10),
+            merge_mode: MergeMode::Pr,
+            skill_path: Some("/skills".to_string()),
+            deepsleep_interval_days: 11,
+        },
+    )
+    .await;
+    assert!(is_ok(&resp), "UpdateProject must return Ok, got {resp:?}");
+
+    let p = projects::get(db.pool(), id).await?.expect("project exists");
+    assert_eq!(p.name, "configurable-renamed");
+    assert_eq!(p.repo_path, "/repo2");
+    assert_eq!(p.default_branch, "trunk");
+    assert_eq!(p.review_agent_cmd.as_deref(), Some("review2 {prompt}"));
+    assert_eq!(p.completion_policy, CompletionPolicy::Soft);
+    assert_eq!(p.schedule_interval_min, Some(10));
+    assert_eq!(p.merge_mode, MergeMode::Pr);
+    assert_eq!(p.skill_path.as_deref(), Some("/skills"));
     Ok(())
 }
 
@@ -228,7 +353,11 @@ async fn given_human_backlog_when_added_then_returns_id() -> anyhow::Result<()> 
         &db,
         &bus,
         TS,
-        Command::AddBacklog { project_id: pid, text: "do x".to_string(), source: Source::Human },
+        Command::AddBacklog {
+            project_id: pid,
+            text: "do x".to_string(),
+            source: Source::Human,
+        },
     )
     .await;
     assert!(want_id(resp) > 0);
@@ -236,7 +365,8 @@ async fn given_human_backlog_when_added_then_returns_id() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
-async fn given_human_backlog_when_added_then_emits_backlog_changed_approved() -> anyhow::Result<()> {
+async fn given_human_backlog_when_added_then_emits_backlog_changed_approved() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
@@ -245,7 +375,11 @@ async fn given_human_backlog_when_added_then_emits_backlog_changed_approved() ->
         &db,
         &bus,
         TS,
-        Command::AddBacklog { project_id: pid, text: "do x".to_string(), source: Source::Human },
+        Command::AddBacklog {
+            project_id: pid,
+            text: "do x".to_string(),
+            source: Source::Human,
+        },
     )
     .await;
     match rx.try_recv() {
@@ -266,13 +400,74 @@ async fn given_agent_backlog_when_added_then_emits_backlog_changed_pending() -> 
         &db,
         &bus,
         TS,
-        Command::AddBacklog { project_id: pid, text: "y".to_string(), source: Source::Agent },
+        Command::AddBacklog {
+            project_id: pid,
+            text: "y".to_string(),
+            source: Source::Agent,
+        },
     )
     .await;
     match rx.try_recv() {
         Ok(Event::BacklogChanged { approval, .. }) => assert_eq!(approval, "pending"),
         other => panic!("expected BacklogChanged(pending), got {other:?}"),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_unconsumed_backlog_when_update_text_then_text_changes() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let pid = add_project(&db, &bus, "p").await;
+    let item_id = backlog::add(db.pool(), pid, "old text", Source::Human, None, TS).await?;
+
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::UpdateBacklogText {
+            item_id,
+            text: "new text".to_string(),
+        },
+    )
+    .await;
+
+    assert!(
+        is_ok(&resp),
+        "UpdateBacklogText must return Ok, got {resp:?}"
+    );
+    let item = backlog::get(db.pool(), item_id)
+        .await?
+        .expect("backlog exists");
+    assert_eq!(item.text, "new text");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_consumed_backlog_when_update_text_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let pid = add_project(&db, &bus, "p").await;
+    let item_id = backlog::add(db.pool(), pid, "old text", Source::Human, None, TS).await?;
+    let created =
+        want_triaged(ipc::dispatch(&db, &bus, TS, Command::Triage { project_id: pid }).await);
+    assert_eq!(created.len(), 1);
+
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::UpdateBacklogText {
+            item_id,
+            text: "new text".to_string(),
+        },
+    )
+    .await;
+
+    assert!(
+        want_err(resp).contains("already consumed"),
+        "consumed backlog edits must be rejected"
+    );
     Ok(())
 }
 
@@ -286,7 +481,11 @@ async fn given_mixed_backlog_when_list_filtered_pending_then_only_pending() -> a
         &db,
         &bus,
         TS,
-        Command::AddBacklog { project_id: pid, text: "h".to_string(), source: Source::Human },
+        Command::AddBacklog {
+            project_id: pid,
+            text: "h".to_string(),
+            source: Source::Human,
+        },
     )
     .await;
     let agent_id = want_id(
@@ -294,7 +493,11 @@ async fn given_mixed_backlog_when_list_filtered_pending_then_only_pending() -> a
             &db,
             &bus,
             TS,
-            Command::AddBacklog { project_id: pid, text: "a".to_string(), source: Source::Agent },
+            Command::AddBacklog {
+                project_id: pid,
+                text: "a".to_string(),
+                source: Source::Agent,
+            },
         )
         .await,
     );
@@ -302,7 +505,10 @@ async fn given_mixed_backlog_when_list_filtered_pending_then_only_pending() -> a
         &db,
         &bus,
         TS,
-        Command::ListBacklog { project_id: pid, approval: Some(Approval::Pending) },
+        Command::ListBacklog {
+            project_id: pid,
+            approval: Some(Approval::Pending),
+        },
     )
     .await
     {
@@ -324,21 +530,32 @@ async fn given_no_filter_when_list_backlog_then_returns_all() -> anyhow::Result<
         &db,
         &bus,
         TS,
-        Command::AddBacklog { project_id: pid, text: "h".to_string(), source: Source::Human },
+        Command::AddBacklog {
+            project_id: pid,
+            text: "h".to_string(),
+            source: Source::Human,
+        },
     )
     .await;
     let _ = ipc::dispatch(
         &db,
         &bus,
         TS,
-        Command::AddBacklog { project_id: pid, text: "a".to_string(), source: Source::Agent },
+        Command::AddBacklog {
+            project_id: pid,
+            text: "a".to_string(),
+            source: Source::Agent,
+        },
     )
     .await;
     match ipc::dispatch(
         &db,
         &bus,
         TS,
-        Command::ListBacklog { project_id: pid, approval: None },
+        Command::ListBacklog {
+            project_id: pid,
+            approval: None,
+        },
     )
     .await
     {
@@ -358,7 +575,11 @@ async fn given_pending_item_when_approve_backlog_then_ok() -> anyhow::Result<()>
             &db,
             &bus,
             TS,
-            Command::AddBacklog { project_id: pid, text: "a".to_string(), source: Source::Agent },
+            Command::AddBacklog {
+                project_id: pid,
+                text: "a".to_string(),
+                source: Source::Agent,
+            },
         )
         .await,
     );
@@ -378,7 +599,11 @@ async fn given_approve_backlog_when_dispatched_then_emits_backlog_changed_approv
             &db,
             &bus,
             TS,
-            Command::AddBacklog { project_id: pid, text: "a".to_string(), source: Source::Agent },
+            Command::AddBacklog {
+                project_id: pid,
+                text: "a".to_string(),
+                source: Source::Agent,
+            },
         )
         .await,
     );
@@ -410,7 +635,11 @@ async fn given_pending_item_when_dismiss_backlog_then_ok() -> anyhow::Result<()>
             &db,
             &bus,
             TS,
-            Command::AddBacklog { project_id: pid, text: "a".to_string(), source: Source::Agent },
+            Command::AddBacklog {
+                project_id: pid,
+                text: "a".to_string(),
+                source: Source::Agent,
+            },
         )
         .await,
     );
@@ -441,11 +670,20 @@ async fn given_one_approved_item_when_triage_then_one_issue_created() -> anyhow:
         &db,
         &bus,
         TS,
-        Command::AddBacklog { project_id: pid, text: "feat".to_string(), source: Source::Human },
+        Command::AddBacklog {
+            project_id: pid,
+            text: "feat".to_string(),
+            source: Source::Human,
+        },
     )
     .await;
-    let created = want_triaged(ipc::dispatch(&db, &bus, TS, Command::Triage { project_id: pid }).await);
-    assert_eq!(created.len(), 1, "one approved item promotes to exactly one issue");
+    let created =
+        want_triaged(ipc::dispatch(&db, &bus, TS, Command::Triage { project_id: pid }).await);
+    assert_eq!(
+        created.len(),
+        1,
+        "one approved item promotes to exactly one issue"
+    );
     Ok(())
 }
 
@@ -459,10 +697,15 @@ async fn given_only_pending_item_when_triage_then_no_issue_created() -> anyhow::
         &db,
         &bus,
         TS,
-        Command::AddBacklog { project_id: pid, text: "x".to_string(), source: Source::Agent },
+        Command::AddBacklog {
+            project_id: pid,
+            text: "x".to_string(),
+            source: Source::Agent,
+        },
     )
     .await;
-    let created = want_triaged(ipc::dispatch(&db, &bus, TS, Command::Triage { project_id: pid }).await);
+    let created =
+        want_triaged(ipc::dispatch(&db, &bus, TS, Command::Triage { project_id: pid }).await);
     assert!(created.is_empty(), "pending items are not triaged");
     Ok(())
 }
@@ -478,7 +721,9 @@ async fn given_approved_item_when_run_triage_then_issue_is_consolidating() -> an
     let pid = add_project(&db, &bus, "p").await;
     backlog::add(db.pool(), pid, "feat", Source::Human, None, TS).await?;
     let created = backlog::run_triage(db.pool(), pid, TS).await?;
-    let issue = issues::get(db.pool(), created[0]).await?.expect("created issue exists");
+    let issue = issues::get(db.pool(), created[0])
+        .await?
+        .expect("created issue exists");
     assert_eq!(issue.status, IssueStatus::Consolidating);
     Ok(())
 }
@@ -490,8 +735,14 @@ async fn given_approved_item_when_run_triage_then_consumed_issue_id_set() -> any
     let pid = add_project(&db, &bus, "p").await;
     let item_id = backlog::add(db.pool(), pid, "feat", Source::Human, None, TS).await?;
     let created = backlog::run_triage(db.pool(), pid, TS).await?;
-    let item = backlog::get(db.pool(), item_id).await?.expect("item exists");
-    assert_eq!(item.consumed_issue_id, Some(created[0]), "triage links item to its issue");
+    let item = backlog::get(db.pool(), item_id)
+        .await?
+        .expect("item exists");
+    assert_eq!(
+        item.consumed_issue_id,
+        Some(created[0]),
+        "triage links item to its issue"
+    );
     Ok(())
 }
 
@@ -503,7 +754,10 @@ async fn given_already_consumed_item_when_run_triage_again_then_skipped() -> any
     backlog::add(db.pool(), pid, "feat", Source::Human, None, TS).await?;
     backlog::run_triage(db.pool(), pid, TS).await?; // consumes it
     let second = backlog::run_triage(db.pool(), pid, TS).await?;
-    assert!(second.is_empty(), "an already-consumed item is not re-triaged");
+    assert!(
+        second.is_empty(),
+        "an already-consumed item is not re-triaged"
+    );
     Ok(())
 }
 
@@ -515,6 +769,225 @@ async fn given_pending_item_when_run_triage_then_no_issue() -> anyhow::Result<()
     backlog::add(db.pool(), pid, "x", Source::Agent, None, TS).await?; // pending
     let created = backlog::run_triage(db.pool(), pid, TS).await?;
     assert!(created.is_empty());
+    Ok(())
+}
+
+// ===========================================================================
+// dispatch: routines
+// ===========================================================================
+
+#[tokio::test]
+async fn given_create_routine_when_dispatched_then_list_returns_it() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let pid = add_project(&db, &bus, "p").await;
+
+    let routine_id = want_id(
+        ipc::dispatch(
+            &db,
+            &bus,
+            TS,
+            Command::CreateRoutine {
+                project_id: pid,
+                name: "daily".to_string(),
+                routine_type: RoutineType::Report,
+                prompt: "write report".to_string(),
+                cron: "0 0 * * * *".to_string(),
+                writable_paths: Some("reports/".to_string()),
+                enabled: true,
+            },
+        )
+        .await,
+    );
+    let routines = want_routines(
+        ipc::dispatch(&db, &bus, TS, Command::ListRoutines { project_id: pid }).await,
+    );
+
+    assert_eq!(routines.len(), 1);
+    assert_eq!(routines[0].id, routine_id);
+    assert_eq!(routines[0].name, "daily");
+    assert_eq!(routines[0].routine_type, RoutineType::Report);
+    assert!(routines[0].enabled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_update_routine_when_dispatched_then_get_returns_updated_fields() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let pid = add_project(&db, &bus, "p").await;
+    let routine_id = want_id(
+        ipc::dispatch(
+            &db,
+            &bus,
+            TS,
+            Command::CreateRoutine {
+                project_id: pid,
+                name: "daily".to_string(),
+                routine_type: RoutineType::Report,
+                prompt: "write report".to_string(),
+                cron: "0 0 * * * *".to_string(),
+                writable_paths: None,
+                enabled: true,
+            },
+        )
+        .await,
+    );
+
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::UpdateRoutine {
+            routine_id,
+            name: "weekly ideas".to_string(),
+            routine_type: RoutineType::Idea,
+            prompt: "find ideas".to_string(),
+            cron: "0 0 * * 1 *".to_string(),
+            writable_paths: Some("ideas/".to_string()),
+            enabled: false,
+        },
+    )
+    .await;
+    assert!(is_ok(&resp), "UpdateRoutine must return Ok, got {resp:?}");
+
+    match ipc::dispatch(&db, &bus, TS, Command::GetRoutine { routine_id }).await {
+        Response::Routine(Some(r)) => {
+            assert_eq!(r.name, "weekly ideas");
+            assert_eq!(r.routine_type, RoutineType::Idea);
+            assert_eq!(r.prompt, "find ideas");
+            assert_eq!(r.cron, "0 0 * * 1 *");
+            assert_eq!(r.writable_paths.as_deref(), Some("ideas/"));
+            assert!(!r.enabled);
+        }
+        other => panic!("expected Routine(Some), got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_scheduler_runs_when_recent_requested_then_source_roundtrips() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let pid = add_project(&db, &bus, "p").await;
+    scheduler_runs::record(db.pool(), pid, TS, SchedulerRunSource::Auto, Some("{}")).await?;
+    scheduler_runs::record(
+        db.pool(),
+        pid,
+        TS + 1,
+        SchedulerRunSource::Manual,
+        Some("{}"),
+    )
+    .await?;
+
+    match ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::RecentSchedulerRunsByProject {
+            project_id: pid,
+            limit: 10,
+        },
+    )
+    .await
+    {
+        Response::SchedulerRuns(runs) => {
+            assert_eq!(runs.len(), 2);
+            assert_eq!(runs[0].source, SchedulerRunSource::Manual);
+            assert_eq!(runs[1].source, SchedulerRunSource::Auto);
+        }
+        other => panic!("expected SchedulerRuns, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_agent_run_log_when_tail_requested_then_reads_recorded_path_only(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let pid = add_project(&db, &bus, "p").await;
+    let issue_id = issues::create(db.pool(), pid, "t", None, TS).await?;
+    let tmp = socket_tempdir()?;
+    let log_path = tmp.path().join("agent.log");
+    std::fs::write(&log_path, "0123456789abcdef")?;
+    let log_str = log_path.to_string_lossy().to_string();
+    let run_id = agent_runs::start(
+        db.pool(),
+        StartRun {
+            issue_id: Some(issue_id),
+            main_job_id: None,
+            role: Role::Main,
+            phase: "consolidating",
+            agent_cmd: "agent {prompt}",
+            status_before: Some("CONSOLIDATING"),
+            pid: None,
+            prompt_path: None,
+            log_path: Some(&log_str),
+        },
+        TS,
+    )
+    .await?;
+
+    match ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::TailAgentRunLog {
+            agent_run_id: run_id,
+            max_bytes: 4,
+        },
+    )
+    .await
+    {
+        Response::LogTail { path, text } => {
+            assert_eq!(path, log_str);
+            assert_eq!(text, "cdef");
+        }
+        other => panic!("expected LogTail, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_agent_run_without_log_when_tail_requested_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let pid = add_project(&db, &bus, "p").await;
+    let issue_id = issues::create(db.pool(), pid, "t", None, TS).await?;
+    let run_id = agent_runs::start(
+        db.pool(),
+        StartRun {
+            issue_id: Some(issue_id),
+            main_job_id: None,
+            role: Role::Main,
+            phase: "consolidating",
+            agent_cmd: "agent {prompt}",
+            status_before: Some("CONSOLIDATING"),
+            pid: None,
+            prompt_path: None,
+            log_path: None,
+        },
+        TS,
+    )
+    .await?;
+
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::TailAgentRunLog {
+            agent_run_id: run_id,
+            max_bytes: 4,
+        },
+    )
+    .await;
+
+    assert!(
+        want_err(resp).contains("has no log_path"),
+        "tailing a run without a recorded log path must fail"
+    );
     Ok(())
 }
 
@@ -531,7 +1004,11 @@ async fn given_add_issue_when_dispatched_then_returns_id() -> anyhow::Result<()>
         &db,
         &bus,
         TS,
-        Command::AddIssue { project_id: pid, title: "t".to_string(), description: None },
+        Command::AddIssue {
+            project_id: pid,
+            title: "t".to_string(),
+            description: None,
+        },
     )
     .await;
     assert!(want_id(resp) > 0);
@@ -548,7 +1025,11 @@ async fn given_add_issue_when_dispatched_then_issue_enters_consolidating() -> an
             &db,
             &bus,
             TS,
-            Command::AddIssue { project_id: pid, title: "t".to_string(), description: None },
+            Command::AddIssue {
+                project_id: pid,
+                title: "t".to_string(),
+                description: None,
+            },
         )
         .await,
     );
@@ -571,7 +1052,8 @@ async fn given_missing_issue_when_get_issue_then_issue_none() -> anyhow::Result<
 }
 
 #[tokio::test]
-async fn given_mixed_status_issues_when_list_filtered_then_only_that_status() -> anyhow::Result<()> {
+async fn given_mixed_status_issues_when_list_filtered_then_only_that_status() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
@@ -581,7 +1063,10 @@ async fn given_mixed_status_issues_when_list_filtered_then_only_that_status() ->
         &db,
         &bus,
         TS,
-        Command::ListIssues { project_id: pid, status: Some(IssueStatus::Planning) },
+        Command::ListIssues {
+            project_id: pid,
+            status: Some(IssueStatus::Planning),
+        },
     )
     .await
     {
@@ -605,7 +1090,10 @@ async fn given_no_status_filter_when_list_issues_then_returns_all() -> anyhow::R
         &db,
         &bus,
         TS,
-        Command::ListIssues { project_id: pid, status: None },
+        Command::ListIssues {
+            project_id: pid,
+            status: None,
+        },
     )
     .await
     {
@@ -628,10 +1116,17 @@ async fn given_consolidating_when_set_status_planning_then_ok() -> anyhow::Resul
         &db,
         &bus,
         TS,
-        Command::SetIssueStatus { issue_id: id, status: IssueStatus::Planning, force: false },
+        Command::SetIssueStatus {
+            issue_id: id,
+            status: IssueStatus::Planning,
+            force: false,
+        },
     )
     .await;
-    assert!(is_ok(&resp), "legal transition must return Ok, got {resp:?}");
+    assert!(
+        is_ok(&resp),
+        "legal transition must return Ok, got {resp:?}"
+    );
     Ok(())
 }
 
@@ -646,7 +1141,11 @@ async fn given_legal_set_status_when_dispatched_then_emits_issue_status() -> any
         &db,
         &bus,
         TS,
-        Command::SetIssueStatus { issue_id: id, status: IssueStatus::Planning, force: false },
+        Command::SetIssueStatus {
+            issue_id: id,
+            status: IssueStatus::Planning,
+            force: false,
+        },
     )
     .await;
     match rx.try_recv() {
@@ -667,7 +1166,11 @@ async fn given_illegal_set_status_unforced_when_dispatched_then_err() -> anyhow:
         &db,
         &bus,
         TS,
-        Command::SetIssueStatus { issue_id: id, status: IssueStatus::Done, force: false },
+        Command::SetIssueStatus {
+            issue_id: id,
+            status: IssueStatus::Done,
+            force: false,
+        },
     )
     .await;
     let _ = want_err(resp);
@@ -685,7 +1188,11 @@ async fn given_illegal_set_status_unforced_when_dispatched_then_status_unchanged
         &db,
         &bus,
         TS,
-        Command::SetIssueStatus { issue_id: id, status: IssueStatus::Done, force: false },
+        Command::SetIssueStatus {
+            issue_id: id,
+            status: IssueStatus::Done,
+            force: false,
+        },
     )
     .await;
     // Confirm via GetIssue that the rejected transition left status untouched.
@@ -709,10 +1216,17 @@ async fn given_illegal_set_status_forced_when_dispatched_then_ok() -> anyhow::Re
         &db,
         &bus,
         TS,
-        Command::SetIssueStatus { issue_id: id, status: IssueStatus::Done, force: true },
+        Command::SetIssueStatus {
+            issue_id: id,
+            status: IssueStatus::Done,
+            force: true,
+        },
     )
     .await;
-    assert!(is_ok(&resp), "forced transition must return Ok, got {resp:?}");
+    assert!(
+        is_ok(&resp),
+        "forced transition must return Ok, got {resp:?}"
+    );
     Ok(())
 }
 
@@ -727,7 +1241,11 @@ async fn given_illegal_set_status_forced_when_dispatched_then_status_changed() -
         &db,
         &bus,
         TS,
-        Command::SetIssueStatus { issue_id: id, status: IssueStatus::Done, force: true },
+        Command::SetIssueStatus {
+            issue_id: id,
+            status: IssueStatus::Done,
+            force: true,
+        },
     )
     .await;
     match ipc::dispatch(&db, &bus, TS, Command::GetIssue { issue_id: id }).await {
@@ -745,7 +1263,11 @@ async fn given_missing_issue_when_set_status_then_err() -> anyhow::Result<()> {
         &db,
         &bus,
         TS,
-        Command::SetIssueStatus { issue_id: 999_999, status: IssueStatus::Planning, force: false },
+        Command::SetIssueStatus {
+            issue_id: 999_999,
+            status: IssueStatus::Planning,
+            force: false,
+        },
     )
     .await;
     let _ = want_err(resp);
@@ -766,7 +1288,11 @@ async fn given_add_subtask_when_dispatched_then_returns_id() -> anyhow::Result<(
         &db,
         &bus,
         TS,
-        Command::AddSubtask { issue_id: iid, ord: 0, text: "step".to_string() },
+        Command::AddSubtask {
+            issue_id: iid,
+            ord: 0,
+            text: "step".to_string(),
+        },
     )
     .await;
     assert!(want_id(resp) > 0);
@@ -783,7 +1309,11 @@ async fn given_subtask_added_when_list_subtasks_then_returns_it() -> anyhow::Res
         &db,
         &bus,
         TS,
-        Command::AddSubtask { issue_id: iid, ord: 0, text: "step".to_string() },
+        Command::AddSubtask {
+            issue_id: iid,
+            ord: 0,
+            text: "step".to_string(),
+        },
     )
     .await;
     match ipc::dispatch(&db, &bus, TS, Command::ListSubtasks { issue_id: iid }).await {
@@ -804,7 +1334,11 @@ async fn given_subtask_when_complete_subtask_then_ok() -> anyhow::Result<()> {
             &db,
             &bus,
             TS,
-            Command::AddSubtask { issue_id: iid, ord: 0, text: "step".to_string() },
+            Command::AddSubtask {
+                issue_id: iid,
+                ord: 0,
+                text: "step".to_string(),
+            },
         )
         .await,
     );
@@ -817,7 +1351,15 @@ async fn given_subtask_when_complete_subtask_then_ok() -> anyhow::Result<()> {
 async fn given_missing_subtask_when_complete_then_err() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
-    let resp = ipc::dispatch(&db, &bus, TS, Command::CompleteSubtask { subtask_id: 999_999 }).await;
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::CompleteSubtask {
+            subtask_id: 999_999,
+        },
+    )
+    .await;
     let _ = want_err(resp);
     Ok(())
 }
@@ -867,7 +1409,10 @@ async fn given_add_finding_when_dispatched_then_emits_finding_added() -> anyhow:
     let mut rx = bus.subscribe();
     let fid = add_finding(&db, &bus, iid).await;
     match rx.try_recv() {
-        Ok(Event::FindingAdded { finding_id, issue_id }) => {
+        Ok(Event::FindingAdded {
+            finding_id,
+            issue_id,
+        }) => {
             assert_eq!((finding_id, issue_id), (fid, iid))
         }
         other => panic!("expected FindingAdded, got {other:?}"),
@@ -887,7 +1432,10 @@ async fn given_two_findings_when_list_findings_all_then_returns_both() -> anyhow
         &db,
         &bus,
         TS,
-        Command::ListFindings { issue_id: iid, open_only: false },
+        Command::ListFindings {
+            issue_id: iid,
+            open_only: false,
+        },
     )
     .await
     {
@@ -909,14 +1457,20 @@ async fn given_accepted_finding_when_list_open_only_then_excluded() -> anyhow::R
         &db,
         &bus,
         TS,
-        Command::AcceptFinding { finding_id: accepted, rationale: "ok".to_string() },
+        Command::AcceptFinding {
+            finding_id: accepted,
+            rationale: "ok".to_string(),
+        },
     )
     .await;
     match ipc::dispatch(
         &db,
         &bus,
         TS,
-        Command::ListFindings { issue_id: iid, open_only: true },
+        Command::ListFindings {
+            issue_id: iid,
+            open_only: true,
+        },
     )
     .await
     {
@@ -940,7 +1494,10 @@ async fn given_open_finding_when_accept_finding_then_ok() -> anyhow::Result<()> 
         &db,
         &bus,
         TS,
-        Command::AcceptFinding { finding_id: fid, rationale: "ok".to_string() },
+        Command::AcceptFinding {
+            finding_id: fid,
+            rationale: "ok".to_string(),
+        },
     )
     .await;
     assert!(is_ok(&resp), "AcceptFinding must return Ok, got {resp:?}");
@@ -958,7 +1515,10 @@ async fn given_open_finding_when_reject_finding_then_ok() -> anyhow::Result<()> 
         &db,
         &bus,
         TS,
-        Command::RejectFinding { finding_id: fid, rationale: "fp".to_string() },
+        Command::RejectFinding {
+            finding_id: fid,
+            rationale: "fp".to_string(),
+        },
     )
     .await;
     assert!(is_ok(&resp), "RejectFinding must return Ok, got {resp:?}");
@@ -985,7 +1545,10 @@ async fn given_missing_finding_when_accept_then_err() -> anyhow::Result<()> {
         &db,
         &bus,
         TS,
-        Command::AcceptFinding { finding_id: 999_999, rationale: "x".to_string() },
+        Command::AcceptFinding {
+            finding_id: 999_999,
+            rationale: "x".to_string(),
+        },
     )
     .await;
     let _ = want_err(resp);
@@ -996,7 +1559,15 @@ async fn given_missing_finding_when_accept_then_err() -> anyhow::Result<()> {
 async fn given_missing_finding_when_dismiss_then_err() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
-    let resp = ipc::dispatch(&db, &bus, TS, Command::DismissFinding { finding_id: 999_999 }).await;
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::DismissFinding {
+            finding_id: 999_999,
+        },
+    )
+    .await;
     let _ = want_err(resp);
     Ok(())
 }
@@ -1016,7 +1587,11 @@ async fn given_implementing_issue_when_add_steering_then_returns_id() -> anyhow:
         &db,
         &bus,
         TS,
-        Command::AddSteering { issue_id: iid, source: SteeringSource::Human, note: "n".to_string() },
+        Command::AddSteering {
+            issue_id: iid,
+            source: SteeringSource::Human,
+            note: "n".to_string(),
+        },
     )
     .await;
     assert!(want_id(resp) > 0);
@@ -1044,7 +1619,10 @@ async fn given_add_steering_when_accepted_then_emits_steering_added() -> anyhow:
         .await,
     );
     match rx.try_recv() {
-        Ok(Event::SteeringAdded { steering_id, issue_id }) => {
+        Ok(Event::SteeringAdded {
+            steering_id,
+            issue_id,
+        }) => {
             assert_eq!((steering_id, issue_id), (sid, iid))
         }
         other => panic!("expected SteeringAdded, got {other:?}"),
@@ -1063,7 +1641,11 @@ async fn given_consolidating_issue_when_add_steering_then_err() -> anyhow::Resul
         &db,
         &bus,
         TS,
-        Command::AddSteering { issue_id: iid, source: SteeringSource::Human, note: "n".to_string() },
+        Command::AddSteering {
+            issue_id: iid,
+            source: SteeringSource::Human,
+            note: "n".to_string(),
+        },
     )
     .await;
     let _ = want_err(resp);
@@ -1081,7 +1663,11 @@ async fn given_planned_issue_when_add_steering_then_err() -> anyhow::Result<()> 
         &db,
         &bus,
         TS,
-        Command::AddSteering { issue_id: iid, source: SteeringSource::Human, note: "n".to_string() },
+        Command::AddSteering {
+            issue_id: iid,
+            source: SteeringSource::Human,
+            note: "n".to_string(),
+        },
     )
     .await;
     let _ = want_err(resp);
@@ -1089,7 +1675,7 @@ async fn given_planned_issue_when_add_steering_then_err() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
-async fn given_rejected_steering_when_no_subscriber_then_no_event_emitted() -> anyhow::Result<()> {
+async fn given_rejected_steering_with_subscriber_then_no_event_emitted() -> anyhow::Result<()> {
     // The guard must reject BEFORE emitting: a failed AddSteering broadcasts nothing.
     let db = Db::open_memory().await?;
     let bus = events::channel();
@@ -1100,7 +1686,11 @@ async fn given_rejected_steering_when_no_subscriber_then_no_event_emitted() -> a
         &db,
         &bus,
         TS,
-        Command::AddSteering { issue_id: iid, source: SteeringSource::Human, note: "n".to_string() },
+        Command::AddSteering {
+            issue_id: iid,
+            source: SteeringSource::Human,
+            note: "n".to_string(),
+        },
     )
     .await;
     // Event is not PartialEq, so match the Result rather than assert_eq! on it.
@@ -1121,14 +1711,21 @@ async fn given_pending_steering_when_list_steering_then_returns_it() -> anyhow::
         &db,
         &bus,
         TS,
-        Command::AddSteering { issue_id: iid, source: SteeringSource::Human, note: "n".to_string() },
+        Command::AddSteering {
+            issue_id: iid,
+            source: SteeringSource::Human,
+            note: "n".to_string(),
+        },
     )
     .await;
     match ipc::dispatch(
         &db,
         &bus,
         TS,
-        Command::ListSteering { issue_id: iid, pending_only: true },
+        Command::ListSteering {
+            issue_id: iid,
+            pending_only: true,
+        },
     )
     .await
     {
@@ -1148,16 +1745,26 @@ async fn given_pending_steering_when_consume_steering_then_list_empty() -> anyho
         &db,
         &bus,
         TS,
-        Command::AddSteering { issue_id: iid, source: SteeringSource::Human, note: "n".to_string() },
+        Command::AddSteering {
+            issue_id: iid,
+            source: SteeringSource::Human,
+            note: "n".to_string(),
+        },
     )
     .await;
     let consume = ipc::dispatch(&db, &bus, TS, Command::ConsumeSteering { issue_id: iid }).await;
-    assert!(is_ok(&consume), "ConsumeSteering must return Ok, got {consume:?}");
+    assert!(
+        is_ok(&consume),
+        "ConsumeSteering must return Ok, got {consume:?}"
+    );
     match ipc::dispatch(
         &db,
         &bus,
         TS,
-        Command::ListSteering { issue_id: iid, pending_only: true },
+        Command::ListSteering {
+            issue_id: iid,
+            pending_only: true,
+        },
     )
     .await
     {
@@ -1176,7 +1783,10 @@ async fn given_subscribe_via_dispatch_when_called_then_ok() -> anyhow::Result<()
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let resp = ipc::dispatch(&db, &bus, TS, Command::Subscribe).await;
-    assert!(is_ok(&resp), "Subscribe via dispatch alone is a no-op Ok, got {resp:?}");
+    assert!(
+        is_ok(&resp),
+        "Subscribe via dispatch alone is a no-op Ok, got {resp:?}"
+    );
     Ok(())
 }
 
@@ -1185,7 +1795,10 @@ async fn given_shutdown_via_dispatch_when_called_then_ok() -> anyhow::Result<()>
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let resp = ipc::dispatch(&db, &bus, TS, Command::Shutdown).await;
-    assert!(is_ok(&resp), "Shutdown via dispatch alone is a no-op Ok, got {resp:?}");
+    assert!(
+        is_ok(&resp),
+        "Shutdown via dispatch alone is a no-op Ok, got {resp:?}"
+    );
     Ok(())
 }
 
@@ -1193,33 +1806,45 @@ async fn given_shutdown_via_dispatch_when_called_then_ok() -> anyhow::Result<()>
 // transport: serve / request / EventStream / Shutdown
 // ===========================================================================
 
-/// Poll for the socket file to appear, up to ~2s. Bails if it never does so a
-/// hung server surfaces as a clear failure instead of a deadlock.
-async fn wait_for_socket(path: &Path) -> anyhow::Result<()> {
+async fn wait_for_server_socket(
+    path: &Path,
+    server: &mut JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
     for _ in 0..200 {
         if path.exists() {
             return Ok(());
+        }
+        if server.is_finished() {
+            let result = server.await?;
+            result?;
+            anyhow::bail!("server exited before socket {} appeared", path.display());
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     anyhow::bail!("socket {} never appeared", path.display())
 }
 
+fn socket_tempdir() -> anyhow::Result<tempfile::TempDir> {
+    Ok(tempfile::Builder::new()
+        .prefix("ipc-socket-")
+        .tempdir_in(std::env::current_dir()?)?)
+}
+
 #[tokio::test]
 async fn given_running_server_when_request_ping_then_ok() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
-    let tmp = tempfile::tempdir()?;
+    let tmp = socket_tempdir()?;
     let sock = tmp.path().join("auwsx.sock");
     let shutdown = Arc::new(Notify::new());
-    let server = tokio::spawn({
+    let mut server = tokio::spawn({
         let db = db.clone();
         let bus = bus.clone();
         let sock = sock.clone();
         let sd = shutdown.clone();
         async move { ipc::serve(db, bus, &sock, sd).await }
     });
-    wait_for_socket(&sock).await?;
+    wait_for_server_socket(&sock, &mut server).await?;
 
     let resp = ipc::request(&sock, &Command::Ping).await?;
     assert!(is_ok(&resp), "request(Ping) must return Ok, got {resp:?}");
@@ -1237,17 +1862,17 @@ async fn given_running_server_when_request_ping_then_ok() -> anyhow::Result<()> 
 async fn given_running_server_when_request_add_project_then_id() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
-    let tmp = tempfile::tempdir()?;
+    let tmp = socket_tempdir()?;
     let sock = tmp.path().join("auwsx.sock");
     let shutdown = Arc::new(Notify::new());
-    let server = tokio::spawn({
+    let mut server = tokio::spawn({
         let db = db.clone();
         let bus = bus.clone();
         let sock = sock.clone();
         let sd = shutdown.clone();
         async move { ipc::serve(db, bus, &sock, sd).await }
     });
-    wait_for_socket(&sock).await?;
+    wait_for_server_socket(&sock, &mut server).await?;
 
     let resp = ipc::request(
         &sock,
@@ -1278,17 +1903,17 @@ async fn given_running_server_when_request_add_project_then_id() -> anyhow::Resu
 async fn given_running_server_when_request_list_projects_then_projects_vec() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
-    let tmp = tempfile::tempdir()?;
+    let tmp = socket_tempdir()?;
     let sock = tmp.path().join("auwsx.sock");
     let shutdown = Arc::new(Notify::new());
-    let server = tokio::spawn({
+    let mut server = tokio::spawn({
         let db = db.clone();
         let bus = bus.clone();
         let sock = sock.clone();
         let sd = shutdown.clone();
         async move { ipc::serve(db, bus, &sock, sd).await }
     });
-    wait_for_socket(&sock).await?;
+    wait_for_server_socket(&sock, &mut server).await?;
 
     let added = ipc::request(
         &sock,
@@ -1309,7 +1934,11 @@ async fn given_running_server_when_request_list_projects_then_projects_vec() -> 
     assert!(want_id(added) > 0);
 
     let resp = ipc::request(&sock, &Command::ListProjects).await?;
-    assert_eq!(want_projects(resp).len(), 1, "one seeded project must round-trip as a one-element Vec");
+    assert_eq!(
+        want_projects(resp).len(),
+        1,
+        "one seeded project must round-trip as a one-element Vec"
+    );
 
     shutdown.notify_one();
     server.await??;
@@ -1323,21 +1952,29 @@ async fn given_running_server_when_request_get_missing_project_then_project_none
 ) -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
-    let tmp = tempfile::tempdir()?;
+    let tmp = socket_tempdir()?;
     let sock = tmp.path().join("auwsx.sock");
     let shutdown = Arc::new(Notify::new());
-    let server = tokio::spawn({
+    let mut server = tokio::spawn({
         let db = db.clone();
         let bus = bus.clone();
         let sock = sock.clone();
         let sd = shutdown.clone();
         async move { ipc::serve(db, bus, &sock, sd).await }
     });
-    wait_for_socket(&sock).await?;
+    wait_for_server_socket(&sock, &mut server).await?;
 
-    let resp = ipc::request(&sock, &Command::GetProject { project_id: 999_999 }).await?;
+    let resp = ipc::request(
+        &sock,
+        &Command::GetProject {
+            project_id: 999_999,
+        },
+    )
+    .await?;
     match resp {
-        Response::Project(p) => assert_eq!(p, None, "missing project must round-trip as Project(None)"),
+        Response::Project(p) => {
+            assert_eq!(p, None, "missing project must round-trip as Project(None)")
+        }
         other => panic!("expected Project, got {other:?}"),
     }
 
@@ -1349,24 +1986,32 @@ async fn given_running_server_when_request_get_missing_project_then_project_none
 /// Empty Vec newtype variant (`Issues(Vec<_>)`) over the wire: a project with no
 /// issues must round-trip ListIssues as an empty Vec.
 #[tokio::test]
-async fn given_running_server_when_request_list_issues_empty_then_empty_vec() -> anyhow::Result<()> {
+async fn given_running_server_when_request_list_issues_empty_then_empty_vec() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = backlog_seed_project(&db).await?; // seed off-socket; subject is the Issues round-trip.
 
-    let tmp = tempfile::tempdir()?;
+    let tmp = socket_tempdir()?;
     let sock = tmp.path().join("auwsx.sock");
     let shutdown = Arc::new(Notify::new());
-    let server = tokio::spawn({
+    let mut server = tokio::spawn({
         let db = db.clone();
         let bus = bus.clone();
         let sock = sock.clone();
         let sd = shutdown.clone();
         async move { ipc::serve(db, bus, &sock, sd).await }
     });
-    wait_for_socket(&sock).await?;
+    wait_for_server_socket(&sock, &mut server).await?;
 
-    let resp = ipc::request(&sock, &Command::ListIssues { project_id: pid, status: None }).await?;
+    let resp = ipc::request(
+        &sock,
+        &Command::ListIssues {
+            project_id: pid,
+            status: None,
+        },
+    )
+    .await?;
     match resp {
         Response::Issues(v) => assert!(v.is_empty(), "no issues must round-trip as an empty Vec"),
         other => panic!("expected Issues, got {other:?}"),
@@ -1378,24 +2023,27 @@ async fn given_running_server_when_request_list_issues_empty_then_empty_vec() ->
 }
 
 #[tokio::test]
-async fn given_running_server_when_shutdown_request_then_server_task_completes() -> anyhow::Result<()>
-{
+async fn given_running_server_when_shutdown_request_then_server_task_completes(
+) -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
-    let tmp = tempfile::tempdir()?;
+    let tmp = socket_tempdir()?;
     let sock = tmp.path().join("auwsx.sock");
     let shutdown = Arc::new(Notify::new());
-    let server = tokio::spawn({
+    let mut server = tokio::spawn({
         let db = db.clone();
         let bus = bus.clone();
         let sock = sock.clone();
         let sd = shutdown.clone();
         async move { ipc::serve(db, bus, &sock, sd).await }
     });
-    wait_for_socket(&sock).await?;
+    wait_for_server_socket(&sock, &mut server).await?;
 
     let resp = ipc::request(&sock, &Command::Shutdown).await?;
-    assert!(is_ok(&resp), "Shutdown request must return Ok, got {resp:?}");
+    assert!(
+        is_ok(&resp),
+        "Shutdown request must return Ok, got {resp:?}"
+    );
     // serve() must return Ok after the Shutdown command triggers the notify.
     server.await??;
     Ok(())
@@ -1410,17 +2058,17 @@ async fn given_raw_bad_line_when_sent_then_response_is_err() -> anyhow::Result<(
 
     let db = Db::open_memory().await?;
     let bus = events::channel();
-    let tmp = tempfile::tempdir()?;
+    let tmp = socket_tempdir()?;
     let sock = tmp.path().join("auwsx.sock");
     let shutdown = Arc::new(Notify::new());
-    let server = tokio::spawn({
+    let mut server = tokio::spawn({
         let db = db.clone();
         let bus = bus.clone();
         let sock = sock.clone();
         let sd = shutdown.clone();
         async move { ipc::serve(db, bus, &sock, sd).await }
     });
-    wait_for_socket(&sock).await?;
+    wait_for_server_socket(&sock, &mut server).await?;
 
     let mut stream = UnixStream::connect(&sock).await?;
     stream.write_all(b"not json\n").await?;
@@ -1438,10 +2086,9 @@ async fn given_raw_bad_line_when_sent_then_response_is_err() -> anyhow::Result<(
 
 #[tokio::test]
 async fn given_event_stream_when_state_changes_then_yields_backlog_changed() -> anyhow::Result<()> {
-    // This test's subject is the EventStream subscription, not Id serialization.
-    // Both the project and a pending backlog item are seeded via direct CRUD on
-    // the shared pool so the test does not depend on the broken `Response::Id`
-    // socket path (see given_running_server_when_request_add_project_then_id).
+    // This test's subject is the EventStream subscription. Both the project
+    // and a pending backlog item are seeded via direct CRUD on the shared pool
+    // so setup does not add unrelated events to the stream.
     // The emitting command is ApproveBacklog: it returns Response::Ok (which
     // serializes cleanly) and broadcasts Event::BacklogChanged.
     let db = Db::open_memory().await?;
@@ -1449,22 +2096,25 @@ async fn given_event_stream_when_state_changes_then_yields_backlog_changed() -> 
     let pid = backlog_seed_project(&db).await?;
     let item_id = backlog::add(db.pool(), pid, "x", Source::Agent, None, TS).await?; // pending
 
-    let tmp = tempfile::tempdir()?;
+    let tmp = socket_tempdir()?;
     let sock = tmp.path().join("auwsx.sock");
     let shutdown = Arc::new(Notify::new());
-    let server = tokio::spawn({
+    let mut server = tokio::spawn({
         let db = db.clone();
         let bus = bus.clone();
         let sock = sock.clone();
         let sd = shutdown.clone();
         async move { ipc::serve(db, bus, &sock, sd).await }
     });
-    wait_for_socket(&sock).await?;
+    wait_for_server_socket(&sock, &mut server).await?;
 
     // Open the subscription BEFORE the emitting command.
     let mut stream = ipc::EventStream::connect(&sock).await?;
     let resp = ipc::request(&sock, &Command::ApproveBacklog { item_id }).await?;
-    assert!(is_ok(&resp), "ApproveBacklog over socket must return Ok, got {resp:?}");
+    assert!(
+        is_ok(&resp),
+        "ApproveBacklog over socket must return Ok, got {resp:?}"
+    );
 
     match stream.next().await? {
         Some(Event::BacklogChanged { project_id, .. }) => assert_eq!(project_id, pid),

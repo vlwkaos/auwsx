@@ -92,7 +92,13 @@ fn start_for_issue(issue_id: i64) -> StartRun<'static> {
 fn given_template_with_prompt_token_and_spaced_prompt_when_build_argv_then_prompt_is_one_arg(
 ) -> anyhow::Result<()> {
     let (argv, stdin) = agent::build_argv("claude --print {prompt}", "hello world")?;
-    assert_eq!((argv, stdin), (vec!["claude".into(), "--print".into(), "hello world".into()], false));
+    assert_eq!(
+        (argv, stdin),
+        (
+            vec!["claude".into(), "--print".into(), "hello world".into()],
+            false
+        )
+    );
     Ok(())
 }
 
@@ -113,21 +119,31 @@ fn given_prompt_token_inside_a_token_when_build_argv_then_substring_replaced_in_
 }
 
 #[test]
-fn given_template_with_no_prompt_token_when_build_argv_then_stdin_flag_true() -> anyhow::Result<()> {
+fn given_template_with_no_prompt_token_when_build_argv_then_stdin_flag_true() -> anyhow::Result<()>
+{
     let (argv, stdin) = agent::build_argv("opencode run -q", "anything")?;
-    assert_eq!((argv, stdin), (vec!["opencode".into(), "run".into(), "-q".into()], true));
+    assert_eq!(
+        (argv, stdin),
+        (vec!["opencode".into(), "run".into(), "-q".into()], true)
+    );
     Ok(())
 }
 
 #[test]
 fn given_empty_template_when_build_argv_then_err() -> anyhow::Result<()> {
-    assert!(agent::build_argv("", "x").is_err(), "empty template must Err");
+    assert!(
+        agent::build_argv("", "x").is_err(),
+        "empty template must Err"
+    );
     Ok(())
 }
 
 #[test]
 fn given_whitespace_only_template_when_build_argv_then_err() -> anyhow::Result<()> {
-    assert!(agent::build_argv("   ", "x").is_err(), "whitespace-only template must Err");
+    assert!(
+        agent::build_argv("   ", "x").is_err(),
+        "whitespace-only template must Err"
+    );
     Ok(())
 }
 
@@ -341,7 +357,10 @@ async fn given_bogus_binary_when_run_then_returns_ok_not_err() -> anyhow::Result
         env: &[],
     })
     .await;
-    assert!(res.is_ok(), "spawn failure must be an Ok(Error) outcome, not Err");
+    assert!(
+        res.is_ok(),
+        "spawn failure must be an Ok(Error) outcome, not Err"
+    );
     Ok(())
 }
 
@@ -359,7 +378,10 @@ async fn given_bogus_binary_when_run_then_log_file_is_non_empty_failure_note() -
         env: &[],
     })
     .await?;
-    assert!(!std::fs::read_to_string(&log)?.is_empty(), "failure note must be written to log");
+    assert!(
+        !std::fs::read_to_string(&log)?.is_empty(),
+        "failure note must be written to log"
+    );
     Ok(())
 }
 
@@ -409,7 +431,12 @@ async fn given_cwd_set_when_run_pwd_then_log_reports_that_dir() -> anyhow::Resul
 
 #[test]
 fn given_exit_kind_variants_when_roundtripped_then_unchanged() -> anyhow::Result<()> {
-    for k in [ExitKind::Exited, ExitKind::Timeout, ExitKind::Killed, ExitKind::Error] {
+    for k in [
+        ExitKind::Exited,
+        ExitKind::Timeout,
+        ExitKind::Killed,
+        ExitKind::Error,
+    ] {
         assert_eq!(ExitKind::from_str(k.as_str()), Some(k), "{k:?}");
     }
     Ok(())
@@ -446,7 +473,11 @@ async fn given_issue_only_start_when_get_then_status_before_and_pid_and_log_path
     let id = agent_runs::start(db.pool(), start_for_issue(iid), TS).await?;
     let run = agent_runs::get(db.pool(), id).await?.expect("run exists");
     assert_eq!(
-        (run.status_before.as_deref(), run.pid, run.log_path.as_deref()),
+        (
+            run.status_before.as_deref(),
+            run.pid,
+            run.log_path.as_deref()
+        ),
         (Some("IMPLEMENTING"), Some(1234), Some("/tmp/run.log"))
     );
     Ok(())
@@ -480,7 +511,10 @@ async fn given_both_issue_and_main_job_when_start_then_err() -> anyhow::Result<(
         log_path: None,
     };
     let res = agent_runs::start(db.pool(), run, TS).await;
-    assert!(res.is_err(), "both issue_id and main_job_id Some must Err (xor guard)");
+    assert!(
+        res.is_err(),
+        "both issue_id and main_job_id Some must Err (xor guard)"
+    );
     Ok(())
 }
 
@@ -508,8 +542,16 @@ async fn given_started_run_when_finished_then_status_after_set() -> anyhow::Resu
     let db = Db::open_memory().await?;
     let (_, iid) = insert_issue(db.pool(), "p").await?;
     let id = agent_runs::start(db.pool(), start_for_issue(iid), TS).await?;
-    agent_runs::finish(db.pool(), id, Some("PLANNING"), Some(0), ExitKind::Exited, TS2, Some("done"))
-        .await?;
+    agent_runs::finish(
+        db.pool(),
+        id,
+        Some("PLANNING"),
+        Some(0),
+        ExitKind::Exited,
+        TS2,
+        Some("done"),
+    )
+    .await?;
     let run = agent_runs::get(db.pool(), id).await?.expect("run exists");
     assert_eq!(run.status_after.as_deref(), Some("PLANNING"));
     Ok(())
@@ -520,8 +562,16 @@ async fn given_started_run_when_finished_then_exit_code_set() -> anyhow::Result<
     let db = Db::open_memory().await?;
     let (_, iid) = insert_issue(db.pool(), "p").await?;
     let id = agent_runs::start(db.pool(), start_for_issue(iid), TS).await?;
-    agent_runs::finish(db.pool(), id, Some("PLANNING"), Some(0), ExitKind::Exited, TS2, Some("done"))
-        .await?;
+    agent_runs::finish(
+        db.pool(),
+        id,
+        Some("PLANNING"),
+        Some(0),
+        ExitKind::Exited,
+        TS2,
+        Some("done"),
+    )
+    .await?;
     let run = agent_runs::get(db.pool(), id).await?.expect("run exists");
     assert_eq!(run.exit_code, Some(0));
     Ok(())
@@ -532,8 +582,16 @@ async fn given_started_run_when_finished_then_exit_kind_set() -> anyhow::Result<
     let db = Db::open_memory().await?;
     let (_, iid) = insert_issue(db.pool(), "p").await?;
     let id = agent_runs::start(db.pool(), start_for_issue(iid), TS).await?;
-    agent_runs::finish(db.pool(), id, Some("PLANNING"), Some(0), ExitKind::Exited, TS2, Some("done"))
-        .await?;
+    agent_runs::finish(
+        db.pool(),
+        id,
+        Some("PLANNING"),
+        Some(0),
+        ExitKind::Exited,
+        TS2,
+        Some("done"),
+    )
+    .await?;
     let run = agent_runs::get(db.pool(), id).await?.expect("run exists");
     assert_eq!(run.exit_kind, Some(ExitKind::Exited));
     Ok(())
@@ -544,8 +602,16 @@ async fn given_started_run_when_finished_then_exited_at_is_supplied_now() -> any
     let db = Db::open_memory().await?;
     let (_, iid) = insert_issue(db.pool(), "p").await?;
     let id = agent_runs::start(db.pool(), start_for_issue(iid), TS).await?;
-    agent_runs::finish(db.pool(), id, Some("PLANNING"), Some(0), ExitKind::Exited, TS2, Some("done"))
-        .await?;
+    agent_runs::finish(
+        db.pool(),
+        id,
+        Some("PLANNING"),
+        Some(0),
+        ExitKind::Exited,
+        TS2,
+        Some("done"),
+    )
+    .await?;
     let run = agent_runs::get(db.pool(), id).await?.expect("run exists");
     assert_eq!(run.exited_at, Some(TS2));
     Ok(())
@@ -556,8 +622,16 @@ async fn given_started_run_when_finished_then_note_set() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let (_, iid) = insert_issue(db.pool(), "p").await?;
     let id = agent_runs::start(db.pool(), start_for_issue(iid), TS).await?;
-    agent_runs::finish(db.pool(), id, Some("PLANNING"), Some(0), ExitKind::Exited, TS2, Some("done"))
-        .await?;
+    agent_runs::finish(
+        db.pool(),
+        id,
+        Some("PLANNING"),
+        Some(0),
+        ExitKind::Exited,
+        TS2,
+        Some("done"),
+    )
+    .await?;
     let run = agent_runs::get(db.pool(), id).await?.expect("run exists");
     assert_eq!(run.note.as_deref(), Some("done"));
     Ok(())
@@ -566,8 +640,7 @@ async fn given_started_run_when_finished_then_note_set() -> anyhow::Result<()> {
 #[tokio::test]
 async fn given_missing_run_id_when_finish_then_err() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
-    let res =
-        agent_runs::finish(db.pool(), 999_999, None, None, ExitKind::Exited, TS2, None).await;
+    let res = agent_runs::finish(db.pool(), 999_999, None, None, ExitKind::Exited, TS2, None).await;
     assert!(res.is_err(), "finish on missing run_id must Err");
     Ok(())
 }
@@ -599,8 +672,11 @@ async fn given_multiple_runs_for_issue_when_list_by_issue_then_oldest_id_first(
     let a = agent_runs::start(db.pool(), start_for_issue(iid), TS).await?;
     let b = agent_runs::start(db.pool(), start_for_issue(iid), TS).await?;
     let c = agent_runs::start(db.pool(), start_for_issue(iid), TS).await?;
-    let ids: Vec<i64> =
-        agent_runs::list_by_issue(db.pool(), iid).await?.into_iter().map(|r| r.id).collect();
+    let ids: Vec<i64> = agent_runs::list_by_issue(db.pool(), iid)
+        .await?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
     assert_eq!(ids, vec![a, b, c]);
     Ok(())
 }
@@ -612,8 +688,11 @@ async fn given_runs_in_another_issue_when_list_by_issue_then_excluded() -> anyho
     let (_, other) = insert_issue(db.pool(), "p2").await?;
     agent_runs::start(db.pool(), start_for_issue(other), TS).await?;
     let my_run = agent_runs::start(db.pool(), start_for_issue(mine), TS).await?;
-    let ids: Vec<i64> =
-        agent_runs::list_by_issue(db.pool(), mine).await?.into_iter().map(|r| r.id).collect();
+    let ids: Vec<i64> = agent_runs::list_by_issue(db.pool(), mine)
+        .await?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
     assert_eq!(ids, vec![my_run]);
     Ok(())
 }

@@ -303,7 +303,10 @@ async fn backlog_items_approval_bad_value_rejected() -> anyhow::Result<()> {
     .execute(db.pool())
     .await;
 
-    assert!(res.is_err(), "backlog_items.approval='maybe' must be rejected");
+    assert!(
+        res.is_err(),
+        "backlog_items.approval='maybe' must be rejected"
+    );
     Ok(())
 }
 
@@ -512,7 +515,10 @@ async fn issues_title_omitted_rejected() -> anyhow::Result<()> {
     .bind(TS)
     .execute(db.pool())
     .await;
-    assert!(res.is_err(), "issues.title is NOT NULL; omission must be rejected");
+    assert!(
+        res.is_err(),
+        "issues.title is NOT NULL; omission must be rejected"
+    );
 
     // Positive control: identical row with title present succeeds.
     insert_issue(db.pool(), project_id, "PLANNING").await?;

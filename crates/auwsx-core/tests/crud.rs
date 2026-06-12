@@ -15,6 +15,7 @@ use auwsx_core::db::issues::{self, INITIAL_STATUS};
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode, NewProject};
 use auwsx_core::db::subtasks;
 use auwsx_core::db::Db;
+use auwsx_core::main_jobs::{self, MainJobStatus};
 use auwsx_core::state::{is_legal_transition, IssueStatus};
 use auwsx_core::steering::{self, SteeringSource};
 use sqlx::SqlitePool;
@@ -71,6 +72,11 @@ async fn insert_routine(pool: &SqlitePool, project_id: i64) -> anyhow::Result<i6
     .await?
     .get("id");
     Ok(id)
+}
+
+async fn insert_main_job(pool: &SqlitePool, project_id: i64) -> anyhow::Result<i64> {
+    let routine_id = insert_routine(pool, project_id).await?;
+    main_jobs::enqueue_routine(pool, project_id, routine_id, "report", "prompt", TS).await
 }
 
 /// Create an issue and force it into `status` (bypassing the legality matrix),
@@ -147,8 +153,8 @@ async fn given_review_agent_cmd_some_when_created_then_review_agent_cmd_roundtri
 // --- SQL DEFAULTs after a minimal create -----------------------------------
 
 #[tokio::test]
-async fn given_minimal_create_when_get_then_completion_policy_defaults_manual(
-) -> anyhow::Result<()> {
+async fn given_minimal_create_when_get_then_completion_policy_defaults_manual() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let id = insert_project(db.pool(), "p").await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
@@ -222,7 +228,8 @@ async fn given_minimal_create_when_get_then_max_concurrency_defaults_1() -> anyh
 }
 
 #[tokio::test]
-async fn given_minimal_create_when_get_then_schedule_interval_defaults_none() -> anyhow::Result<()> {
+async fn given_minimal_create_when_get_then_schedule_interval_defaults_none() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let id = insert_project(db.pool(), "p").await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
@@ -258,7 +265,8 @@ async fn given_minimal_create_when_get_then_deepsleep_interval_defaults_7() -> a
 }
 
 #[tokio::test]
-async fn given_minimal_create_when_get_then_last_deepsleep_at_defaults_none() -> anyhow::Result<()> {
+async fn given_minimal_create_when_get_then_last_deepsleep_at_defaults_none() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let id = insert_project(db.pool(), "p").await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
@@ -278,7 +286,9 @@ async fn given_project_when_get_by_name_then_returns_same_row() -> anyhow::Resul
     let db = Db::open_memory().await?;
     let id = insert_project(db.pool(), "alpha").await?;
     let by_id = projects::get(db.pool(), id).await?.expect("by id");
-    let by_name = projects::get_by_name(db.pool(), "alpha").await?.expect("by name");
+    let by_name = projects::get_by_name(db.pool(), "alpha")
+        .await?
+        .expect("by name");
     assert_eq!(by_id, by_name);
     Ok(())
 }
@@ -303,7 +313,11 @@ async fn given_three_projects_when_list_then_ordered_by_id_asc() -> anyhow::Resu
     insert_project(db.pool(), "a").await?;
     insert_project(db.pool(), "b").await?;
     insert_project(db.pool(), "c").await?;
-    let names: Vec<String> = projects::list(db.pool()).await?.into_iter().map(|p| p.name).collect();
+    let names: Vec<String> = projects::list(db.pool())
+        .await?
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
     assert_eq!(names, vec!["a", "b", "c"]);
     Ok(())
 }
@@ -343,7 +357,11 @@ async fn given_bogus_or_empty_when_merge_mode_from_str_then_none() -> anyhow::Re
 
 #[tokio::test]
 async fn given_completion_policy_variants_when_roundtripped_then_unchanged() -> anyhow::Result<()> {
-    for v in [CompletionPolicy::Manual, CompletionPolicy::Soft, CompletionPolicy::Auto] {
+    for v in [
+        CompletionPolicy::Manual,
+        CompletionPolicy::Soft,
+        CompletionPolicy::Auto,
+    ] {
         assert_eq!(CompletionPolicy::from_str(v.as_str()), Some(v), "{v:?}");
     }
     Ok(())
@@ -369,8 +387,7 @@ async fn given_bogus_or_empty_when_completion_policy_from_str_then_none() -> any
 // ===========================================================================
 
 #[tokio::test]
-async fn given_new_issue_when_created_then_status_is_initial_consolidating(
-) -> anyhow::Result<()> {
+async fn given_new_issue_when_created_then_status_is_initial_consolidating() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
@@ -397,8 +414,8 @@ async fn given_new_issue_with_description_when_get_then_description_roundtrips(
 }
 
 #[tokio::test]
-async fn given_new_issue_without_description_when_get_then_description_none(
-) -> anyhow::Result<()> {
+async fn given_new_issue_without_description_when_get_then_description_none() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
@@ -408,8 +425,7 @@ async fn given_new_issue_without_description_when_get_then_description_none(
 }
 
 #[tokio::test]
-async fn given_new_issue_when_created_then_counters_and_flags_default(
-) -> anyhow::Result<()> {
+async fn given_new_issue_when_created_then_counters_and_flags_default() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
@@ -451,22 +467,27 @@ async fn given_three_issues_when_list_by_project_then_newest_id_first() -> anyho
     let a = issues::create(db.pool(), pid, "a", None, TS).await?;
     let b = issues::create(db.pool(), pid, "b", None, TS).await?;
     let c = issues::create(db.pool(), pid, "c", None, TS).await?;
-    let ids: Vec<i64> =
-        issues::list_by_project(db.pool(), pid).await?.into_iter().map(|i| i.id).collect();
+    let ids: Vec<i64> = issues::list_by_project(db.pool(), pid)
+        .await?
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
     assert_eq!(ids, vec![c, b, a]);
     Ok(())
 }
 
 #[tokio::test]
-async fn given_issues_in_other_project_when_list_by_project_then_excluded(
-) -> anyhow::Result<()> {
+async fn given_issues_in_other_project_when_list_by_project_then_excluded() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let p1 = insert_project(db.pool(), "p1").await?;
     let p2 = insert_project(db.pool(), "p2").await?;
     issues::create(db.pool(), p2, "other", None, TS).await?;
     let mine = issues::create(db.pool(), p1, "mine", None, TS).await?;
-    let ids: Vec<i64> =
-        issues::list_by_project(db.pool(), p1).await?.into_iter().map(|i| i.id).collect();
+    let ids: Vec<i64> = issues::list_by_project(db.pool(), p1)
+        .await?
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
     assert_eq!(ids, vec![mine]);
     Ok(())
 }
@@ -500,8 +521,8 @@ async fn given_no_issues_in_status_when_list_by_status_then_empty() -> anyhow::R
 // --- transition: legal, illegal, timestamp ---------------------------------
 
 #[tokio::test]
-async fn given_consolidating_when_transition_to_planning_then_status_planning(
-) -> anyhow::Result<()> {
+async fn given_consolidating_when_transition_to_planning_then_status_planning() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
@@ -577,12 +598,11 @@ async fn given_missing_issue_when_force_status_then_err() -> anyhow::Result<()> 
 // --- mark_absorbed ---------------------------------------------------------
 
 #[tokio::test]
-async fn given_consolidating_issue_when_mark_absorbed_then_status_absorbed(
-) -> anyhow::Result<()> {
+async fn given_consolidating_issue_when_mark_absorbed_then_status_absorbed() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let donor = issues::create(db.pool(), pid, "donor", None, TS).await?;
-    let target = issues::create(db.pool(), pid, "target", None, TS).await?;
+    let target = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
     issues::mark_absorbed(db.pool(), donor, target, TS2).await?;
     let issue = issues::get(db.pool(), donor).await?.expect("issue exists");
     assert_eq!(issue.status, IssueStatus::Absorbed);
@@ -595,10 +615,33 @@ async fn given_consolidating_issue_when_mark_absorbed_then_absorbed_into_id_set(
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let donor = issues::create(db.pool(), pid, "donor", None, TS).await?;
-    let target = issues::create(db.pool(), pid, "target", None, TS).await?;
+    let target = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
     issues::mark_absorbed(db.pool(), donor, target, TS2).await?;
     let issue = issues::get(db.pool(), donor).await?.expect("issue exists");
     assert_eq!(issue.absorbed_into_id, Some(target));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_absorb_target_not_working_when_mark_absorbed_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let pid = insert_project(db.pool(), "p").await?;
+    let donor = issues::create(db.pool(), pid, "donor", None, TS).await?;
+    let target = issues::create(db.pool(), pid, "target", None, TS).await?;
+    let res = issues::mark_absorbed(db.pool(), donor, target, TS2).await;
+    assert!(res.is_err(), "target must accept steering");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_absorb_target_in_other_project_when_mark_absorbed_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let pid = insert_project(db.pool(), "p").await?;
+    let other_pid = insert_project(db.pool(), "other").await?;
+    let donor = issues::create(db.pool(), pid, "donor", None, TS).await?;
+    let target = insert_issue_at(db.pool(), other_pid, IssueStatus::Implementing).await?;
+    let res = issues::mark_absorbed(db.pool(), donor, target, TS2).await;
+    assert!(res.is_err(), "target must belong to the same project");
     Ok(())
 }
 
@@ -623,7 +666,11 @@ async fn given_issue_when_set_worktree_then_fields_roundtrip() -> anyhow::Result
     issues::set_worktree(db.pool(), id, Some("br"), Some("/wt"), Some("sess"), TS2).await?;
     let issue = issues::get(db.pool(), id).await?.expect("issue exists");
     assert_eq!(
-        (issue.branch.as_deref(), issue.worktree_path.as_deref(), issue.agent_session.as_deref()),
+        (
+            issue.branch.as_deref(),
+            issue.worktree_path.as_deref(),
+            issue.agent_session.as_deref()
+        ),
         (Some("br"), Some("/wt"), Some("sess"))
     );
     Ok(())
@@ -636,7 +683,10 @@ async fn given_issue_when_set_worktree_all_none_then_fields_null() -> anyhow::Re
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
     issues::set_worktree(db.pool(), id, None, None, None, TS2).await?;
     let issue = issues::get(db.pool(), id).await?.expect("issue exists");
-    assert_eq!((issue.branch, issue.worktree_path, issue.agent_session), (None, None, None));
+    assert_eq!(
+        (issue.branch, issue.worktree_path, issue.agent_session),
+        (None, None, None)
+    );
     Ok(())
 }
 
@@ -738,8 +788,7 @@ async fn given_twice_bumped_review_round_when_bumped_then_returns_2() -> anyhow:
 }
 
 #[tokio::test]
-async fn given_bumped_review_round_when_get_then_persisted_value_matches(
-) -> anyhow::Result<()> {
+async fn given_bumped_review_round_when_get_then_persisted_value_matches() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
@@ -765,7 +814,10 @@ async fn given_fresh_issue_when_bump_conflict_attempts_then_returns_1() -> anyho
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
     let new = issues::bump_conflict_attempts(db.pool(), id, TS2).await?;
-    assert_eq!(new, 1, "conflict_attempts starts at 0; first bump returns 1");
+    assert_eq!(
+        new, 1,
+        "conflict_attempts starts at 0; first bump returns 1"
+    );
     Ok(())
 }
 
@@ -773,7 +825,10 @@ async fn given_fresh_issue_when_bump_conflict_attempts_then_returns_1() -> anyho
 async fn given_missing_issue_when_bump_conflict_attempts_then_err() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let res = issues::bump_conflict_attempts(db.pool(), 999_999, TS).await;
-    assert!(res.is_err(), "bump_conflict_attempts on missing id must Err");
+    assert!(
+        res.is_err(),
+        "bump_conflict_attempts on missing id must Err"
+    );
     Ok(())
 }
 
@@ -803,25 +858,37 @@ async fn given_non_working_phase_status_when_accepts_steering_then_false() -> an
 
 #[tokio::test]
 async fn given_consolidating_to_planning_when_checked_then_legal() -> anyhow::Result<()> {
-    assert!(is_legal_transition(IssueStatus::Consolidating, IssueStatus::Planning));
+    assert!(is_legal_transition(
+        IssueStatus::Consolidating,
+        IssueStatus::Planning
+    ));
     Ok(())
 }
 
 #[tokio::test]
 async fn given_consolidating_to_implementing_when_checked_then_illegal() -> anyhow::Result<()> {
-    assert!(!is_legal_transition(IssueStatus::Consolidating, IssueStatus::Implementing));
+    assert!(!is_legal_transition(
+        IssueStatus::Consolidating,
+        IssueStatus::Implementing
+    ));
     Ok(())
 }
 
 #[tokio::test]
 async fn given_consolidating_to_absorbed_when_checked_then_legal() -> anyhow::Result<()> {
-    assert!(is_legal_transition(IssueStatus::Consolidating, IssueStatus::Absorbed));
+    assert!(is_legal_transition(
+        IssueStatus::Consolidating,
+        IssueStatus::Absorbed
+    ));
     Ok(())
 }
 
 #[tokio::test]
 async fn given_consolidating_to_done_when_checked_then_illegal() -> anyhow::Result<()> {
-    assert!(!is_legal_transition(IssueStatus::Consolidating, IssueStatus::Done));
+    assert!(!is_legal_transition(
+        IssueStatus::Consolidating,
+        IssueStatus::Done
+    ));
     Ok(())
 }
 
@@ -857,7 +924,9 @@ async fn given_new_finding_when_added_then_status_open() -> anyhow::Result<()> {
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.status, FindingStatus::Open);
     Ok(())
 }
@@ -868,7 +937,9 @@ async fn given_new_finding_when_added_then_resolved_at_none() -> anyhow::Result<
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.resolved_at, None);
     Ok(())
 }
@@ -892,10 +963,24 @@ async fn given_finding_with_optional_fields_when_get_then_roundtrip() -> anyhow:
         TS,
     )
     .await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(
-        (f.review_round, f.severity, f.lens.as_deref(), f.detail.as_deref(), f.file_ref.as_deref()),
-        (2, Severity::Blocker, Some("security"), Some("token logged"), Some("src/x.rs:10"))
+        (
+            f.review_round,
+            f.severity,
+            f.lens.as_deref(),
+            f.detail.as_deref(),
+            f.file_ref.as_deref()
+        ),
+        (
+            2,
+            Severity::Blocker,
+            Some("security"),
+            Some("token logged"),
+            Some("src/x.rs:10")
+        )
     );
     Ok(())
 }
@@ -924,8 +1009,11 @@ async fn given_three_findings_when_list_by_issue_then_oldest_id_first() -> anyho
     let a = findings::add(db.pool(), new_finding(iid), TS).await?;
     let b = findings::add(db.pool(), new_finding(iid), TS).await?;
     let c = findings::add(db.pool(), new_finding(iid), TS).await?;
-    let ids: Vec<i64> =
-        findings::list_by_issue(db.pool(), iid).await?.into_iter().map(|f| f.id).collect();
+    let ids: Vec<i64> = findings::list_by_issue(db.pool(), iid)
+        .await?
+        .into_iter()
+        .map(|f| f.id)
+        .collect();
     assert_eq!(ids, vec![a, b, c]);
     Ok(())
 }
@@ -938,8 +1026,11 @@ async fn given_mixed_status_findings_when_list_open_then_only_open() -> anyhow::
     let open = findings::add(db.pool(), new_finding(iid), TS).await?;
     let accepted = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::accept(db.pool(), accepted, "will fix", TS2).await?;
-    let ids: Vec<i64> =
-        findings::list_open(db.pool(), iid).await?.into_iter().map(|f| f.id).collect();
+    let ids: Vec<i64> = findings::list_open(db.pool(), iid)
+        .await?
+        .into_iter()
+        .map(|f| f.id)
+        .collect();
     assert_eq!(ids, vec![open]);
     Ok(())
 }
@@ -953,7 +1044,9 @@ async fn given_open_finding_when_accept_then_status_accepted() -> anyhow::Result
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::accept(db.pool(), fid, "will fix", TS2).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.status, FindingStatus::Accepted);
     Ok(())
 }
@@ -965,7 +1058,9 @@ async fn given_open_finding_when_accept_then_adjudication_is_rationale() -> anyh
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::accept(db.pool(), fid, "will fix", TS2).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.adjudication.as_deref(), Some("will fix"));
     Ok(())
 }
@@ -977,7 +1072,9 @@ async fn given_open_finding_when_accept_then_resolved_at_is_now() -> anyhow::Res
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::accept(db.pool(), fid, "will fix", TS2).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.resolved_at, Some(TS2));
     Ok(())
 }
@@ -999,7 +1096,9 @@ async fn given_open_finding_when_reject_then_status_rejected() -> anyhow::Result
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::reject(db.pool(), fid, "false positive", TS2).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.status, FindingStatus::Rejected);
     Ok(())
 }
@@ -1011,7 +1110,9 @@ async fn given_open_finding_when_reject_then_adjudication_is_rationale() -> anyh
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::reject(db.pool(), fid, "false positive", TS2).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.adjudication.as_deref(), Some("false positive"));
     Ok(())
 }
@@ -1033,7 +1134,9 @@ async fn given_open_finding_when_dismiss_then_status_dismissed() -> anyhow::Resu
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::dismiss(db.pool(), fid, TS2).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.status, FindingStatus::Dismissed);
     Ok(())
 }
@@ -1045,7 +1148,9 @@ async fn given_open_finding_when_dismiss_then_adjudication_stays_none() -> anyho
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::dismiss(db.pool(), fid, TS2).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.adjudication, None);
     Ok(())
 }
@@ -1057,7 +1162,9 @@ async fn given_open_finding_when_dismiss_then_resolved_at_is_now() -> anyhow::Re
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::dismiss(db.pool(), fid, TS2).await?;
-    let f = findings::get(db.pool(), fid).await?.expect("finding exists");
+    let f = findings::get(db.pool(), fid)
+        .await?
+        .expect("finding exists");
     assert_eq!(f.resolved_at, Some(TS2));
     Ok(())
 }
@@ -1074,7 +1181,12 @@ async fn given_missing_finding_when_dismiss_then_err() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn given_severity_variants_when_roundtripped_then_unchanged() -> anyhow::Result<()> {
-    for v in [Severity::Blocker, Severity::Major, Severity::Minor, Severity::Nit] {
+    for v in [
+        Severity::Blocker,
+        Severity::Major,
+        Severity::Minor,
+        Severity::Nit,
+    ] {
         assert_eq!(Severity::from_str(v.as_str()), Some(v), "{v:?}");
     }
     Ok(())
@@ -1172,8 +1284,8 @@ async fn given_no_subtasks_when_list_by_issue_then_empty() -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn given_subtasks_with_distinct_ord_when_list_then_ordered_by_ord_asc(
-) -> anyhow::Result<()> {
+async fn given_subtasks_with_distinct_ord_when_list_then_ordered_by_ord_asc() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
@@ -1181,8 +1293,11 @@ async fn given_subtasks_with_distinct_ord_when_list_then_ordered_by_ord_asc(
     subtasks::add(db.pool(), iid, 2, "third", TS).await?;
     subtasks::add(db.pool(), iid, 0, "first", TS).await?;
     subtasks::add(db.pool(), iid, 1, "second", TS).await?;
-    let texts: Vec<String> =
-        subtasks::list_by_issue(db.pool(), iid).await?.into_iter().map(|s| s.text).collect();
+    let texts: Vec<String> = subtasks::list_by_issue(db.pool(), iid)
+        .await?
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
     assert_eq!(texts, vec!["first", "second", "third"]);
     Ok(())
 }
@@ -1194,8 +1309,11 @@ async fn given_equal_ord_subtasks_when_list_then_tiebreak_by_id_asc() -> anyhow:
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
     let a = subtasks::add(db.pool(), iid, 0, "a", TS).await?;
     let b = subtasks::add(db.pool(), iid, 0, "b", TS).await?;
-    let ids: Vec<i64> =
-        subtasks::list_by_issue(db.pool(), iid).await?.into_iter().map(|s| s.id).collect();
+    let ids: Vec<i64> = subtasks::list_by_issue(db.pool(), iid)
+        .await?
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
     assert_eq!(ids, vec![a, b]);
     Ok(())
 }
@@ -1353,8 +1471,11 @@ async fn given_three_items_when_list_by_project_then_newest_id_first() -> anyhow
     let a = backlog::add(db.pool(), pid, "a", Source::Human, None, TS).await?;
     let b = backlog::add(db.pool(), pid, "b", Source::Human, None, TS).await?;
     let c = backlog::add(db.pool(), pid, "c", Source::Human, None, TS).await?;
-    let ids: Vec<i64> =
-        backlog::list_by_project(db.pool(), pid).await?.into_iter().map(|i| i.id).collect();
+    let ids: Vec<i64> = backlog::list_by_project(db.pool(), pid)
+        .await?
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
     assert_eq!(ids, vec![c, b, a]);
     Ok(())
 }
@@ -1584,13 +1705,15 @@ async fn given_bogus_or_empty_when_approval_from_str_then_none() -> anyhow::Resu
 // ===========================================================================
 
 #[tokio::test]
-async fn given_working_phase_issue_when_steering_added_then_get_returns_note(
-) -> anyhow::Result<()> {
+async fn given_working_phase_issue_when_steering_added_then_get_returns_note() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await?;
-    let s = steering::get(db.pool(), sid).await?.expect("steering exists");
+    let s = steering::get(db.pool(), sid)
+        .await?
+        .expect("steering exists");
     assert_eq!(s.note, "go left");
     Ok(())
 }
@@ -1601,20 +1724,25 @@ async fn given_new_steering_when_added_then_not_consumed() -> anyhow::Result<()>
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await?;
-    let s = steering::get(db.pool(), sid).await?.expect("steering exists");
+    let s = steering::get(db.pool(), sid)
+        .await?
+        .expect("steering exists");
     assert!(!s.consumed);
     Ok(())
 }
 
 #[tokio::test]
-async fn given_steering_added_when_issue_read_then_has_pending_steering_true(
-) -> anyhow::Result<()> {
+async fn given_steering_added_when_issue_read_then_has_pending_steering_true() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
     steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await?;
     let issue = issues::get(db.pool(), iid).await?.expect("issue exists");
-    assert!(issue.has_pending_steering, "add must flip issue.has_pending_steering");
+    assert!(
+        issue.has_pending_steering,
+        "add must flip issue.has_pending_steering"
+    );
     Ok(())
 }
 
@@ -1631,14 +1759,16 @@ async fn given_planned_issue_when_steering_added_then_err() -> anyhow::Result<()
 }
 
 #[tokio::test]
-async fn given_planned_issue_when_steering_add_fails_then_flag_stays_false(
-) -> anyhow::Result<()> {
+async fn given_planned_issue_when_steering_add_fails_then_flag_stays_false() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Planned).await?;
     let _ = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await;
     let issue = issues::get(db.pool(), iid).await?.expect("issue exists");
-    assert!(!issue.has_pending_steering, "rejected steering must not flip the flag");
+    assert!(
+        !issue.has_pending_steering,
+        "rejected steering must not flip the flag"
+    );
     Ok(())
 }
 
@@ -1674,8 +1804,11 @@ async fn given_multiple_pending_steering_when_list_pending_then_oldest_id_first(
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
     let a = steering::add(db.pool(), iid, SteeringSource::Human, "first", TS).await?;
     let b = steering::add(db.pool(), iid, SteeringSource::Human, "second", TS).await?;
-    let ids: Vec<i64> =
-        steering::list_pending(db.pool(), iid).await?.into_iter().map(|s| s.id).collect();
+    let ids: Vec<i64> = steering::list_pending(db.pool(), iid)
+        .await?
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
     assert_eq!(ids, vec![a, b]);
     Ok(())
 }
@@ -1699,7 +1832,9 @@ async fn given_consumed_steering_when_get_then_consumed_at_is_now() -> anyhow::R
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "a", TS).await?;
     steering::consume_all(db.pool(), iid, TS2).await?;
-    let s = steering::get(db.pool(), sid).await?.expect("steering exists");
+    let s = steering::get(db.pool(), sid)
+        .await?
+        .expect("steering exists");
     assert_eq!(s.consumed_at, Some(TS2));
     Ok(())
 }
@@ -1712,13 +1847,16 @@ async fn given_consume_all_when_done_then_issue_flag_cleared() -> anyhow::Result
     steering::add(db.pool(), iid, SteeringSource::Human, "a", TS).await?;
     steering::consume_all(db.pool(), iid, TS2).await?;
     let issue = issues::get(db.pool(), iid).await?.expect("issue exists");
-    assert!(!issue.has_pending_steering, "consume_all must clear the flag");
+    assert!(
+        !issue.has_pending_steering,
+        "consume_all must clear the flag"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn given_pending_steering_when_remove_pending_then_list_pending_empty(
-) -> anyhow::Result<()> {
+async fn given_pending_steering_when_remove_pending_then_list_pending_empty() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
@@ -1806,7 +1944,9 @@ async fn given_consumed_steering_when_consume_all_again_then_consumed_at_not_res
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "a", TS).await?;
     steering::consume_all(db.pool(), iid, TS2).await?;
     steering::consume_all(db.pool(), iid, TS2 + 1).await?;
-    let s = steering::get(db.pool(), sid).await?.expect("steering exists");
+    let s = steering::get(db.pool(), sid)
+        .await?
+        .expect("steering exists");
     assert_eq!(s.consumed_at, Some(TS2));
     Ok(())
 }
@@ -1816,7 +1956,10 @@ async fn given_dangling_issue_id_when_finding_added_then_err() -> anyhow::Result
     // No issue with id 999_999 exists, so the FK on findings.issue_id must reject.
     let db = Db::open_memory().await?;
     let res = findings::add(db.pool(), new_finding(999_999), TS).await;
-    assert!(res.is_err(), "findings::add with a dangling issue_id must Err");
+    assert!(
+        res.is_err(),
+        "findings::add with a dangling issue_id must Err"
+    );
     Ok(())
 }
 
@@ -1904,8 +2047,8 @@ async fn given_completion_policy_some_auto_when_created_then_soft_timeout_siblin
 }
 
 #[tokio::test]
-async fn given_plan_gate_timeout_some_zero_when_created_then_plan_gate_is_0(
-) -> anyhow::Result<()> {
+async fn given_plan_gate_timeout_some_zero_when_created_then_plan_gate_is_0() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let id = projects::create(
         db.pool(),
@@ -2030,7 +2173,11 @@ async fn given_all_three_overrides_when_created_then_each_persists_independently
     .await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
     assert_eq!(
-        (p.completion_policy, p.plan_gate_timeout_min, p.completion_soft_timeout_min),
+        (
+            p.completion_policy,
+            p.plan_gate_timeout_min,
+            p.completion_soft_timeout_min
+        ),
         (CompletionPolicy::Soft, 0, 45)
     );
     Ok(())
@@ -2060,7 +2207,10 @@ async fn given_negative_plan_gate_timeout_override_when_created_then_stored_verb
     )
     .await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
-    assert_eq!((p.plan_gate_timeout_min, p.completion_soft_timeout_min), (-5, 60));
+    assert_eq!(
+        (p.plan_gate_timeout_min, p.completion_soft_timeout_min),
+        (-5, 60)
+    );
     Ok(())
 }
 
@@ -2087,8 +2237,85 @@ async fn given_soft_timeout_override_alone_when_created_then_persists_and_policy
     .await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
     assert_eq!(
-        (p.completion_policy, p.plan_gate_timeout_min, p.completion_soft_timeout_min),
+        (
+            p.completion_policy,
+            p.plan_gate_timeout_min,
+            p.completion_soft_timeout_min
+        ),
         (CompletionPolicy::Manual, 10, 45)
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// main jobs
+// ===========================================================================
+
+#[tokio::test]
+async fn given_routine_main_job_when_enqueued_then_recent_by_project_returns_queued(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "main-job-project").await?;
+    let job_id = insert_main_job(db.pool(), project_id).await?;
+
+    let jobs = main_jobs::recent_by_project(db.pool(), project_id, 10).await?;
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, job_id);
+    assert_eq!(jobs[0].status, MainJobStatus::Queued);
+    assert_eq!(jobs[0].queued_at, TS);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_queued_main_job_when_mark_running_then_status_and_log_are_set() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "main-job-running").await?;
+    let job_id = insert_main_job(db.pool(), project_id).await?;
+
+    main_jobs::mark_running(db.pool(), job_id, TS2, "/tmp/job.log").await?;
+    let job = main_jobs::get(db.pool(), job_id)
+        .await?
+        .expect("job exists");
+
+    assert_eq!(job.status, MainJobStatus::Running);
+    assert_eq!(job.started_at, Some(TS2));
+    assert_eq!(job.log_path.as_deref(), Some("/tmp/job.log"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_done_main_job_when_mark_running_again_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "main-job-guard").await?;
+    let job_id = insert_main_job(db.pool(), project_id).await?;
+    main_jobs::finish(db.pool(), job_id, MainJobStatus::Done, TS2, Some("ok")).await?;
+
+    let err = main_jobs::mark_running(db.pool(), job_id, TS2, "/tmp/job.log")
+        .await
+        .expect_err("terminal job must not be marked running");
+
+    assert!(
+        err.to_string().contains("is not queued"),
+        "unexpected error: {err:#}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_non_terminal_status_when_finish_main_job_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "main-job-finish").await?;
+    let job_id = insert_main_job(db.pool(), project_id).await?;
+
+    let err = main_jobs::finish(db.pool(), job_id, MainJobStatus::Running, TS2, None)
+        .await
+        .expect_err("finish must reject non-terminal statuses");
+
+    assert!(
+        err.to_string().contains("terminal"),
+        "unexpected error: {err:#}"
     );
     Ok(())
 }

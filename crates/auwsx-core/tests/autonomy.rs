@@ -22,20 +22,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use auwsx_core::agent::{AgentExecutor, AgentOutcome, AgentSpec, ExitKind};
+use auwsx_core::artifacts;
+use auwsx_core::backlog::{self, Source};
 use auwsx_core::clock::Clock;
 use auwsx_core::db::agent_runs::{self, Role};
 use auwsx_core::db::issues::{self, Issue};
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode, NewProject, Project};
+use auwsx_core::db::scheduler_runs;
 use auwsx_core::db::Db;
 use auwsx_core::events;
+use auwsx_core::main_jobs::{self, MainJobStatus};
 use auwsx_core::prompt::{self, PromptContext};
+use auwsx_core::routines::{self, NewRoutine, RoutineType};
 use auwsx_core::scheduler::{decide, Decision, Scheduler};
 use auwsx_core::state::IssueStatus;
 use auwsx_core::worktree::{branch_for_issue, WorktreeHandle, Worktrees};
 use sqlx::SqlitePool;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 /// Fixed deterministic timestamp (Unix epoch ms). No SystemTime anywhere.
 const TS: i64 = 1_000_000;
+static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 // ===========================================================================
 // In-memory struct builders for the PURE fns (no DB round-trip needed).
@@ -106,7 +113,10 @@ fn empty_running() -> HashSet<i64> {
 
 #[test]
 fn given_consolidating_when_plan_phase_then_main_no_worktree() {
-    assert_eq!(prompt_plan(IssueStatus::Consolidating), Some((Role::Main, false)));
+    assert_eq!(
+        prompt_plan(IssueStatus::Consolidating),
+        Some((Role::Main, false))
+    );
 }
 
 #[test]
@@ -116,7 +126,10 @@ fn given_planning_when_plan_phase_then_plan_needs_worktree() {
 
 #[test]
 fn given_implementing_when_plan_phase_then_work_needs_worktree() {
-    assert_eq!(prompt_plan(IssueStatus::Implementing), Some((Role::Work, true)));
+    assert_eq!(
+        prompt_plan(IssueStatus::Implementing),
+        Some((Role::Work, true))
+    );
 }
 
 #[test]
@@ -131,12 +144,18 @@ fn given_audit_when_plan_phase_then_work_needs_worktree() {
 
 #[test]
 fn given_conflicted_when_plan_phase_then_work_needs_worktree() {
-    assert_eq!(prompt_plan(IssueStatus::Conflicted), Some((Role::Work, true)));
+    assert_eq!(
+        prompt_plan(IssueStatus::Conflicted),
+        Some((Role::Work, true))
+    );
 }
 
 #[test]
 fn given_completing_when_plan_phase_then_work_needs_worktree() {
-    assert_eq!(prompt_plan(IssueStatus::Completing), Some((Role::Work, true)));
+    assert_eq!(
+        prompt_plan(IssueStatus::Completing),
+        Some((Role::Work, true))
+    );
 }
 
 #[test]
@@ -378,7 +397,10 @@ fn given_done_issue_when_build_then_none() {
         steering: &[],
         open_findings: &[],
     };
-    assert!(prompt::build(&ctx).is_none(), "non-actionable status yields no prompt");
+    assert!(
+        prompt::build(&ctx).is_none(),
+        "non-actionable status yields no prompt"
+    );
 }
 
 #[test]
@@ -391,7 +413,10 @@ fn given_planning_issue_when_build_then_body_mentions_planned_callback() {
         open_findings: &[],
     };
     let text = prompt::build(&ctx).expect("planning prompt");
-    assert!(text.contains("PLANNED"), "planning body must point at the PLANNED target");
+    assert!(
+        text.contains("PLANNED"),
+        "planning body must point at the PLANNED target"
+    );
 }
 
 #[test]
@@ -404,7 +429,10 @@ fn given_review_issue_when_build_then_body_mentions_needs_fix_and_audit() {
         open_findings: &[],
     };
     let text = prompt::build(&ctx).expect("review prompt");
-    assert!(text.contains("NEEDS_FIX"), "review body must offer NEEDS_FIX");
+    assert!(
+        text.contains("NEEDS_FIX"),
+        "review body must offer NEEDS_FIX"
+    );
     assert!(text.contains("AUDIT"), "review body must offer AUDIT");
 }
 
@@ -497,6 +525,43 @@ impl AgentExecutor for ScriptedAgent {
     }
 }
 
+struct ExitAgent;
+#[async_trait]
+impl AgentExecutor for ExitAgent {
+    async fn execute(&self, _spec: AgentSpec<'_>) -> anyhow::Result<AgentOutcome> {
+        Ok(AgentOutcome {
+            exit_kind: ExitKind::Exited,
+            exit_code: Some(0),
+            pid: None,
+        })
+    }
+}
+
+struct ErrorAgent;
+#[async_trait]
+impl AgentExecutor for ErrorAgent {
+    async fn execute(&self, _spec: AgentSpec<'_>) -> anyhow::Result<AgentOutcome> {
+        anyhow::bail!("executor setup failed")
+    }
+}
+
+struct BlockingAgent {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+#[async_trait]
+impl AgentExecutor for BlockingAgent {
+    async fn execute(&self, _spec: AgentSpec<'_>) -> anyhow::Result<AgentOutcome> {
+        self.started.notify_waiters();
+        self.release.notified().await;
+        Ok(AgentOutcome {
+            exit_kind: ExitKind::Exited,
+            exit_code: Some(0),
+            pid: None,
+        })
+    }
+}
+
 /// Create a project whose gates auto-release with no time travel:
 /// completion_policy='auto', plan_gate_timeout_min=0.
 async fn drive_project(pool: &SqlitePool) -> anyhow::Result<i64> {
@@ -520,6 +585,76 @@ async fn drive_project(pool: &SqlitePool) -> anyhow::Result<i64> {
     Ok(id)
 }
 
+async fn set_project_runtime_policy(
+    pool: &SqlitePool,
+    project_id: i64,
+    max_concurrency: i64,
+    schedule_interval_min: Option<i64>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE projects
+         SET max_concurrency = ?, schedule_interval_min = ?
+         WHERE id = ?",
+    )
+    .bind(max_concurrency)
+    .bind(schedule_interval_min)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn scheduler_with(
+    db: Db,
+    clock: Arc<dyn Clock>,
+    executor: Arc<dyn AgentExecutor>,
+    tick_interval: Duration,
+) -> Scheduler {
+    Scheduler::new(
+        db,
+        clock,
+        executor,
+        Arc::new(FakeWorktrees(PathBuf::from("/tmp/auwsx-test-worktree"))),
+        events::channel(),
+        PathBuf::from("/tmp/unused.sock"),
+        tick_interval,
+    )
+}
+
+async fn wait_for_scheduler_runs(
+    pool: &SqlitePool,
+    project_id: i64,
+    min: usize,
+) -> anyhow::Result<Vec<auwsx_core::db::scheduler_runs::SchedulerRun>> {
+    for _ in 0..100 {
+        let runs = scheduler_runs::recent_by_project(pool, project_id, 100).await?;
+        if runs.len() >= min {
+            return Ok(runs);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    scheduler_runs::recent_by_project(pool, project_id, 100)
+        .await
+        .map_err(Into::into)
+}
+
+async fn wait_for_agent_runs(
+    pool: &SqlitePool,
+    project_id: i64,
+    min: usize,
+) -> anyhow::Result<Vec<auwsx_core::db::agent_runs::AgentRun>> {
+    for _ in 0..100 {
+        let runs = agent_runs::recent_by_project(pool, project_id, 100).await?;
+        if runs.len() >= min {
+            return Ok(runs);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    agent_runs::recent_by_project(pool, project_id, 100)
+        .await
+        .map_err(Into::into)
+}
+
 #[tokio::test]
 async fn given_fake_agent_when_scheduler_ticks_then_issue_reaches_done_and_worktree_torn_down(
 ) -> anyhow::Result<()> {
@@ -528,6 +663,7 @@ async fn given_fake_agent_when_scheduler_ticks_then_issue_reaches_done_and_workt
     let issue_id = issues::create(db.pool(), project_id, "drive me", None, TS).await?;
 
     // Per-test data dir for pipeline run-logs/prompts. Held for the whole test.
+    let _env_guard = ENV_LOCK.lock().await;
     let data_tmp = tempfile::tempdir()?;
     std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
     let wt_tmp = tempfile::tempdir()?;
@@ -551,17 +687,26 @@ async fn given_fake_agent_when_scheduler_ticks_then_issue_reaches_done_and_workt
     for _ in 0..30 {
         sched.tick_project(project_id).await?;
         sched.join_inflight().await;
-        status = issues::get(db.pool(), issue_id).await?.expect("issue exists").status;
+        status = issues::get(db.pool(), issue_id)
+            .await?
+            .expect("issue exists")
+            .status;
         if status == IssueStatus::Done {
             break;
         }
     }
-    assert_eq!(status, IssueStatus::Done, "scheduler must drive the issue to DONE");
+    assert_eq!(
+        status,
+        IssueStatus::Done,
+        "scheduler must drive the issue to DONE"
+    );
 
     // One more pass: DONE + worktree present => Teardown clears the worktree.
     sched.tick_project(project_id).await?;
     sched.join_inflight().await;
-    let final_issue = issues::get(db.pool(), issue_id).await?.expect("issue exists");
+    let final_issue = issues::get(db.pool(), issue_id)
+        .await?
+        .expect("issue exists");
     assert_eq!(
         final_issue.worktree_path, None,
         "Teardown must clear the worktree after DONE"
@@ -573,10 +718,541 @@ async fn given_fake_agent_when_scheduler_ticks_then_issue_reaches_done_and_workt
     assert!(!runs.is_empty(), "pipeline must record agent runs");
     for r in &runs {
         // join_inflight awaited every spawned task, so all runs are finished.
-        assert_eq!(r.exit_kind, Some(ExitKind::Exited), "run {} not finished cleanly", r.id);
-        assert!(r.status_after.is_some(), "run {} missing status_after", r.id);
+        assert_eq!(
+            r.exit_kind,
+            Some(ExitKind::Exited),
+            "run {} not finished cleanly",
+            r.id
+        );
+        assert!(
+            r.status_after.is_some(),
+            "run {} missing status_after",
+            r.id
+        );
     }
 
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_approved_backlog_when_tick_project_then_backlog_is_consumed_into_issue(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, None).await?;
+    let backlog_id = backlog::add(
+        db.pool(),
+        project_id,
+        "approved item",
+        Source::Human,
+        None,
+        TS,
+    )
+    .await?;
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    sched.tick_project(project_id).await?;
+
+    let item = backlog::get(db.pool(), backlog_id)
+        .await?
+        .expect("backlog item exists");
+    let issue_count = issues::list_by_project(db.pool(), project_id).await?.len();
+    let run_count = scheduler_runs::recent_by_project(db.pool(), project_id, 10)
+        .await?
+        .len();
+    assert_eq!(
+        (item.consumed_issue_id.is_some(), issue_count, run_count),
+        (true, 1, 1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_pending_backlog_when_tick_project_then_backlog_is_not_consumed() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, None).await?;
+    let backlog_id = backlog::add(
+        db.pool(),
+        project_id,
+        "pending item",
+        Source::Agent,
+        None,
+        TS,
+    )
+    .await?;
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    sched.tick_project(project_id).await?;
+
+    let item = backlog::get(db.pool(), backlog_id)
+        .await?
+        .expect("backlog item exists");
+    let issue_count = issues::list_by_project(db.pool(), project_id).await?.len();
+    assert_eq!((item.consumed_issue_id, issue_count), (None, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_pending_backlog_when_run_backlog_now_then_promotes_and_spawns_first_phase(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    let data_tmp = tempfile::tempdir()?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 1, None).await?;
+    let backlog_id = backlog::add(
+        db.pool(),
+        project_id,
+        "manual backlog",
+        Source::Agent,
+        None,
+        TS,
+    )
+    .await?;
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let issue_id = sched.run_backlog_now(backlog_id, TS).await?;
+    sched.join_inflight().await;
+
+    let item = backlog::get(db.pool(), backlog_id)
+        .await?
+        .expect("backlog exists");
+    let runs = agent_runs::list_by_issue(db.pool(), issue_id).await?;
+    assert_eq!(item.consumed_issue_id, Some(issue_id));
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].role, Role::Main);
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_routine_when_run_routine_now_then_main_job_and_agent_run_are_recorded(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    let data_tmp = tempfile::tempdir()?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    let routine_id = routines::create(
+        db.pool(),
+        NewRoutine {
+            project_id,
+            name: "daily report",
+            routine_type: RoutineType::Report,
+            prompt: "write a report",
+            cron: "0 0 * * * *",
+            writable_paths: None,
+            enabled: true,
+        },
+        TS,
+    )
+    .await?;
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let main_job_id = sched.run_routine_now(routine_id).await?;
+    sched.join_inflight().await;
+
+    let job = main_jobs::get(db.pool(), main_job_id)
+        .await?
+        .expect("main job exists");
+    let runs = agent_runs::recent_by_project(db.pool(), project_id, 10).await?;
+    let routine = routines::get(db.pool(), routine_id)
+        .await?
+        .expect("routine exists");
+    let expected_log = artifacts::main_job_log_path(project_id, main_job_id, TS)?
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(job.status, MainJobStatus::Done);
+    assert_eq!(job.routine_id, Some(routine_id));
+    assert_eq!(job.log_path.as_deref(), Some(expected_log.as_str()));
+    assert_eq!(routine.last_run_at, Some(TS));
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].main_job_id, Some(main_job_id));
+    assert_eq!(runs[0].role, Role::Main);
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_more_actionable_issues_than_capacity_when_tick_project_then_spawns_up_to_max_concurrency(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    let data_tmp = tempfile::tempdir()?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 2, None).await?;
+    issues::create(db.pool(), project_id, "one", None, TS).await?;
+    issues::create(db.pool(), project_id, "two", None, TS).await?;
+    issues::create(db.pool(), project_id, "three", None, TS).await?;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(BlockingAgent {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+        Duration::from_secs(60),
+    );
+
+    let started_wait = started.notified();
+    sched.tick_project(project_id).await?;
+    started_wait.await;
+    let runs = wait_for_agent_runs(db.pool(), project_id, 2).await?;
+
+    assert_eq!(runs.len(), 2);
+    release.notify_waiters();
+    sched.join_inflight().await;
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_issue_running_in_other_project_when_tick_project_then_capacity_is_project_local(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    let data_tmp = tempfile::tempdir()?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+
+    let db = Db::open_memory().await?;
+    let first_project_id = drive_project(db.pool()).await?;
+    let second_project_id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "second",
+            repo_path: "/repo2",
+            default_branch: "main",
+            main_agent_cmd: "main {prompt}",
+            plan_agent_cmd: "plan {prompt}",
+            work_agent_cmd: "work {prompt}",
+            review_agent_cmd: None,
+            completion_policy: Some(CompletionPolicy::Auto),
+            plan_gate_timeout_min: Some(0),
+            completion_soft_timeout_min: None,
+        },
+        TS,
+    )
+    .await?;
+    set_project_runtime_policy(db.pool(), first_project_id, 1, None).await?;
+    set_project_runtime_policy(db.pool(), second_project_id, 1, None).await?;
+    issues::create(db.pool(), first_project_id, "one", None, TS).await?;
+    issues::create(db.pool(), second_project_id, "two", None, TS).await?;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(BlockingAgent {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+        Duration::from_secs(60),
+    );
+
+    let started_wait = started.notified();
+    sched.tick_project(first_project_id).await?;
+    started_wait.await;
+    sched.tick_project(second_project_id).await?;
+    let runs = wait_for_agent_runs(db.pool(), second_project_id, 1).await?;
+
+    assert_eq!(runs.len(), 1);
+    release.notify_waiters();
+    sched.join_inflight().await;
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_project_without_interval_when_run_ticks_then_project_is_manual_only(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, None).await?;
+    let shutdown = Arc::new(Notify::new());
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_millis(10),
+    );
+    let worker = sched.clone();
+    let signal = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        worker.run(signal).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    handle.abort();
+    let _ = handle.await;
+
+    let runs = scheduler_runs::recent_by_project(db.pool(), project_id, 10).await?;
+    assert_eq!(runs.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_project_zero_interval_when_run_ticks_then_scheduler_records_repeated_passes(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some(0)).await?;
+    let shutdown = Arc::new(Notify::new());
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_millis(10),
+    );
+    let worker = sched.clone();
+    let signal = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        worker.run(signal).await;
+    });
+
+    let runs = wait_for_scheduler_runs(db.pool(), project_id, 2).await?;
+    handle.abort();
+    let _ = handle.await;
+
+    assert!(runs.len() >= 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_project_interval_not_elapsed_when_run_ticks_then_project_is_not_scheduled(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some(60)).await?;
+    scheduler_runs::record(
+        db.pool(),
+        project_id,
+        TS,
+        scheduler_runs::SchedulerRunSource::Auto,
+        Some("{}"),
+    )
+    .await?;
+    let backlog_id = backlog::add(
+        db.pool(),
+        project_id,
+        "approved item",
+        Source::Human,
+        None,
+        TS,
+    )
+    .await?;
+    let shutdown = Arc::new(Notify::new());
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_millis(10),
+    );
+    let worker = sched.clone();
+    let signal = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        worker.run(signal).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    handle.abort();
+    let _ = handle.await;
+
+    let item = backlog::get(db.pool(), backlog_id)
+        .await?
+        .expect("backlog item exists");
+    let run_count = scheduler_runs::recent_by_project(db.pool(), project_id, 10)
+        .await?
+        .len();
+    assert_eq!((item.consumed_issue_id, run_count), (None, 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_project_interval_elapsed_when_run_ticks_then_project_is_scheduled(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some(1)).await?;
+    scheduler_runs::record(
+        db.pool(),
+        project_id,
+        TS - 60_000,
+        scheduler_runs::SchedulerRunSource::Auto,
+        Some("{}"),
+    )
+    .await?;
+    let backlog_id = backlog::add(
+        db.pool(),
+        project_id,
+        "approved item",
+        Source::Human,
+        None,
+        TS,
+    )
+    .await?;
+    let shutdown = Arc::new(Notify::new());
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_millis(10),
+    );
+    let worker = sched.clone();
+    let signal = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        worker.run(signal).await;
+    });
+
+    let _ = wait_for_scheduler_runs(db.pool(), project_id, 2).await?;
+    handle.abort();
+    let _ = handle.await;
+
+    let item = backlog::get(db.pool(), backlog_id)
+        .await?
+        .expect("backlog item exists");
+    assert!(item.consumed_issue_id.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_project_interval_configured_when_manual_tick_project_then_interval_is_bypassed(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some(60)).await?;
+    scheduler_runs::record(
+        db.pool(),
+        project_id,
+        TS,
+        scheduler_runs::SchedulerRunSource::Auto,
+        Some("{}"),
+    )
+    .await?;
+    let backlog_id = backlog::add(
+        db.pool(),
+        project_id,
+        "approved item",
+        Source::Human,
+        None,
+        TS,
+    )
+    .await?;
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    sched.tick_project(project_id).await?;
+
+    let item = backlog::get(db.pool(), backlog_id)
+        .await?
+        .expect("backlog item exists");
+    let run_count = scheduler_runs::recent_by_project(db.pool(), project_id, 10)
+        .await?
+        .len();
+    assert_eq!((item.consumed_issue_id.is_some(), run_count), (true, 2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_executor_error_when_tick_project_then_run_is_finished_and_issue_failed(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    let data_tmp = tempfile::tempdir()?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "fails", None, TS).await?;
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ErrorAgent),
+        Duration::from_secs(60),
+    );
+
+    sched.tick_project(project_id).await?;
+    sched.join_inflight().await;
+
+    let issue = issues::get(db.pool(), issue_id)
+        .await?
+        .expect("issue exists");
+    let runs = agent_runs::list_by_issue(db.pool(), issue_id).await?;
+    assert_eq!(
+        (
+            issue.status,
+            runs.len(),
+            runs.first().and_then(|run| run.exit_kind)
+        ),
+        (IssueStatus::Failed, 1, Some(ExitKind::Error))
+    );
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_issue_already_running_when_run_issue_now_then_call_fails() -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    let data_tmp = tempfile::tempdir()?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "run now", None, TS).await?;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(BlockingAgent {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+        Duration::from_secs(60),
+    );
+    let started_wait = started.notified();
+    sched.run_issue_now(issue_id).await?;
+    started_wait.await;
+
+    let err = sched
+        .run_issue_now(issue_id)
+        .await
+        .expect_err("second run must fail");
+
+    assert!(err.to_string().contains("already running"));
+    release.notify_waiters();
+    sched.join_inflight().await;
     std::env::remove_var("AUWSX_DATA_DIR");
     Ok(())
 }
