@@ -112,12 +112,11 @@ pub async fn list_by_status(
     project_id: i64,
     status: IssueStatus,
 ) -> Result<Vec<Issue>> {
-    let rows =
-        sqlx::query("SELECT * FROM issues WHERE project_id = ? AND status = ? ORDER BY id")
-            .bind(project_id)
-            .bind(status.as_str())
-            .fetch_all(pool)
-            .await?;
+    let rows = sqlx::query("SELECT * FROM issues WHERE project_id = ? AND status = ? ORDER BY id")
+        .bind(project_id)
+        .bind(status.as_str())
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(Issue::from_row).collect()
 }
 
@@ -163,8 +162,27 @@ async fn write_status(pool: &SqlitePool, id: i64, to: IssueStatus, now: i64) -> 
 /// Self-close by delegating into another issue: `CONSOLIDATING -> ABSORBED`
 /// plus recording the target. Legality of the status edge is enforced.
 pub async fn mark_absorbed(pool: &SqlitePool, id: i64, into_id: i64, now: i64) -> Result<()> {
-    let from = current_status(pool, id).await?;
-    state::check_transition(from, IssueStatus::Absorbed)?;
+    if id == into_id {
+        return Err(anyhow!("issue {id} cannot absorb into itself"));
+    }
+    let source = get(pool, id)
+        .await?
+        .ok_or_else(|| anyhow!("issue {id} not found"))?;
+    let target = get(pool, into_id)
+        .await?
+        .ok_or_else(|| anyhow!("issue {into_id} not found"))?;
+    state::check_transition(source.status, IssueStatus::Absorbed)?;
+    if source.project_id != target.project_id {
+        return Err(anyhow!(
+            "issue {id} cannot absorb into issue {into_id} from another project"
+        ));
+    }
+    if !target.status.accepts_steering() {
+        return Err(anyhow!(
+            "issue {id} cannot absorb into issue {into_id} in status {}",
+            target.status.as_str()
+        ));
+    }
     let n = sqlx::query(
         "UPDATE issues SET status = ?, absorbed_into_id = ?, updated_at = ? WHERE id = ?",
     )

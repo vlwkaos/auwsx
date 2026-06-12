@@ -38,13 +38,7 @@ impl Subtask {
 }
 
 /// Append one subtask (`done = 0`). Returns the new id.
-pub async fn add(
-    pool: &SqlitePool,
-    issue_id: i64,
-    ord: i64,
-    text: &str,
-    now: i64,
-) -> Result<i64> {
+pub async fn add(pool: &SqlitePool, issue_id: i64, ord: i64, text: &str, now: i64) -> Result<i64> {
     let id: i64 = sqlx::query(
         "INSERT INTO subtasks (issue_id, ord, text, created_at)
          VALUES (?, ?, ?, ?)

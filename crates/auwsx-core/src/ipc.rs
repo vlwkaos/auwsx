@@ -13,15 +13,23 @@
 //! out) and is unit-tested directly without a socket; [`serve`] / [`request`]
 //! are the thin transport around it.
 
+use crate::artifacts;
 use crate::backlog::{self, Approval, BacklogItem, Source};
 use crate::db::{
+    agent_runs::{self, AgentRun},
     findings::{self, Finding, NewFinding, Severity},
     issues::{self, Issue},
-    projects::{self, CompletionPolicy, NewProject, Project},
+    projects::{
+        self, CompletionPolicy, MergeMode, NewProject, Project, UpdateProject as ProjectUpdate,
+    },
+    scheduler_runs::{self, SchedulerRun},
     subtasks::{self, Subtask},
     Db,
 };
 use crate::events::Event;
+use crate::main_jobs::{self, MainJob};
+use crate::routines::{self, Routine, RoutineType};
+use crate::scheduler::Scheduler;
 use crate::state::IssueStatus;
 use crate::steering::{self, Steering, SteeringSource};
 use crate::Result;
@@ -58,6 +66,28 @@ pub enum Command {
         plan_gate_timeout_min: Option<i64>,
         completion_soft_timeout_min: Option<i64>,
     },
+    UpdateProject {
+        project_id: i64,
+        name: String,
+        repo_path: String,
+        default_branch: String,
+        main_agent_cmd: String,
+        plan_agent_cmd: String,
+        work_agent_cmd: String,
+        review_agent_cmd: Option<String>,
+        completion_policy: CompletionPolicy,
+        plan_gate_timeout_min: i64,
+        completion_soft_timeout_min: i64,
+        iteration_timeout_min: i64,
+        main_job_timeout_min: i64,
+        review_max_rounds: i64,
+        conflict_max_attempts: i64,
+        max_concurrency: i64,
+        schedule_interval_min: Option<i64>,
+        merge_mode: MergeMode,
+        skill_path: Option<String>,
+        deepsleep_interval_days: i64,
+    },
 
     // --- backlog ---
     ListBacklog {
@@ -79,6 +109,10 @@ pub enum Command {
     Triage {
         project_id: i64,
     },
+    UpdateBacklogText {
+        item_id: i64,
+        text: String,
+    },
 
     // --- issues ---
     ListIssues {
@@ -98,6 +132,75 @@ pub enum Command {
         status: IssueStatus,
         /// Human override: skip the legal-transition check.
         force: bool,
+    },
+    AbsorbIssue {
+        issue_id: i64,
+        into_issue_id: i64,
+    },
+    RunSchedulerOnce {
+        project_id: i64,
+    },
+    RunIssueNow {
+        issue_id: i64,
+    },
+    RunBacklogNow {
+        item_id: i64,
+    },
+    RunRoutineNow {
+        routine_id: i64,
+    },
+
+    // --- routines / activity ---
+    ListRoutines {
+        project_id: i64,
+    },
+    GetRoutine {
+        routine_id: i64,
+    },
+    ToggleRoutine {
+        routine_id: i64,
+        enabled: bool,
+    },
+    CreateRoutine {
+        project_id: i64,
+        name: String,
+        routine_type: RoutineType,
+        prompt: String,
+        cron: String,
+        writable_paths: Option<String>,
+        enabled: bool,
+    },
+    UpdateRoutine {
+        routine_id: i64,
+        name: String,
+        routine_type: RoutineType,
+        prompt: String,
+        cron: String,
+        writable_paths: Option<String>,
+        enabled: bool,
+    },
+    RecentAgentRunsByProject {
+        project_id: i64,
+        limit: i64,
+    },
+    ListAgentRunsByIssue {
+        issue_id: i64,
+    },
+    RecentMainJobsByProject {
+        project_id: i64,
+        limit: i64,
+    },
+    RecentMainJobsByRoutine {
+        routine_id: i64,
+        limit: i64,
+    },
+    RecentSchedulerRunsByProject {
+        project_id: i64,
+        limit: i64,
+    },
+    TailAgentRunLog {
+        agent_run_id: i64,
+        max_bytes: usize,
     },
 
     // --- subtasks ---
@@ -183,7 +286,14 @@ pub enum Response {
     Subtasks(Vec<Subtask>),
     Findings(Vec<Finding>),
     Steering(Vec<Steering>),
+    Routines(Vec<Routine>),
+    Routine(Option<Routine>),
+    AgentRuns(Vec<AgentRun>),
+    MainJobs(Vec<MainJob>),
+    SchedulerRuns(Vec<SchedulerRun>),
+    LogTail { path: String, text: String },
     Triaged { created_issue_ids: Vec<i64> },
+    RanIssue { issue_id: i64 },
     Event(Event),
 }
 
@@ -285,6 +395,56 @@ async fn dispatch_inner(
             .await?;
             Response::Id(id)
         }
+        Command::UpdateProject {
+            project_id,
+            name,
+            repo_path,
+            default_branch,
+            main_agent_cmd,
+            plan_agent_cmd,
+            work_agent_cmd,
+            review_agent_cmd,
+            completion_policy,
+            plan_gate_timeout_min,
+            completion_soft_timeout_min,
+            iteration_timeout_min,
+            main_job_timeout_min,
+            review_max_rounds,
+            conflict_max_attempts,
+            max_concurrency,
+            schedule_interval_min,
+            merge_mode,
+            skill_path,
+            deepsleep_interval_days,
+        } => {
+            projects::update(
+                pool,
+                project_id,
+                ProjectUpdate {
+                    name: &name,
+                    repo_path: &repo_path,
+                    default_branch: &default_branch,
+                    main_agent_cmd: &main_agent_cmd,
+                    plan_agent_cmd: &plan_agent_cmd,
+                    work_agent_cmd: &work_agent_cmd,
+                    review_agent_cmd: review_agent_cmd.as_deref(),
+                    completion_policy,
+                    plan_gate_timeout_min,
+                    completion_soft_timeout_min,
+                    iteration_timeout_min,
+                    main_job_timeout_min,
+                    review_max_rounds,
+                    conflict_max_attempts,
+                    max_concurrency,
+                    schedule_interval_min,
+                    merge_mode,
+                    skill_path: skill_path.as_deref(),
+                    deepsleep_interval_days,
+                },
+            )
+            .await?;
+            Response::Ok
+        }
 
         // --- backlog ---
         Command::ListBacklog {
@@ -329,6 +489,17 @@ async fn dispatch_inner(
                 created_issue_ids: created,
             }
         }
+        Command::UpdateBacklogText { item_id, text } => {
+            let item = backlog::get(pool, item_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("backlog item {item_id} not found"))?;
+            if item.consumed_issue_id.is_some() {
+                anyhow::bail!("backlog item {item_id} is already consumed");
+            }
+            backlog::edit_text(pool, item_id, &text).await?;
+            emit_backlog_changed(events, pool, item_id, item.approval.as_str()).await;
+            Response::Ok
+        }
 
         // --- issues ---
         Command::ListIssues { project_id, status } => {
@@ -352,6 +523,9 @@ async fn dispatch_inner(
             status,
             force,
         } => {
+            if status == IssueStatus::Absorbed && !force {
+                anyhow::bail!("use `issue absorb <issue_id> <into_issue_id>` to record the target");
+            }
             if force {
                 issues::force_status(pool, issue_id, status, now).await?;
             } else {
@@ -359,6 +533,119 @@ async fn dispatch_inner(
             }
             emit(events, Event::IssueStatus { issue_id, status });
             Response::Ok
+        }
+        Command::AbsorbIssue {
+            issue_id,
+            into_issue_id,
+        } => {
+            issues::mark_absorbed(pool, issue_id, into_issue_id, now).await?;
+            emit(
+                events,
+                Event::IssueStatus {
+                    issue_id,
+                    status: IssueStatus::Absorbed,
+                },
+            );
+            Response::Ok
+        }
+        Command::RunSchedulerOnce { .. }
+        | Command::RunIssueNow { .. }
+        | Command::RunBacklogNow { .. }
+        | Command::RunRoutineNow { .. } => {
+            anyhow::bail!("manual run commands require the daemon runtime")
+        }
+
+        // --- routines / activity ---
+        Command::ListRoutines { project_id } => {
+            Response::Routines(routines::list_by_project(pool, project_id).await?)
+        }
+        Command::GetRoutine { routine_id } => {
+            Response::Routine(routines::get(pool, routine_id).await?)
+        }
+        Command::ToggleRoutine {
+            routine_id,
+            enabled,
+        } => {
+            routines::set_enabled(pool, routine_id, enabled).await?;
+            Response::Ok
+        }
+        Command::CreateRoutine {
+            project_id,
+            name,
+            routine_type,
+            prompt,
+            cron,
+            writable_paths,
+            enabled,
+        } => Response::Id(
+            routines::create(
+                pool,
+                routines::NewRoutine {
+                    project_id,
+                    name: &name,
+                    routine_type,
+                    prompt: &prompt,
+                    cron: &cron,
+                    writable_paths: writable_paths.as_deref(),
+                    enabled,
+                },
+                now,
+            )
+            .await?,
+        ),
+        Command::UpdateRoutine {
+            routine_id,
+            name,
+            routine_type,
+            prompt,
+            cron,
+            writable_paths,
+            enabled,
+        } => {
+            routines::update(
+                pool,
+                routine_id,
+                routines::UpdateRoutine {
+                    name: &name,
+                    routine_type,
+                    prompt: &prompt,
+                    cron: &cron,
+                    writable_paths: writable_paths.as_deref(),
+                    enabled,
+                },
+            )
+            .await?;
+            Response::Ok
+        }
+        Command::RecentAgentRunsByProject { project_id, limit } => {
+            Response::AgentRuns(agent_runs::recent_by_project(pool, project_id, limit).await?)
+        }
+        Command::ListAgentRunsByIssue { issue_id } => {
+            Response::AgentRuns(agent_runs::list_by_issue(pool, issue_id).await?)
+        }
+        Command::RecentMainJobsByProject { project_id, limit } => {
+            Response::MainJobs(main_jobs::recent_by_project(pool, project_id, limit).await?)
+        }
+        Command::RecentMainJobsByRoutine { routine_id, limit } => {
+            Response::MainJobs(main_jobs::recent_by_routine(pool, routine_id, limit).await?)
+        }
+        Command::RecentSchedulerRunsByProject { project_id, limit } => Response::SchedulerRuns(
+            scheduler_runs::recent_by_project(pool, project_id, limit).await?,
+        ),
+        Command::TailAgentRunLog {
+            agent_run_id,
+            max_bytes,
+        } => {
+            let run = agent_runs::get(pool, agent_run_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("agent_run {agent_run_id} not found"))?;
+            let path = run
+                .log_path
+                .ok_or_else(|| anyhow::anyhow!("agent_run {agent_run_id} has no log_path"))?;
+            Response::LogTail {
+                text: artifacts::tail_file(PathBuf::from(&path), max_bytes).await?,
+                path,
+            }
         }
 
         // --- subtasks ---
@@ -410,7 +697,13 @@ async fn dispatch_inner(
                 now,
             )
             .await?;
-            emit(events, Event::FindingAdded { finding_id: id, issue_id });
+            emit(
+                events,
+                Event::FindingAdded {
+                    finding_id: id,
+                    issue_id,
+                },
+            );
             Response::Id(id)
         }
         Command::AcceptFinding {
@@ -448,7 +741,13 @@ async fn dispatch_inner(
             note,
         } => {
             let id = steering::add(pool, issue_id, source, &note, now).await?;
-            emit(events, Event::SteeringAdded { steering_id: id, issue_id });
+            emit(
+                events,
+                Event::SteeringAdded {
+                    steering_id: id,
+                    issue_id,
+                },
+            );
             Response::Id(id)
         }
         Command::ConsumeSteering { issue_id } => {
@@ -496,17 +795,43 @@ pub async fn serve(
     socket: &Path,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
-    if let Some(parent) = socket.parent() {
+    serve_inner(db, events, socket, shutdown, None).await
+}
+
+pub async fn serve_with_scheduler(
+    db: Db,
+    events: broadcast::Sender<Event>,
+    socket: &Path,
+    shutdown: Arc<Notify>,
+    scheduler: Arc<Scheduler>,
+) -> Result<()> {
+    serve_inner(db, events, socket, shutdown, Some(scheduler)).await
+}
+
+async fn serve_inner(
+    db: Db,
+    events: broadcast::Sender<Event>,
+    socket: &Path,
+    shutdown: Arc<Notify>,
+    scheduler: Option<Arc<Scheduler>>,
+) -> Result<()> {
+    let bind_socket = if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating socket dir {}", parent.display()))?;
-    }
+        match std::fs::canonicalize(parent) {
+            Ok(parent) => parent.join(socket.file_name().unwrap_or_default()),
+            Err(_) => socket.to_path_buf(),
+        }
+    } else {
+        socket.to_path_buf()
+    };
     // A leftover socket from a crashed daemon would make bind() fail with
     // EADDRINUSE even though nobody is listening; clear it first.
-    if socket.exists() {
-        std::fs::remove_file(socket).ok();
+    if bind_socket.exists() {
+        std::fs::remove_file(&bind_socket).ok();
     }
-    let listener = UnixListener::bind(socket)
-        .with_context(|| format!("binding unix socket {}", socket.display()))?;
+    let listener = UnixListener::bind(&bind_socket)
+        .with_context(|| format!("binding unix socket {}", bind_socket.display()))?;
 
     loop {
         tokio::select! {
@@ -516,8 +841,9 @@ pub async fn serve(
                 let db = db.clone();
                 let events = events.clone();
                 let shutdown = shutdown.clone();
+                let scheduler = scheduler.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, db, events, shutdown).await {
+                    if let Err(e) = handle_conn(stream, db, events, shutdown, scheduler).await {
                         tracing::debug!("ipc connection ended: {e:#}");
                     }
                 });
@@ -525,7 +851,7 @@ pub async fn serve(
         }
     }
 
-    std::fs::remove_file(socket).ok();
+    std::fs::remove_file(&bind_socket).ok();
     Ok(())
 }
 
@@ -534,6 +860,7 @@ async fn handle_conn(
     db: Db,
     events: broadcast::Sender<Event>,
     shutdown: Arc<Notify>,
+    scheduler: Option<Arc<Scheduler>>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -561,6 +888,13 @@ async fn handle_conn(
                 shutdown.notify_one();
                 return Ok(());
             }
+            manual @ (Command::RunSchedulerOnce { .. }
+            | Command::RunIssueNow { .. }
+            | Command::RunBacklogNow { .. }
+            | Command::RunRoutineNow { .. }) => {
+                let resp = dispatch_manual(&db, scheduler.as_deref(), now_ms(), manual).await;
+                write_line(&mut write_half, &resp).await?;
+            }
             other => {
                 let resp = dispatch(&db, &events, now_ms(), other).await;
                 write_line(&mut write_half, &resp).await?;
@@ -568,6 +902,45 @@ async fn handle_conn(
         }
     }
     Ok(())
+}
+
+async fn dispatch_manual(
+    db: &Db,
+    scheduler: Option<&Scheduler>,
+    now: i64,
+    cmd: Command,
+) -> Response {
+    let Some(scheduler) = scheduler else {
+        return Response::Err {
+            message: "manual run commands require the daemon runtime".to_string(),
+        };
+    };
+    match manual_inner(db, scheduler, now, cmd).await {
+        Ok(resp) => resp,
+        Err(e) => Response::err(e),
+    }
+}
+
+async fn manual_inner(_db: &Db, scheduler: &Scheduler, now: i64, cmd: Command) -> Result<Response> {
+    Ok(match cmd {
+        Command::RunSchedulerOnce { project_id } => {
+            scheduler.tick_project(project_id).await?;
+            Response::Ok
+        }
+        Command::RunIssueNow { issue_id } => {
+            scheduler.run_issue_now(issue_id).await?;
+            Response::RanIssue { issue_id }
+        }
+        Command::RunBacklogNow { item_id } => {
+            let issue_id = scheduler.run_backlog_now(item_id, now).await?;
+            Response::RanIssue { issue_id }
+        }
+        Command::RunRoutineNow { routine_id } => {
+            let _main_job_id = scheduler.run_routine_now(routine_id).await?;
+            Response::Ok
+        }
+        _ => anyhow::bail!("not a manual command"),
+    })
 }
 
 /// Forward broadcast events to a subscribed client until it disconnects or the

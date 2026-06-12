@@ -101,6 +101,12 @@ pub struct BacklogItem {
     pub resolved_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TriagedBacklog {
+    pub item_id: i64,
+    pub issue_id: i64,
+}
+
 impl BacklogItem {
     fn from_row(row: &SqliteRow) -> Result<Self> {
         let source_raw: String = row.try_get("source")?;
@@ -161,11 +167,10 @@ pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<BacklogItem>> {
 
 /// All items for a project, newest first.
 pub async fn list_by_project(pool: &SqlitePool, project_id: i64) -> Result<Vec<BacklogItem>> {
-    let rows =
-        sqlx::query("SELECT * FROM backlog_items WHERE project_id = ? ORDER BY id DESC")
-            .bind(project_id)
-            .fetch_all(pool)
-            .await?;
+    let rows = sqlx::query("SELECT * FROM backlog_items WHERE project_id = ? ORDER BY id DESC")
+        .bind(project_id)
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(BacklogItem::from_row).collect()
 }
 
@@ -185,6 +190,35 @@ pub async fn list_by_approval(
     rows.iter().map(BacklogItem::from_row).collect()
 }
 
+pub async fn count_by_approval(
+    pool: &SqlitePool,
+    project_id: i64,
+    approval: Approval,
+) -> Result<i64> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM backlog_items WHERE project_id = ? AND approval = ?")
+        .bind(project_id)
+        .bind(approval.as_str())
+        .fetch_one(pool)
+        .await
+        .map_err(Into::into)
+}
+
+pub async fn count_unconsumed_by_approval(
+    pool: &SqlitePool,
+    project_id: i64,
+    approval: Approval,
+) -> Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM backlog_items
+         WHERE project_id = ? AND approval = ? AND consumed_issue_id IS NULL",
+    )
+    .bind(project_id)
+    .bind(approval.as_str())
+    .fetch_one(pool)
+    .await
+    .map_err(Into::into)
+}
+
 /// Human approves a pending item (admits it to triage). Stamps `resolved_at`.
 pub async fn approve(pool: &SqlitePool, id: i64, now: i64) -> Result<()> {
     set_approval(pool, id, Approval::Approved, now).await
@@ -195,12 +229,7 @@ pub async fn dismiss(pool: &SqlitePool, id: i64, now: i64) -> Result<()> {
     set_approval(pool, id, Approval::Dismissed, now).await
 }
 
-async fn set_approval(
-    pool: &SqlitePool,
-    id: i64,
-    approval: Approval,
-    now: i64,
-) -> Result<()> {
+async fn set_approval(pool: &SqlitePool, id: i64, approval: Approval, now: i64) -> Result<()> {
     let n = sqlx::query("UPDATE backlog_items SET approval = ?, resolved_at = ? WHERE id = ?")
         .bind(approval.as_str())
         .bind(now)
@@ -224,15 +253,14 @@ pub async fn edit_text(pool: &SqlitePool, id: i64, text: &str) -> Result<()> {
 
 /// Link an item to the issue triage grouped it into (sets `consumed_issue_id`).
 pub async fn mark_consumed(pool: &SqlitePool, id: i64, issue_id: i64, now: i64) -> Result<()> {
-    let n = sqlx::query(
-        "UPDATE backlog_items SET consumed_issue_id = ?, resolved_at = ? WHERE id = ?",
-    )
-    .bind(issue_id)
-    .bind(now)
-    .bind(id)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let n =
+        sqlx::query("UPDATE backlog_items SET consumed_issue_id = ?, resolved_at = ? WHERE id = ?")
+            .bind(issue_id)
+            .bind(now)
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected();
     ensure_found(n, id)
 }
 
@@ -261,6 +289,18 @@ fn ensure_found(rows_affected: u64, id: i64) -> Result<()> {
 /// v1 has no grouping heuristic — one item, one issue. Consolidation across
 /// similar issues happens later, per-issue, in the CONSOLIDATING phase.
 pub async fn run_triage(pool: &SqlitePool, project_id: i64, now: i64) -> Result<Vec<i64>> {
+    Ok(run_triage_detailed(pool, project_id, now)
+        .await?
+        .into_iter()
+        .map(|t| t.issue_id)
+        .collect())
+}
+
+pub async fn run_triage_detailed(
+    pool: &SqlitePool,
+    project_id: i64,
+    now: i64,
+) -> Result<Vec<TriagedBacklog>> {
     let approved = list_by_approval(pool, project_id, Approval::Approved).await?;
     let mut created = Vec::new();
     for item in approved {
@@ -269,7 +309,31 @@ pub async fn run_triage(pool: &SqlitePool, project_id: i64, now: i64) -> Result<
         }
         let issue_id = issues::create(pool, project_id, &item.text, None, now).await?;
         mark_consumed(pool, item.id, issue_id, now).await?;
-        created.push(issue_id);
+        created.push(TriagedBacklog {
+            item_id: item.id,
+            issue_id,
+        });
     }
     Ok(created)
+}
+
+/// Promote exactly one backlog item into an issue. Pending items are approved
+/// first; dismissed items are rejected; already-consumed items return their
+/// existing issue id. This is the imperative path behind "run backlog now".
+pub async fn promote_one(pool: &SqlitePool, item_id: i64, now: i64) -> Result<i64> {
+    let item = get(pool, item_id)
+        .await?
+        .ok_or_else(|| anyhow!("backlog item {item_id} not found"))?;
+    if item.approval == Approval::Dismissed {
+        return Err(anyhow!("backlog item {item_id} is dismissed"));
+    }
+    if let Some(issue_id) = item.consumed_issue_id {
+        return Ok(issue_id);
+    }
+    if item.approval == Approval::Pending {
+        approve(pool, item_id, now).await?;
+    }
+    let issue_id = issues::create(pool, item.project_id, &item.text, None, now).await?;
+    mark_consumed(pool, item_id, issue_id, now).await?;
+    Ok(issue_id)
 }

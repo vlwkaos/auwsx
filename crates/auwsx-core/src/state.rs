@@ -425,7 +425,11 @@ mod tests {
     #[test]
     fn given_str_ids_table_when_collected_then_covers_every_variant_once() {
         let keys: HashSet<IssueStatus> = STR_IDS.iter().map(|(v, _)| *v).collect();
-        assert_eq!(keys.len(), 16, "STR_IDS must map every variant exactly once");
+        assert_eq!(
+            keys.len(),
+            16,
+            "STR_IDS must map every variant exactly once"
+        );
         for v in ALL {
             assert!(keys.contains(&v), "STR_IDS missing {v:?}");
         }
@@ -450,7 +454,11 @@ mod tests {
     #[test]
     fn given_every_variant_when_round_tripped_through_as_str_then_unchanged() {
         for v in ALL {
-            assert_eq!(IssueStatus::from_str(v.as_str()), Some(v), "round-trip {v:?}");
+            assert_eq!(
+                IssueStatus::from_str(v.as_str()),
+                Some(v),
+                "round-trip {v:?}"
+            );
         }
     }
 
@@ -581,8 +589,7 @@ mod tests {
     #[test]
     fn given_each_variant_when_three_predicates_checked_then_exactly_one_true() {
         for v in ALL {
-            let count =
-                v.is_actionable() as u8 + v.is_human_gated() as u8 + v.is_terminal() as u8;
+            let count = v.is_actionable() as u8 + v.is_human_gated() as u8 + v.is_terminal() as u8;
             assert_eq!(count, 1, "{v:?} must satisfy exactly one predicate");
         }
     }

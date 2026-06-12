@@ -120,6 +120,29 @@ pub struct NewProject<'a> {
     pub completion_soft_timeout_min: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct UpdateProject<'a> {
+    pub name: &'a str,
+    pub repo_path: &'a str,
+    pub default_branch: &'a str,
+    pub main_agent_cmd: &'a str,
+    pub plan_agent_cmd: &'a str,
+    pub work_agent_cmd: &'a str,
+    pub review_agent_cmd: Option<&'a str>,
+    pub completion_policy: CompletionPolicy,
+    pub plan_gate_timeout_min: i64,
+    pub completion_soft_timeout_min: i64,
+    pub iteration_timeout_min: i64,
+    pub main_job_timeout_min: i64,
+    pub review_max_rounds: i64,
+    pub conflict_max_attempts: i64,
+    pub max_concurrency: i64,
+    pub schedule_interval_min: Option<i64>,
+    pub merge_mode: MergeMode,
+    pub skill_path: Option<&'a str>,
+    pub deepsleep_interval_days: i64,
+}
+
 impl Project {
     /// The agent command template for a phase role. `Review` falls back to the
     /// work command when `review_agent_cmd` is unset (a fresh work-agent session
@@ -130,7 +153,10 @@ impl Project {
             Role::Main => &self.main_agent_cmd,
             Role::Plan => &self.plan_agent_cmd,
             Role::Work => &self.work_agent_cmd,
-            Role::Review => self.review_agent_cmd.as_deref().unwrap_or(&self.work_agent_cmd),
+            Role::Review => self
+                .review_agent_cmd
+                .as_deref()
+                .unwrap_or(&self.work_agent_cmd),
         }
     }
 
@@ -229,6 +255,59 @@ pub async fn get_by_name(pool: &SqlitePool, name: &str) -> Result<Option<Project
         .fetch_optional(pool)
         .await?;
     row.as_ref().map(Project::from_row).transpose()
+}
+
+pub async fn update(pool: &SqlitePool, id: i64, update: UpdateProject<'_>) -> Result<()> {
+    let n = sqlx::query(
+        "UPDATE projects SET
+            name = ?,
+            repo_path = ?,
+            default_branch = ?,
+            main_agent_cmd = ?,
+            plan_agent_cmd = ?,
+            work_agent_cmd = ?,
+            review_agent_cmd = ?,
+            completion_policy = ?,
+            plan_gate_timeout_min = ?,
+            completion_soft_timeout_min = ?,
+            iteration_timeout_min = ?,
+            main_job_timeout_min = ?,
+            review_max_rounds = ?,
+            conflict_max_attempts = ?,
+            max_concurrency = ?,
+            schedule_interval_min = ?,
+            merge_mode = ?,
+            skill_path = ?,
+            deepsleep_interval_days = ?
+         WHERE id = ?",
+    )
+    .bind(update.name)
+    .bind(update.repo_path)
+    .bind(update.default_branch)
+    .bind(update.main_agent_cmd)
+    .bind(update.plan_agent_cmd)
+    .bind(update.work_agent_cmd)
+    .bind(update.review_agent_cmd)
+    .bind(update.completion_policy.as_str())
+    .bind(update.plan_gate_timeout_min)
+    .bind(update.completion_soft_timeout_min)
+    .bind(update.iteration_timeout_min)
+    .bind(update.main_job_timeout_min)
+    .bind(update.review_max_rounds)
+    .bind(update.conflict_max_attempts)
+    .bind(update.max_concurrency)
+    .bind(update.schedule_interval_min)
+    .bind(update.merge_mode.as_str())
+    .bind(update.skill_path)
+    .bind(update.deepsleep_interval_days)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(anyhow!("project {id} not found"));
+    }
+    Ok(())
 }
 
 /// All projects, oldest first.

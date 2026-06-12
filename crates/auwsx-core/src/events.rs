@@ -25,6 +25,9 @@ pub enum Event {
         project_id: i64,
         approval: String, // "pending" | "approved" | "dismissed"
     },
+    SchedulerTick {
+        project_id: i64,
+    },
     FindingAdded {
         finding_id: i64,
         issue_id: i64,

@@ -23,7 +23,8 @@
 //!   COMPLETING     work
 //! ```
 
-use crate::agent::{AgentExecutor, AgentSpec};
+use crate::agent::{AgentExecutor, AgentSpec, ExitKind};
+use crate::artifacts;
 use crate::clock::Clock;
 use crate::db::agent_runs::{self, Role, StartRun};
 use crate::db::{findings, issues, projects, subtasks, Db};
@@ -34,7 +35,6 @@ use crate::steering;
 use crate::worktree::{branch_for_issue, Worktrees};
 use crate::Result;
 use anyhow::{anyhow, Context};
-use directories::ProjectDirs;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -83,7 +83,12 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
     };
     let project = projects::get(pool, issue.project_id)
         .await?
-        .ok_or_else(|| anyhow!("issue {issue_id} references missing project {}", issue.project_id))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "issue {issue_id} references missing project {}",
+                issue.project_id
+            )
+        })?;
 
     // Worktree: created once, at the first phase that needs one (PLANNING).
     let mut worktree_path = issue.worktree_path.clone();
@@ -109,7 +114,11 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
 
     // CONSOLIDATING runs at the repo root (no worktree yet); later phases run in
     // the worktree.
-    let cwd = PathBuf::from(worktree_path.clone().unwrap_or_else(|| project.repo_path.clone()));
+    let cwd = PathBuf::from(
+        worktree_path
+            .clone()
+            .unwrap_or_else(|| project.repo_path.clone()),
+    );
 
     // Context for the prompt.
     let subtasks = subtasks::list_by_issue(pool, issue_id).await?;
@@ -126,14 +135,24 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
     };
 
     let spawned_at = deps.clock.now_ms();
-    let (log_path, prompt_path) = run_paths(issue_id, spawned_at)?;
+    let (log_path, prompt_path) = artifacts::issue_run_paths(issue_id, spawned_at)?;
     std::fs::write(&prompt_path, &prompt_text)
         .with_context(|| format!("writing prompt to {}", prompt_path.display()))?;
 
     let cmd_template = project.agent_cmd_for(role).to_string();
     let env = vec![
-        ("AUWSX_SOCK".to_string(), deps.socket.to_string_lossy().to_string()),
+        (
+            "AUWSX_SOCK".to_string(),
+            deps.socket.to_string_lossy().to_string(),
+        ),
+        (
+            "AUWSX_BIN".to_string(),
+            std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "auwsx".to_string()),
+        ),
         ("AUWSX_ISSUE_ID".to_string(), issue_id.to_string()),
+        ("AUWSX_PROJECT_ID".to_string(), issue.project_id.to_string()),
         ("AUWSX_AGENT_ROLE".to_string(), role.as_str().to_string()),
     ];
 
@@ -157,7 +176,7 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
     .await?;
 
     let timeout = Duration::from_secs((project.iteration_timeout_min.max(1) as u64) * 60);
-    let outcome = deps
+    let outcome = match deps
         .executor
         .execute(AgentSpec {
             cmd_template: &cmd_template,
@@ -167,7 +186,43 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
             timeout,
             env: &env,
         })
-        .await?;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let failed_at = deps.clock.now_ms();
+            let transition_result =
+                issues::transition(pool, issue_id, IssueStatus::Failed, failed_at).await;
+            let status_after = issues::get(pool, issue_id)
+                .await?
+                .map(|i| i.status.as_str().to_string());
+            let note = match &transition_result {
+                Ok(()) => e.to_string(),
+                Err(status_error) => {
+                    format!("{e}; additionally failed to mark issue FAILED: {status_error:#}")
+                }
+            };
+            agent_runs::finish(
+                pool,
+                run_id,
+                status_after.as_deref(),
+                None,
+                ExitKind::Error,
+                failed_at,
+                Some(&note),
+            )
+            .await?;
+            transition_result?;
+            let _ = deps.events.send(Event::IssueStatus {
+                issue_id,
+                status: IssueStatus::Failed,
+            });
+            return Err(e);
+        }
+    };
+    if let Some(pid) = outcome.pid {
+        agent_runs::set_pid(pool, run_id, pid as i64).await?;
+    }
 
     // The agent (or the test fake) may have advanced the status via the control
     // CLI during the run; reload to record where it landed.
@@ -186,27 +241,4 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
     .await?;
 
     Ok(())
-}
-
-/// Per-run log + prompt artifact paths under the daemon data dir (NOT in the
-/// repo/worktree — those hold the agent's own `.auwsx/` artifacts). Creates the
-/// parent directory.
-fn run_paths(issue_id: i64, spawned_at: i64) -> Result<(PathBuf, PathBuf)> {
-    let base = data_dir().join("runs").join(format!("issue-{issue_id}"));
-    std::fs::create_dir_all(&base)
-        .with_context(|| format!("creating run dir {}", base.display()))?;
-    Ok((
-        base.join(format!("run-{spawned_at}.log")),
-        base.join(format!("run-{spawned_at}.prompt.txt")),
-    ))
-}
-
-fn data_dir() -> PathBuf {
-    if let Ok(env) = std::env::var("AUWSX_DATA_DIR") {
-        return PathBuf::from(env);
-    }
-    if let Some(dirs) = ProjectDirs::from("", "", "auwsx") {
-        return dirs.data_dir().to_path_buf();
-    }
-    std::env::temp_dir().join("auwsx")
 }

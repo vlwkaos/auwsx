@@ -10,15 +10,22 @@
 //! owns the in-flight set.
 
 use crate::agent::AgentExecutor;
+use crate::backlog;
 use crate::clock::Clock;
 use crate::db::issues;
 use crate::db::projects::{self, CompletionPolicy, Project};
+use crate::db::scheduler_runs::{
+    self, SchedulerRunDecision, SchedulerRunPicked, SchedulerRunSource,
+};
 use crate::db::Issue;
 use crate::events::Event;
+use crate::main_job_runner;
+use crate::main_jobs::MainJobStatus;
 use crate::pipeline::{self, Deps};
 use crate::state::{IssueStatus, SchedulerClass};
 use crate::worktree::{branch_for_issue, WorktreeHandle, Worktrees};
 use crate::Result;
+use anyhow::{anyhow, bail};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -116,6 +123,7 @@ pub struct Scheduler {
     socket: PathBuf,
     tick_interval: Duration,
     running: Arc<Mutex<HashSet<i64>>>,
+    running_routines: Arc<Mutex<HashSet<i64>>>,
     inflight: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -139,6 +147,7 @@ impl Scheduler {
             socket,
             tick_interval,
             running: Arc::new(Mutex::new(HashSet::new())),
+            running_routines: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -151,8 +160,12 @@ impl Scheduler {
                 _ = shutdown.notified() => break,
                 _ = interval.tick() => {
                     let projects = projects::list(self.db.pool()).await.unwrap_or_default();
+                    let now = self.clock.now_ms();
                     for p in projects {
-                        if let Err(e) = self.tick_project(p.id).await {
+                        if !self.project_due_for_auto_tick(&p, now).await {
+                            continue;
+                        }
+                        if let Err(e) = self.tick_project_from(p.id, SchedulerRunSource::Auto).await {
                             tracing::warn!("scheduler tick for project {} failed: {e:#}", p.id);
                         }
                     }
@@ -161,16 +174,103 @@ impl Scheduler {
         }
     }
 
+    /// Whether the automatic daemon loop should run this project on the current
+    /// global tick. Manual commands intentionally bypass this gate by calling
+    /// `tick_project` directly.
+    async fn project_due_for_auto_tick(&self, project: &Project, now: i64) -> bool {
+        let Some(interval_min) = project.schedule_interval_min else {
+            return false;
+        };
+        if interval_min <= 0 {
+            return true;
+        }
+
+        let interval_ms = interval_min.saturating_mul(60_000);
+        match scheduler_runs::latest_auto_by_project(self.db.pool(), project.id).await {
+            Ok(Some(last)) => now.saturating_sub(last.fired_at) >= interval_ms,
+            Ok(None) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "checking scheduler interval for project {} failed: {e:#}",
+                    project.id
+                );
+                true
+            }
+        }
+    }
+
     /// One scheduling pass for a project: decide, then execute each decision.
     pub async fn tick_project(&self, project_id: i64) -> Result<()> {
+        self.tick_project_from(project_id, SchedulerRunSource::Manual)
+            .await
+    }
+
+    async fn tick_project_from(&self, project_id: i64, source: SchedulerRunSource) -> Result<()> {
         self.prune_inflight();
         let pool = self.db.pool();
         let Some(project) = projects::get(pool, project_id).await? else {
             return Ok(());
         };
-        let issues = issues::list_by_project(pool, project_id).await?;
         let snapshot = self.running.lock().unwrap().clone();
-        let decisions = decide(&issues, &project, &snapshot, self.clock.now_ms());
+        let now = self.clock.now_ms();
+        let triaged = match backlog::run_triage_detailed(pool, project_id, now).await {
+            Ok(items) => items,
+            Err(e) => {
+                tracing::warn!("triage for project {project_id} failed: {e:#}");
+                Vec::new()
+            }
+        };
+        let issues = issues::list_by_project(pool, project_id).await?;
+        let issue_ids: HashSet<i64> = issues.iter().map(|issue| issue.id).collect();
+        let project_running: HashSet<i64> = snapshot
+            .iter()
+            .copied()
+            .filter(|issue_id| issue_ids.contains(issue_id))
+            .collect();
+        let decisions = decide(&issues, &project, &project_running, now);
+        let triaged_issue_ids: Vec<i64> = triaged.iter().map(|item| item.issue_id).collect();
+        let pending_backlog =
+            backlog::count_by_approval(pool, project_id, backlog::Approval::Pending)
+                .await
+                .unwrap_or(0) as usize;
+        let ready_backlog =
+            backlog::count_unconsumed_by_approval(pool, project_id, backlog::Approval::Approved)
+                .await
+                .unwrap_or(0) as usize;
+        let picked = picked_summary(
+            &triaged_issue_ids,
+            &decisions,
+            pending_backlog,
+            ready_backlog,
+            project_running.len(),
+            project.max_concurrency.max(0) as usize,
+        );
+        match picked.to_json_string() {
+            Ok(picked_json) => {
+                if let Err(e) =
+                    scheduler_runs::record(pool, project_id, now, source, Some(&picked_json)).await
+                {
+                    tracing::warn!(
+                        "recording scheduler tick for project {project_id} failed: {e:#}"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("serializing scheduler tick for project {project_id} failed: {e:#}")
+            }
+        }
+        let _ = self.events.send(Event::SchedulerTick { project_id });
+        for item in &triaged {
+            let _ = self.events.send(Event::BacklogChanged {
+                item_id: item.item_id,
+                project_id,
+                approval: "approved".to_string(),
+            });
+            let _ = self.events.send(Event::IssueStatus {
+                issue_id: item.issue_id,
+                status: IssueStatus::Consolidating,
+            });
+        }
 
         for d in decisions {
             match d {
@@ -188,6 +288,104 @@ impl Scheduler {
             }
         }
         Ok(())
+    }
+
+    /// Execute the selected issue immediately if it is actionable and not
+    /// already running. This is the daemon-owned imperative control used by
+    /// clients for "run now"; it shares the same running set and pipeline as the
+    /// automatic tick.
+    pub async fn run_issue_now(&self, issue_id: i64) -> Result<()> {
+        self.prune_inflight();
+        if self.running.lock().unwrap().contains(&issue_id) {
+            bail!("issue {issue_id} is already running");
+        }
+        let issue = issues::get(self.db.pool(), issue_id)
+            .await?
+            .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
+        if pipeline::plan_phase(issue.status).is_none() {
+            bail!(
+                "issue {issue_id} is not actionable in status {}",
+                issue.status.as_str()
+            );
+        }
+        self.spawn_phase(issue_id);
+        Ok(())
+    }
+
+    pub async fn run_backlog_now(&self, item_id: i64, now: i64) -> Result<i64> {
+        let issue_id = backlog::promote_one(self.db.pool(), item_id, now).await?;
+        self.run_issue_now(issue_id).await?;
+        Ok(issue_id)
+    }
+
+    pub fn is_running(&self, issue_id: i64) -> bool {
+        self.running.lock().unwrap().contains(&issue_id)
+    }
+
+    /// Enqueue and run a routine immediately through the main-job lane.
+    pub async fn run_routine_now(&self, routine_id: i64) -> Result<i64> {
+        self.prune_inflight();
+        {
+            let mut running = self.running_routines.lock().unwrap();
+            if running.contains(&routine_id) {
+                bail!("routine {routine_id} is already running");
+            }
+            running.insert(routine_id);
+        }
+
+        let result = self.enqueue_and_spawn_routine(routine_id).await;
+        if result.is_err() {
+            self.running_routines.lock().unwrap().remove(&routine_id);
+        }
+        result
+    }
+
+    async fn enqueue_and_spawn_routine(&self, routine_id: i64) -> Result<i64> {
+        let deps = main_job_runner::Deps {
+            db: &self.db,
+            clock: &*self.clock,
+            executor: &*self.executor,
+            events: &self.events,
+            socket: self.socket.clone(),
+        };
+        let job = main_job_runner::enqueue_routine(&deps, routine_id).await?;
+        let main_job_id = job.main_job_id;
+        self.spawn_main_job(job);
+        Ok(main_job_id)
+    }
+
+    fn spawn_main_job(&self, job: main_job_runner::RoutineJob) {
+        let db = self.db.clone();
+        let clock = self.clock.clone();
+        let executor = self.executor.clone();
+        let events = self.events.clone();
+        let socket = self.socket.clone();
+        let running_routines = self.running_routines.clone();
+        let main_job_id = job.main_job_id;
+        let routine_id = job.routine_id;
+
+        let handle = tokio::spawn(async move {
+            let deps = main_job_runner::Deps {
+                db: &db,
+                clock: &*clock,
+                executor: &*executor,
+                events: &events,
+                socket,
+            };
+            let status = match main_job_runner::execute_routine(&deps, &job).await {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::warn!("main job {main_job_id} failed: {e:#}");
+                    MainJobStatus::Failed
+                }
+            };
+            let _ = events.send(Event::MainJobStatus {
+                main_job_id,
+                status,
+            });
+            running_routines.lock().unwrap().remove(&routine_id);
+        });
+        self.inflight.lock().unwrap().push(handle);
     }
 
     /// Reserve the slot and spawn the phase task; it removes itself from the
@@ -275,7 +473,10 @@ impl Scheduler {
             return Ok(());
         };
         let handle = WorktreeHandle {
-            branch: issue.branch.clone().unwrap_or_else(|| branch_for_issue(issue_id)),
+            branch: issue
+                .branch
+                .clone()
+                .unwrap_or_else(|| branch_for_issue(issue_id)),
             path: PathBuf::from(path),
         };
         self.worktrees.teardown(project, &handle).await?;
@@ -295,5 +496,37 @@ impl Scheduler {
         for h in handles {
             let _ = h.await;
         }
+    }
+}
+
+fn picked_summary(
+    triaged_issue_ids: &[i64],
+    decisions: &[Decision],
+    pending_backlog: usize,
+    ready_backlog: usize,
+    running_issues: usize,
+    max_concurrency: usize,
+) -> SchedulerRunPicked {
+    let decisions = decisions
+        .iter()
+        .map(|d| match d {
+            Decision::Spawn(issue_id) => SchedulerRunDecision::Spawn {
+                issue_id: *issue_id,
+            },
+            Decision::SoftGate(issue_id) => SchedulerRunDecision::SoftGate {
+                issue_id: *issue_id,
+            },
+            Decision::Teardown(issue_id) => SchedulerRunDecision::Teardown {
+                issue_id: *issue_id,
+            },
+        })
+        .collect();
+    SchedulerRunPicked {
+        triaged_issue_ids: triaged_issue_ids.to_vec(),
+        decisions,
+        pending_backlog,
+        ready_backlog,
+        running_issues,
+        max_concurrency,
     }
 }
