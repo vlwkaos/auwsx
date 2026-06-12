@@ -12,12 +12,14 @@
 
 mod app;
 mod cli;
-mod editor;
 mod input;
 mod ui;
 
 use anyhow::Result;
+use auwsx_core::ipc::{self, Command};
 use cli::CliAction;
+use std::process::Stdio;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,12 +31,41 @@ async fn main() -> Result<()> {
             cli::print_usage();
             Ok(())
         }
-        // TODO(tui slice): ensure inside tmux, auto-start daemon, run the
-        // ratatui loop subscribed to the IPC Event stream. Until then, point the
-        // user at the working CLI surface.
+        // ratatui dashboard over the IPC client; starts the daemon when absent.
         CliAction::Tui => {
-            eprintln!("auwsx: TUI not yet implemented — run `auwsx help` for the CLI.");
-            Ok(())
+            let socket = ipc::default_socket_path();
+            ensure_daemon(&socket).await?;
+            app::run(socket).await
         }
+    }
+}
+
+async fn ensure_daemon(socket: &std::path::Path) -> Result<()> {
+    if ipc::request(socket, &Command::Ping).await.is_ok() {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let mut last_err = None;
+    for _ in 0..50 {
+        match ipc::request(socket, &Command::Ping).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    match last_err {
+        Some(e) => Err(e).map_err(Into::into),
+        None => anyhow::bail!("daemon did not become ready"),
     }
 }

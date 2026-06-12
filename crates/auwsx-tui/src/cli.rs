@@ -44,6 +44,7 @@ USAGE:
         [--completion-policy manual|soft|auto] \\
         [--plan-gate-timeout <min>] [--completion-timeout <min>]
   auwsx project ls
+  auwsx project get <project_id>           show one project incl. resolved policy
 
   auwsx backlog add <project_id> <text...> [--source human|agent|routine|inbox]
   auwsx backlog ls <project_id> [--approval pending|approved|dismissed]
@@ -55,6 +56,7 @@ USAGE:
   auwsx issue ls <project_id> [--status <STATUS>]
   auwsx issue get <issue_id>
   auwsx issue status <issue_id> <STATUS> [--force]
+  auwsx issue absorb <issue_id> <into_issue_id>
 
   auwsx subtask add <issue_id> <ord> <text...>
   auwsx subtask ls <issue_id>
@@ -125,6 +127,9 @@ fn parse_project(args: &[String]) -> Result<CliAction> {
             completion_soft_timeout_min: p.opt_int("completion-timeout")?,
         },
         "ls" | "list" => Command::ListProjects,
+        "get" => Command::GetProject {
+            project_id: p.int(0, "project_id")?,
+        },
         other => bail!("unknown `project` subcommand: {other}"),
     };
     Ok(CliAction::Request(cmd))
@@ -138,8 +143,9 @@ fn parse_backlog(args: &[String]) -> Result<CliAction> {
             project_id: p.int(0, "project_id")?,
             text: p.rest_from(1, "text")?,
             source: match p.flag("source") {
-                Some(s) => Source::from_str(&s)
-                    .with_context(|| format!("invalid --source {s:?}"))?,
+                Some(s) => {
+                    Source::from_str(&s).with_context(|| format!("invalid --source {s:?}"))?
+                }
                 None => Source::Human,
             },
         },
@@ -147,8 +153,7 @@ fn parse_backlog(args: &[String]) -> Result<CliAction> {
             project_id: p.int(0, "project_id")?,
             approval: match p.flag("approval") {
                 Some(a) => Some(
-                    Approval::from_str(&a)
-                        .with_context(|| format!("invalid --approval {a:?}"))?,
+                    Approval::from_str(&a).with_context(|| format!("invalid --approval {a:?}"))?,
                 ),
                 None => None,
             },
@@ -177,8 +182,7 @@ fn parse_issue(args: &[String]) -> Result<CliAction> {
             project_id: p.int(0, "project_id")?,
             status: match p.flag("status") {
                 Some(s) => Some(
-                    IssueStatus::from_str(&s)
-                        .with_context(|| format!("invalid --status {s:?}"))?,
+                    IssueStatus::from_str(&s).with_context(|| format!("invalid --status {s:?}"))?,
                 ),
                 None => None,
             },
@@ -193,6 +197,10 @@ fn parse_issue(args: &[String]) -> Result<CliAction> {
                 IssueStatus::from_str(&s).with_context(|| format!("invalid status {s:?}"))?
             },
             force: p.has("force"),
+        },
+        "absorb" => Command::AbsorbIssue {
+            issue_id: p.int(0, "issue_id")?,
+            into_issue_id: p.int(1, "into_issue_id")?,
         },
         other => bail!("unknown `issue` subcommand: {other}"),
     };
@@ -416,7 +424,7 @@ pub async fn run_daemon() -> Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(10)
         .max(1);
-    let scheduler = Scheduler::new(
+    let scheduler = Arc::new(Scheduler::new(
         db.clone(),
         clock::system(),
         subprocess_executor(),
@@ -424,14 +432,15 @@ pub async fn run_daemon() -> Result<()> {
         bus.clone(),
         socket.clone(),
         Duration::from_secs(tick_secs),
-    );
+    ));
     let sched_stop = Arc::new(Notify::new());
     let sched_stop_run = sched_stop.clone();
-    let sched_task = tokio::spawn(async move { scheduler.run(sched_stop_run).await });
+    let scheduler_run = scheduler.clone();
+    let sched_task = tokio::spawn(async move { scheduler_run.run(sched_stop_run).await });
 
     println!("auwsx daemon listening on {}", socket.display());
     println!("scheduler ticking every {tick_secs}s");
-    let serve_result = ipc::serve(db, bus, &socket, shutdown).await;
+    let serve_result = ipc::serve_with_scheduler(db, bus, &socket, shutdown, scheduler).await;
 
     // IPC server stopped (SIGINT or `daemon stop`) — drain the scheduler too.
     sched_stop.notify_one();
@@ -477,7 +486,10 @@ fn print_response(resp: Response) -> bool {
         }
         Response::Projects(ps) => {
             for p in ps {
-                println!("{}\t{}\t{}\t{}", p.id, p.name, p.default_branch, p.repo_path);
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    p.id, p.name, p.default_branch, p.repo_path
+                );
             }
         }
         Response::Project(Some(p)) => {
@@ -485,7 +497,10 @@ fn print_response(resp: Response) -> bool {
             println!("name:   {}", p.name);
             println!("repo:   {}", p.repo_path);
             println!("branch: {}", p.default_branch);
-            println!("agents: main={} plan={} work={}", p.main_agent_cmd, p.plan_agent_cmd, p.work_agent_cmd);
+            println!(
+                "agents: main={} plan={} work={}",
+                p.main_agent_cmd, p.plan_agent_cmd, p.work_agent_cmd
+            );
             println!(
                 "policy: completion={} plan_gate={}min completion_soft={}min concurrency={}",
                 p.completion_policy.as_str(),
@@ -549,6 +564,60 @@ fn print_response(resp: Response) -> bool {
                 println!("{}\t{}\t{}", s.id, s.source.as_str(), s.note);
             }
         }
+        Response::Routines(rs) => {
+            for r in rs {
+                let enabled = if r.enabled { "on" } else { "off" };
+                println!("{}\t{}\t{}\t{}", r.id, enabled, r.cron, r.name);
+            }
+        }
+        Response::Routine(Some(r)) => {
+            println!("id:      {}", r.id);
+            println!("name:    {}", r.name);
+            println!("enabled: {}", r.enabled);
+            println!("type:    {}", r.routine_type.as_str());
+            println!("cron:    {}", r.cron);
+            println!("prompt:  {}", r.prompt);
+        }
+        Response::Routine(None) => println!("not found"),
+        Response::AgentRuns(runs) => {
+            for r in runs {
+                println!(
+                    "{}\t{:?}\t{}\t{}\t{}",
+                    r.id,
+                    r.issue_id.or(r.main_job_id),
+                    r.role.as_str(),
+                    r.phase,
+                    r.log_path.unwrap_or_default()
+                );
+            }
+        }
+        Response::MainJobs(jobs) => {
+            for j in jobs {
+                println!(
+                    "{}\t{:?}\t{}\t{}",
+                    j.id,
+                    j.status,
+                    j.kind,
+                    j.outcome.unwrap_or_default()
+                );
+            }
+        }
+        Response::SchedulerRuns(runs) => {
+            for r in runs {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    r.id,
+                    r.source.as_str(),
+                    r.fired_at,
+                    r.picked.unwrap_or_default()
+                );
+            }
+        }
+        Response::LogTail { path, text } => {
+            println!("==> {path}");
+            print!("{text}");
+        }
+        Response::RanIssue { issue_id } => println!("running issue {issue_id}"),
         Response::Event(ev) => println!("event: {ev:?}"),
     }
     false
@@ -700,6 +769,24 @@ mod tests {
     #[test]
     fn given_project_bogus_verb_when_parsed_then_err() {
         assert!(parse(&argv(&["project", "bogus"])).is_err());
+    }
+
+    #[test]
+    fn given_project_get_when_parsed_then_getproject() {
+        assert_eq!(
+            parse(&argv(&["project", "get", "7"])).unwrap(),
+            CliAction::Request(Command::GetProject { project_id: 7 })
+        );
+    }
+
+    #[test]
+    fn given_project_get_non_integer_id_when_parsed_then_err() {
+        assert!(parse(&argv(&["project", "get", "notanint"])).is_err());
+    }
+
+    #[test]
+    fn given_project_get_missing_id_when_parsed_then_err() {
+        assert!(parse(&argv(&["project", "get"])).is_err());
     }
 
     // --- backlog add --------------------------------------------------------
@@ -868,6 +955,17 @@ mod tests {
     }
 
     #[test]
+    fn given_issue_absorb_when_parsed_then_absorbissue() {
+        assert_eq!(
+            parse(&argv(&["issue", "absorb", "1", "2"])).unwrap(),
+            CliAction::Request(Command::AbsorbIssue {
+                issue_id: 1,
+                into_issue_id: 2,
+            })
+        );
+    }
+
+    #[test]
     fn given_issue_status_invalid_status_when_parsed_then_err() {
         assert!(parse(&argv(&["issue", "status", "1", "bogus"])).is_err());
     }
@@ -908,8 +1006,17 @@ mod tests {
     fn given_finding_add_with_lens_and_file_when_parsed_then_addfinding() {
         assert_eq!(
             parse(&argv(&[
-                "finding", "add", "1", "0", "blocker", "null", "deref", "--lens", "correctness",
-                "--file", "src/x.rs"
+                "finding",
+                "add",
+                "1",
+                "0",
+                "blocker",
+                "null",
+                "deref",
+                "--lens",
+                "correctness",
+                "--file",
+                "src/x.rs"
             ]))
             .unwrap(),
             CliAction::Request(Command::AddFinding {
@@ -1045,11 +1152,24 @@ mod tests {
 
     #[test]
     fn given_completion_policy_auto_when_parsed_then_policy_some_auto() {
-        let CliAction::Request(Command::AddProject { completion_policy, .. }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--completion-policy", "auto",
+        let CliAction::Request(Command::AddProject {
+            completion_policy, ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-policy",
+            "auto",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
         assert_eq!(completion_policy, Some(CompletionPolicy::Auto));
@@ -1057,11 +1177,24 @@ mod tests {
 
     #[test]
     fn given_completion_policy_soft_when_parsed_then_policy_some_soft() {
-        let CliAction::Request(Command::AddProject { completion_policy, .. }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--completion-policy", "soft",
+        let CliAction::Request(Command::AddProject {
+            completion_policy, ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-policy",
+            "soft",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
         assert_eq!(completion_policy, Some(CompletionPolicy::Soft));
@@ -1070,8 +1203,18 @@ mod tests {
     #[test]
     fn given_completion_policy_bogus_when_parsed_then_err() {
         assert!(parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--completion-policy", "bogus",
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-policy",
+            "bogus",
         ]))
         .is_err());
     }
@@ -1080,8 +1223,18 @@ mod tests {
     fn given_completion_policy_uppercase_when_parsed_then_err() {
         // from_str is exact lowercase; `AUTO` is not a known variant.
         assert!(parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--completion-policy", "AUTO",
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-policy",
+            "AUTO",
         ]))
         .is_err());
     }
@@ -1089,7 +1242,16 @@ mod tests {
     #[test]
     fn given_completion_policy_empty_value_via_equals_when_parsed_then_err() {
         assert!(parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
             "--completion-policy=",
         ]))
         .is_err());
@@ -1097,11 +1259,23 @@ mod tests {
 
     #[test]
     fn given_completion_policy_equals_form_when_parsed_then_some_auto() {
-        let CliAction::Request(Command::AddProject { completion_policy, .. }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+        let CliAction::Request(Command::AddProject {
+            completion_policy, ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
             "--completion-policy=auto",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
         assert_eq!(completion_policy, Some(CompletionPolicy::Auto));
@@ -1109,11 +1283,25 @@ mod tests {
 
     #[test]
     fn given_plan_gate_timeout_zero_when_parsed_then_some_zero() {
-        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--plan-gate-timeout", "0",
+        let CliAction::Request(Command::AddProject {
+            plan_gate_timeout_min,
+            ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--plan-gate-timeout",
+            "0",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
         assert_eq!(plan_gate_timeout_min, Some(0));
@@ -1121,11 +1309,25 @@ mod tests {
 
     #[test]
     fn given_plan_gate_timeout_fifteen_when_parsed_then_some_fifteen() {
-        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--plan-gate-timeout", "15",
+        let CliAction::Request(Command::AddProject {
+            plan_gate_timeout_min,
+            ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--plan-gate-timeout",
+            "15",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
         assert_eq!(plan_gate_timeout_min, Some(15));
@@ -1134,8 +1336,18 @@ mod tests {
     #[test]
     fn given_plan_gate_timeout_non_integer_when_parsed_then_err() {
         assert!(parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--plan-gate-timeout", "notanint",
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--plan-gate-timeout",
+            "notanint",
         ]))
         .is_err());
     }
@@ -1144,11 +1356,25 @@ mod tests {
     fn given_negative_plan_gate_timeout_when_parsed_then_some_negative() {
         // `-5` is taken as the flag value (not another flag) and i64 accepts it;
         // no sign validation at the parse layer.
-        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--plan-gate-timeout", "-5",
+        let CliAction::Request(Command::AddProject {
+            plan_gate_timeout_min,
+            ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--plan-gate-timeout",
+            "-5",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
         assert_eq!(plan_gate_timeout_min, Some(-5));
@@ -1158,11 +1384,24 @@ mod tests {
     fn given_bare_plan_gate_timeout_flag_at_end_when_parsed_then_none() {
         // A `--key` with no following value is classified as a boolean flag, so
         // the optional int reads as absent (None), not an error. ^ pins this.
-        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+        let CliAction::Request(Command::AddProject {
+            plan_gate_timeout_min,
+            ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
             "--plan-gate-timeout",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
         assert_eq!(plan_gate_timeout_min, None);
@@ -1170,12 +1409,24 @@ mod tests {
 
     #[test]
     fn given_completion_timeout_thirty_when_parsed_then_some_thirty() {
-        let CliAction::Request(Command::AddProject { completion_soft_timeout_min, .. }) =
-            parse(&argv(&[
-                "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-                "--completion-timeout", "30",
-            ]))
-            .unwrap()
+        let CliAction::Request(Command::AddProject {
+            completion_soft_timeout_min,
+            ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-timeout",
+            "30",
+        ]))
+        .unwrap()
         else {
             panic!("expected AddProject")
         };
@@ -1185,20 +1436,42 @@ mod tests {
     #[test]
     fn given_completion_timeout_non_integer_when_parsed_then_err() {
         assert!(parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--completion-timeout", "abc",
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-timeout",
+            "abc",
         ]))
         .is_err());
     }
 
     #[test]
     fn given_large_completion_timeout_when_parsed_then_some_i64_max() {
-        let CliAction::Request(Command::AddProject { completion_soft_timeout_min, .. }) =
-            parse(&argv(&[
-                "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-                "--completion-timeout", "9223372036854775807",
-            ]))
-            .unwrap()
+        let CliAction::Request(Command::AddProject {
+            completion_soft_timeout_min,
+            ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-timeout",
+            "9223372036854775807",
+        ]))
+        .unwrap()
         else {
             panic!("expected AddProject")
         };
@@ -1209,8 +1482,21 @@ mod tests {
     fn given_all_three_new_flags_when_parsed_then_addproject_carries_each() {
         assert_eq!(
             parse(&argv(&[
-                "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-                "--completion-policy", "soft", "--plan-gate-timeout", "0", "--completion-timeout",
+                "project",
+                "add",
+                "demo",
+                "/repo",
+                "--main",
+                "mc",
+                "--plan",
+                "pc",
+                "--work",
+                "wc",
+                "--completion-policy",
+                "soft",
+                "--plan-gate-timeout",
+                "0",
+                "--completion-timeout",
                 "45"
             ]))
             .unwrap(),
@@ -1232,8 +1518,18 @@ mod tests {
     #[test]
     fn given_completion_timeout_overflow_when_parsed_then_err() {
         assert!(parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--completion-timeout", "9223372036854775808",
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-timeout",
+            "9223372036854775808",
         ]))
         .is_err());
     }
@@ -1241,19 +1537,44 @@ mod tests {
     #[test]
     fn given_plan_gate_timeout_overflow_when_parsed_then_err() {
         assert!(parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--plan-gate-timeout", "99999999999999999999",
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--plan-gate-timeout",
+            "99999999999999999999",
         ]))
         .is_err());
     }
 
     #[test]
     fn given_completion_policy_repeated_when_parsed_then_last_wins_soft() {
-        let CliAction::Request(Command::AddProject { completion_policy, .. }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--completion-policy", "auto", "--completion-policy", "soft",
+        let CliAction::Request(Command::AddProject {
+            completion_policy, ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-policy",
+            "auto",
+            "--completion-policy",
+            "soft",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
         assert_eq!(completion_policy, Some(CompletionPolicy::Soft));
@@ -1262,19 +1583,42 @@ mod tests {
     #[test]
     fn given_completion_policy_whitespace_value_when_parsed_then_err() {
         assert!(parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--completion-policy", " ",
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-policy",
+            " ",
         ]))
         .is_err());
     }
 
     #[test]
     fn given_plan_gate_timeout_equals_form_zero_when_parsed_then_some_zero() {
-        let CliAction::Request(Command::AddProject { plan_gate_timeout_min, .. }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
+        let CliAction::Request(Command::AddProject {
+            plan_gate_timeout_min,
+            ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
             "--plan-gate-timeout=0",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
         assert_eq!(plan_gate_timeout_min, Some(0));
@@ -1287,12 +1631,26 @@ mod tests {
             completion_soft_timeout_min,
             ..
         }) = parse(&argv(&[
-            "project", "add", "demo", "/repo", "--main", "mc", "--plan", "pc", "--work", "wc",
-            "--completion-policy", "auto",
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--completion-policy",
+            "auto",
         ]))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("expected AddProject")
         };
-        assert_eq!((plan_gate_timeout_min, completion_soft_timeout_min), (None, None));
+        assert_eq!(
+            (plan_gate_timeout_min, completion_soft_timeout_min),
+            (None, None)
+        );
     }
 }
