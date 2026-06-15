@@ -1,11 +1,11 @@
 //! Operator console: one tree on the left, contextual detail on the right.
 
-use super::{render_list, ACCENT};
+use super::{render_list, theme, ACCENT};
 use crate::app::{App, TreeItem};
 use auwsx_core::backlog::Approval;
 use auwsx_core::db::scheduler_runs::{SchedulerRunDecision, SchedulerRunPicked};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
@@ -19,25 +19,52 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let rows = app.tree_rows();
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|r| {
-            let prefix = match r.depth {
-                0 => "",
-                1 => "  ",
-                _ => "    ",
-            };
-            ListItem::new(format!("{prefix}{}", r.label))
+        .enumerate()
+        .map(|(i, r)| match r.depth {
+            // depth 0 — project header. ▾/▸ reflects expanded state.
+            0 => {
+                let expanded = rows.get(i + 1).map(|n| n.depth > 0).unwrap_or(false);
+                let glyph = if expanded { "▾ " } else { "▸ " };
+                ListItem::new(Line::from(vec![
+                    Span::raw(glyph),
+                    Span::styled(
+                        r.label.clone(),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+            }
+            // depth 1 — category header (Routines/Backlog/Issues).
+            1 => ListItem::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    r.label.clone(),
+                    Style::default()
+                        .fg(theme::TEXT_DIM)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            // depth 2 — leaf. └ for the last item in its category, ├ otherwise.
+            _ => {
+                let is_last = rows.get(i + 1).map(|n| n.depth < 2).unwrap_or(true);
+                let connector = if is_last { "    └ " } else { "    ├ " };
+                ListItem::new(Line::from(vec![
+                    Span::styled(connector, Style::default().fg(theme::TREE_CONNECTOR)),
+                    Span::styled(r.label.clone(), Style::default().fg(theme::TEXT)),
+                ]))
+            }
         })
         .collect();
     render_list(frame, cols[0], "auwsx", items, app.tree_sel, true);
 
-    match app.selected_tree_item().unwrap_or(TreeItem::Project) {
-        TreeItem::Project => render_project(frame, app, cols[1]),
-        TreeItem::RoutinesRoot => render_routines(frame, app, cols[1]),
-        TreeItem::Routine(_) => render_routine(frame, app, cols[1]),
-        TreeItem::BacklogRoot => render_backlog_summary(frame, app, cols[1]),
-        TreeItem::Backlog(_) => render_backlog(frame, app, cols[1]),
-        TreeItem::IssuesRoot => render_issue_summary(frame, app, cols[1]),
-        TreeItem::Issue(_) => render_issue(frame, app, cols[1]),
+    match app.selected_tree_item() {
+        None => render_project(frame, app, cols[1]),
+        Some(TreeItem::Project(_)) => render_project(frame, app, cols[1]),
+        Some(TreeItem::RoutinesRoot(_)) => render_routines(frame, app, cols[1]),
+        Some(TreeItem::Routine { .. }) => render_routine(frame, app, cols[1]),
+        Some(TreeItem::BacklogRoot(_)) => render_backlog_summary(frame, app, cols[1]),
+        Some(TreeItem::Backlog { .. }) => render_backlog(frame, app, cols[1]),
+        Some(TreeItem::IssuesRoot(_)) => render_issue_summary(frame, app, cols[1]),
+        Some(TreeItem::Issue { .. }) => render_issue(frame, app, cols[1]),
     }
 }
 
@@ -52,7 +79,7 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let running = app
-        .issues
+        .issues()
         .iter()
         .filter(|i| i.status.is_actionable())
         .count();
@@ -82,10 +109,10 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
             "completion gate",
             &format!("{} min", p.completion_soft_timeout_min),
         ),
-        kv("issues", &app.issues.len().to_string()),
+        kv("issues", &app.issues().len().to_string()),
         kv("actionable", &running.to_string()),
-        kv("backlog", &app.backlog.len().to_string()),
-        kv("routines", &app.routines.len().to_string()),
+        kv("backlog", &app.backlog().len().to_string()),
+        kv("routines", &app.routines().len().to_string()),
         sep(),
         Line::styled(
             "Recent scheduler ticks",
@@ -95,7 +122,7 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
     if app.recent_scheduler_runs.is_empty() {
         lines.push(Line::styled(
             "no ticks recorded; daemon may be stopped or this project has not been ticked yet",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARN),
         ));
     }
     for run in app.recent_scheduler_runs.iter().take(5) {
@@ -140,7 +167,7 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_routines(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![Line::raw("Configured recurring main-workspace prompts.")];
-    for r in &app.routines {
+    for r in app.routines() {
         lines.push(Line::raw(format!(
             "#{:<3} {:<3} {:<9} {}",
             r.id,
@@ -183,12 +210,12 @@ fn render_routine(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_backlog_summary(frame: &mut Frame, app: &App, area: Rect) {
     let pending = app
-        .backlog
+        .backlog()
         .iter()
         .filter(|b| b.approval == Approval::Pending)
         .count();
     let approved = app
-        .backlog
+        .backlog()
         .iter()
         .filter(|b| b.approval == Approval::Approved)
         .count();
@@ -197,7 +224,7 @@ fn render_backlog_summary(frame: &mut Frame, app: &App, area: Rect) {
         area,
         "Backlog",
         vec![
-            kv("items", &app.backlog.len().to_string()),
+            kv("items", &app.backlog().len().to_string()),
             kv("pending", &pending.to_string()),
             kv("approved", &approved.to_string()),
             Line::raw("n adds a backlog item. T promotes approved items. E promotes and runs the selected item."),
@@ -239,13 +266,13 @@ fn render_backlog(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "Suggested next action: E promotes this item and runs the first issue phase."
     };
-    lines.push(Line::styled(action, Style::default().fg(Color::Yellow)));
+    lines.push(Line::styled(action, Style::default().fg(theme::WARN)));
     panel(frame, area, &format!("Backlog #{}", b.id), lines);
 }
 
 fn render_issue_summary(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![];
-    for i in &app.issues {
+    for i in app.issues() {
         lines.push(Line::raw(format!(
             "#{:<3} {:<13} {}",
             i.id,
@@ -332,11 +359,8 @@ fn panel(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) 
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
-                .title(Span::styled(
-                    format!(" {title} "),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
+                .border_style(theme::border(false))
+                .title(Span::styled(format!(" {title} "), theme::title())),
         ),
         area,
     );
@@ -344,13 +368,13 @@ fn panel(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) 
 
 fn kv(key: &str, val: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key:>16}: "), Style::default().fg(Color::DarkGray)),
-        Span::raw(val.to_string()),
+        Span::styled(format!("{key:>16}: "), theme::dim()),
+        Span::styled(val.to_string(), Style::default().fg(theme::TEXT)),
     ])
 }
 
 fn sep() -> Line<'static> {
-    Line::from(Span::styled("", Style::default().fg(Color::DarkGray)))
+    Line::from(Span::styled("", theme::dim()))
 }
 
 fn next_due_label(

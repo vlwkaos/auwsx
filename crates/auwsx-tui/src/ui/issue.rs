@@ -1,8 +1,9 @@
 //! Issue detail: header fields (left) + subtasks / findings / steering (right).
 
+use super::theme;
 use crate::app::App;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
@@ -51,10 +52,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     ));
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default().borders(Borders::ALL).title(Span::styled(
-                format!(" Issue #{} ", issue.id),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::border(false))
+                .title(Span::styled(format!(" Issue #{} ", issue.id), theme::title())),
         ),
         cols[0],
     );
@@ -97,7 +98,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("[{}] ", f.severity.as_str()),
-                    Style::default().fg(severity_color(f.severity.as_str())),
+                    Style::default().fg(theme::severity(f.severity.as_str())),
                 ),
                 Span::raw(format!("{} — {}", f.status.as_str(), f.title)),
             ]))
@@ -126,24 +127,17 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
 fn kv<'a>(key: &'a str, val: &str) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{key:>17}: "), Style::default().fg(Color::DarkGray)),
-        Span::raw(val.to_string()),
+        Span::styled(format!("{key:>17}: "), theme::dim()),
+        Span::styled(val.to_string(), Style::default().fg(theme::TEXT)),
     ])
 }
 
 fn list_block(frame: &mut Frame, area: Rect, title: &str, items: Vec<ListItem>) {
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(Span::styled(
-        format!(" {title} "),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::border(false))
+            .title(Span::styled(format!(" {title} "), theme::title())),
+    );
     frame.render_widget(list, area);
-}
-
-fn severity_color(sev: &str) -> Color {
-    match sev {
-        "blocker" => Color::Red,
-        "major" => Color::LightRed,
-        "minor" => Color::Yellow,
-        _ => Color::DarkGray, // nit
-    }
 }

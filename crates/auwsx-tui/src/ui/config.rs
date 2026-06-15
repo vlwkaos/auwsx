@@ -1,9 +1,10 @@
 //! Config: the selected project's policy + agent commands. Edits go through
 //! daemon IPC; this view reflects the `projects` row.
 
+use super::theme;
 use crate::app::App;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
@@ -57,10 +58,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default().borders(Borders::ALL).title(Span::styled(
-                format!(" Config — {} ", p.name),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::border(false))
+                .title(Span::styled(format!(" Config — {} ", p.name), theme::title())),
         ),
         area,
     );
@@ -68,11 +69,11 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
 fn kv(key: &str, val: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key:>24}: "), Style::default().fg(Color::DarkGray)),
-        Span::raw(val),
+        Span::styled(format!("{key:>24}: "), theme::dim()),
+        Span::styled(val, Style::default().fg(theme::TEXT)),
     ])
 }
 
 fn sep() -> Line<'static> {
-    Line::from(Span::styled("  ─", Style::default().fg(Color::DarkGray)))
+    Line::from(Span::styled("  ─", Style::default().fg(theme::BORDER)))
 }

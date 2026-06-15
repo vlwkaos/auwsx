@@ -55,9 +55,10 @@ agent and routine backlog default to pending.
 
 The TUI is an operator console:
 
-- Left pane: one tree with Project, Routines, Backlog, and Issues.
+- Left pane: a tree of all registered projects; each project expands to its
+  Routines, Backlog, and Issues. `⏎` toggles a project's children.
 - Right pane: contextual detail for the highlighted tree row.
-- Bottom bar: mode, key hints, and last result/error.
+- Bottom bar: mode, key hints, last result/error, and the running version.
 
 Useful keys:
 
@@ -70,6 +71,7 @@ Useful keys:
 - `T`: triage approved backlog for the selected project.
 - `E`: execute the selected project/backlog/issue/routine now.
 - `Space`: enable or disable the selected routine.
+- `⏎`: expand/collapse the selected project, or open the selected issue.
 - `f`: add steering to the selected issue.
 - `l`: refresh/toggle issue log tail.
 - `Tab` / `BackTab`: switch compatibility views.

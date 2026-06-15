@@ -13,6 +13,7 @@
 mod app;
 mod cli;
 mod input;
+mod repo_scan;
 mod ui;
 
 use anyhow::Result;

@@ -6,16 +6,18 @@ mod config;
 mod issue;
 mod logs;
 mod overview;
+pub(crate) mod theme;
 
 use crate::app::{App, View};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-/// Accent for the focused/selected element across all views.
-pub(crate) const ACCENT: Color = Color::Cyan;
+/// Accent for the focused/selected element across all views. Re-exported from
+/// [`theme`] so existing `ACCENT` references resolve to the themed color.
+pub(crate) use theme::ACCENT;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -40,28 +42,44 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    // Version pinned to the right; hint/status fills the remaining left space.
+    let version = format!(" v{} ", env!("CARGO_PKG_VERSION"));
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(version.len() as u16)])
+        .split(area);
+
     // A status/error message preempts the hint line when present.
-    let text = if !app.status.is_empty() {
-        app.status.clone()
+    let (text, style) = if !app.status.is_empty() {
+        (app.status.clone(), Style::default().fg(theme::WARN))
     } else {
         let conn = if app.connected { "live" } else { "offline" };
-        format!(
-            "{conn} · j/k move · a project · c config · n backlog · i issue · f steering · A approve · x dismiss · T triage · Space toggle · E run · r refresh · q quit"
+        (
+            format!(
+                "{conn} · j/k move · ⏎ open · a project · c config · n backlog · i issue · f steering · A approve · x dismiss · T triage · Space toggle · E run · r refresh · q quit"
+            ),
+            theme::hint(),
         )
     };
-    let style = if app.status.is_empty() {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default().fg(Color::Yellow)
-    };
-    frame.render_widget(Paragraph::new(Span::styled(text, style)), area);
+    frame.render_widget(Paragraph::new(Span::styled(text, style)), cols[0]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(version, theme::dim())),
+        cols[1],
+    );
 }
 
 fn draw_form(frame: &mut Frame, app: &App) {
     let Some(form) = app.form.as_ref() else {
         return;
     };
-    let area = centered_rect(74, form_height(form.fields.len() as u16), frame.area());
+    // Git-repo completions, shown only when the cursor is on the repo_path field.
+    let suggestions = app.repo_suggestions();
+    let extra = suggestions.len() as u16 + if suggestions.is_empty() { 0 } else { 1 };
+    let area = centered_rect(
+        74,
+        form_height(form.fields.len() as u16, extra),
+        frame.area(),
+    );
     frame.render_widget(Clear, area);
 
     let mut lines = Vec::new();
@@ -78,31 +96,43 @@ fn draw_form(frame: &mut Frame, app: &App) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{marker} {:>12}{optional}: ", field.label),
-                Style::default().fg(Color::DarkGray),
+                theme::dim(),
             ),
             Span::styled(
                 value,
                 if idx == form.current {
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
+                    Style::default().fg(theme::TEXT)
                 },
             ),
         ]));
     }
+
+    // Repo completions block (Tab on the field accepts the top match).
+    if !suggestions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  found repos (Tab fills top):",
+            theme::dim(),
+        )));
+        for repo in &suggestions {
+            lines.push(Line::from(vec![
+                Span::styled("    • ", Style::default().fg(theme::TREE_CONNECTOR)),
+                Span::styled(repo.clone(), Style::default().fg(theme::TEXT)),
+            ]));
+        }
+    }
+
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "Enter next/submit · Tab field · Backspace edit · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+        "Enter next/submit · Tab field/complete · Backspace edit · Esc cancel",
+        theme::hint(),
     )));
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            format!(" {} ", form.title),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .border_style(theme::border(true))
+        .title(Span::styled(format!(" {} ", form.title), theme::title()));
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -111,8 +141,11 @@ fn draw_form(frame: &mut Frame, app: &App) {
     );
 }
 
-fn form_height(field_count: u16) -> u16 {
-    field_count.saturating_add(4).clamp(6, 22)
+fn form_height(field_count: u16, extra: u16) -> u16 {
+    field_count
+        .saturating_add(4)
+        .saturating_add(extra)
+        .clamp(6, 28)
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -138,28 +171,15 @@ pub(crate) fn render_list(
     selected: usize,
     focused: bool,
 ) {
-    let border_style = if focused {
-        Style::default().fg(ACCENT)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
     let is_empty = items.is_empty();
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(Span::styled(
-                    format!(" {title} "),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
+                .border_style(theme::border(focused))
+                .title(Span::styled(format!(" {title} "), theme::title())),
         )
-        .highlight_style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .bg(if focused { ACCENT } else { Color::DarkGray })
-                .fg(Color::Black),
-        )
+        .highlight_style(theme::highlight(focused))
         .highlight_symbol("▌");
     let mut state = ListState::default();
     // No phantom highlight on an empty list.

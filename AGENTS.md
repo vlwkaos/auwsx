@@ -10,7 +10,7 @@ Read the design plan at `~/.claude/plans/current-wsx-is-agent-cosmic-gadget.md` 
 
 ```bash
 cargo build --workspace             # NOT before /sec on dep set
-cargo run --bin auwsx               # default = TUI; must be inside tmux
+cargo run --bin auwsx               # default = TUI (auto-starts daemon if none running)
 cargo run --bin auwsx -- daemon     # start daemon explicitly
 ```
 
@@ -38,6 +38,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 
 - Pin deps to exact patch (`=X.Y.Z`); new package requires `/sec` first.
 - Tests via `/write-test`, never inline.
+- TUI colors: reference `ui::theme` roles only — NO inline `ratatui::style::Color::X` anywhere under `crates/auwsx-tui/src/ui/` (except `theme.rs` itself). Add new semantic roles to `theme.rs`; keep `BORDER` distinct from `TEXT_DIM`/`HINT` so chrome never collides with content.
 - Skills bundled in `skills/`; copied to `~/.claude/skills/` on first run only if missing (never overwrite user copies).
 - All filesystem state outside the repo: `~/.local/share/auwsx/state.db`, `~/.auwsx/inbox/`, `<task-worktree>/.auwsx/`.
 - No AI attribution in commits or PRs.

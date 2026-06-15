@@ -1,8 +1,9 @@
 //! Logs: a live tail of daemon events (newest at the bottom).
 
+use super::theme;
 use crate::app::App;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, List, ListItem};
 use ratatui::Frame;
@@ -27,14 +28,11 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(
-                title,
-                Style::default().add_modifier(Modifier::BOLD),
-            ))
+            .title(Span::styled(title, theme::title()))
             .border_style(Style::default().fg(if app.connected {
-                Color::Green
+                theme::OK
             } else {
-                Color::DarkGray
+                theme::BORDER
             })),
     );
     frame.render_widget(list, area);

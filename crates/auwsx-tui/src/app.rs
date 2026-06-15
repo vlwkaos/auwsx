@@ -33,7 +33,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -68,22 +68,33 @@ impl View {
     }
 }
 
-/// Which pane has the cursor in the Overview view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pane {
-    Projects,
-    Issues,
-}
-
+/// A node in the multi-project tree. Every item carries the owning
+/// `project_id` so actions resolve against the right project regardless of the
+/// cursor's vertical position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeItem {
-    Project,
-    RoutinesRoot,
-    Routine(i64),
-    BacklogRoot,
-    Backlog(i64),
-    IssuesRoot,
-    Issue(i64),
+    Project(i64),
+    RoutinesRoot(i64),
+    Routine { project_id: i64, id: i64 },
+    BacklogRoot(i64),
+    Backlog { project_id: i64, id: i64 },
+    IssuesRoot(i64),
+    Issue { project_id: i64, id: i64 },
+}
+
+impl TreeItem {
+    /// The project this node belongs to.
+    pub fn project_id(&self) -> i64 {
+        match self {
+            TreeItem::Project(id)
+            | TreeItem::RoutinesRoot(id)
+            | TreeItem::BacklogRoot(id)
+            | TreeItem::IssuesRoot(id)
+            | TreeItem::Routine { project_id: id, .. }
+            | TreeItem::Backlog { project_id: id, .. }
+            | TreeItem::Issue { project_id: id, .. } => *id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +102,15 @@ pub struct TreeRow {
     pub item: TreeItem,
     pub label: String,
     pub depth: usize,
+}
+
+/// Eagerly-loaded children for one project. Keyed by project id in
+/// [`App::children`]; refreshed wholesale on every resync.
+#[derive(Default)]
+pub struct ProjectChildren {
+    pub routines: Vec<Routine>,
+    pub backlog: Vec<BacklogItem>,
+    pub issues: Vec<Issue>,
 }
 
 /// Everything the issue-detail pane shows, fetched together.
@@ -390,15 +410,18 @@ fn parse_routine_type(form: &Form, status: &mut String) -> Option<RoutineType> {
 pub struct App {
     pub socket: PathBuf,
     pub view: View,
-    pub pane: Pane,
 
     pub projects: Vec<Project>,
+    /// Index of the "active" project — the one the cursor currently sits in.
+    /// Kept in sync with `tree_sel` so the detail pane and per-project activity
+    /// (recent runs, config) track the cursor across project boundaries.
     pub proj_sel: usize,
-    pub issues: Vec<Issue>,
+    /// Eagerly-loaded children for every project, keyed by project id.
+    pub children: HashMap<i64, ProjectChildren>,
+    /// Project ids whose children are expanded in the tree.
+    pub expanded: HashSet<i64>,
     pub issue_sel: usize,
-    pub backlog: Vec<BacklogItem>,
     pub backlog_sel: usize,
-    pub routines: Vec<Routine>,
     pub tree_sel: usize,
     pub detail: IssueDetail,
     pub recent_agent_runs: Vec<AgentRun>,
@@ -415,6 +438,9 @@ pub struct App {
     pub status: String,
     /// Active inline data-entry form, rendered as a modal overlay.
     pub form: Option<Form>,
+    /// Git repos discovered under `$HOME` (display paths), for the New-project
+    /// form's `repo_path` completion. Populated once by a background scan.
+    pub scanned_repos: Vec<String>,
 }
 
 const LOG_CAP: usize = 500;
@@ -424,14 +450,12 @@ impl App {
         App {
             socket,
             view: View::Overview,
-            pane: Pane::Projects,
             projects: Vec::new(),
             proj_sel: 0,
-            issues: Vec::new(),
+            children: HashMap::new(),
+            expanded: HashSet::new(),
             issue_sel: 0,
-            backlog: Vec::new(),
             backlog_sel: 0,
-            routines: Vec::new(),
             tree_sel: 0,
             detail: IssueDetail::default(),
             recent_agent_runs: Vec::new(),
@@ -443,91 +467,164 @@ impl App {
             connected: false,
             status: String::new(),
             form: None,
+            scanned_repos: Vec::new(),
         }
     }
 
-    /// The currently-selected project id (if any project exists).
+    /// Fuzzy-completion suggestions for the New-project `repo_path` field, based
+    /// on the current field text. Empty unless a Project form is open on that
+    /// field. Capped to keep the dropdown short.
+    pub fn repo_suggestions(&self) -> Vec<String> {
+        let Some(form) = &self.form else {
+            return Vec::new();
+        };
+        if form.kind != FormKind::Project {
+            return Vec::new();
+        }
+        let Some(field) = form.fields.get(form.current) else {
+            return Vec::new();
+        };
+        if field.label != "repo_path" {
+            return Vec::new();
+        }
+        crate::repo_scan::filter_repos(&field.value, &self.scanned_repos, 8)
+    }
+
+    /// The "active" project id — the one the cursor currently sits in.
     pub fn selected_project_id(&self) -> Option<i64> {
         self.projects.get(self.proj_sel).map(|p| p.id)
     }
 
-    /// The currently-selected issue id (if any).
+    fn children_of(&self, project_id: i64) -> Option<&ProjectChildren> {
+        self.children.get(&project_id)
+    }
+
+    /// Routines of the active project (empty if none / not yet loaded).
+    pub fn routines(&self) -> &[Routine] {
+        self.selected_project_id()
+            .and_then(|id| self.children_of(id))
+            .map(|c| c.routines.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Backlog of the active project.
+    pub fn backlog(&self) -> &[BacklogItem] {
+        self.selected_project_id()
+            .and_then(|id| self.children_of(id))
+            .map(|c| c.backlog.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Issues of the active project.
+    pub fn issues(&self) -> &[Issue] {
+        self.selected_project_id()
+            .and_then(|id| self.children_of(id))
+            .map(|c| c.issues.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The currently-selected issue id (if the cursor is on one).
     pub fn selected_issue_id(&self) -> Option<i64> {
         match self.selected_tree_item() {
-            Some(TreeItem::Issue(id)) => Some(id),
-            _ => self.issues.get(self.issue_sel).map(|i| i.id),
+            Some(TreeItem::Issue { id, .. }) => Some(id),
+            _ => self.issues().get(self.issue_sel).map(|i| i.id),
         }
     }
 
     fn selected_backlog_id(&self) -> Option<i64> {
         match self.selected_tree_item() {
-            Some(TreeItem::Backlog(id)) => Some(id),
-            _ => self.backlog.get(self.backlog_sel).map(|b| b.id),
+            Some(TreeItem::Backlog { id, .. }) => Some(id),
+            _ => self.backlog().get(self.backlog_sel).map(|b| b.id),
         }
     }
 
     pub fn tree_rows(&self) -> Vec<TreeRow> {
-        let project_label = self
-            .projects
-            .get(self.proj_sel)
-            .map(|p| format!("PROJECT  {}", p.name))
-            .unwrap_or_else(|| "PROJECT  (none)".to_string());
-        let mut rows = vec![TreeRow {
-            item: TreeItem::Project,
-            label: project_label,
-            depth: 0,
-        }];
-        rows.push(TreeRow {
-            item: TreeItem::RoutinesRoot,
-            label: format!("ROUTINES  {}", self.routines.len()),
-            depth: 0,
-        });
-        for r in &self.routines {
-            rows.push(TreeRow {
-                item: TreeItem::Routine(r.id),
-                label: format!(
-                    "{:<3} #{:<3} {}",
-                    if r.enabled { "on" } else { "off" },
-                    r.id,
-                    r.name
-                ),
-                depth: 2,
-            });
+        let mut rows = Vec::new();
+        if self.projects.is_empty() {
+            return rows;
         }
-        rows.push(TreeRow {
-            item: TreeItem::BacklogRoot,
-            label: format!("BACKLOG   {}", self.backlog.len()),
-            depth: 0,
-        });
-        for b in &self.backlog {
-            let consumed = if b.consumed_issue_id.is_some() {
-                "*"
-            } else {
-                " "
-            };
+        for p in &self.projects {
+            let expanded = self.expanded.contains(&p.id);
+            let empty = ProjectChildren::default();
+            let kids = self.children.get(&p.id).unwrap_or(&empty);
             rows.push(TreeRow {
-                item: TreeItem::Backlog(b.id),
+                item: TreeItem::Project(p.id),
                 label: format!(
-                    "{} {:<9} #{:<3} {}",
-                    consumed,
-                    b.approval.as_str(),
-                    b.id,
-                    b.text.lines().next().unwrap_or("")
+                    "{}  (r{} b{} i{})",
+                    p.name,
+                    kids.routines.len(),
+                    kids.backlog.len(),
+                    kids.issues.len()
                 ),
-                depth: 2,
+                depth: 0,
             });
-        }
-        rows.push(TreeRow {
-            item: TreeItem::IssuesRoot,
-            label: format!("ISSUES    {}", self.issues.len()),
-            depth: 0,
-        });
-        for i in &self.issues {
+            if !expanded {
+                continue;
+            }
+
             rows.push(TreeRow {
-                item: TreeItem::Issue(i.id),
-                label: format!("#{: <3} {:<13} {}", i.id, i.status.as_str(), i.title),
-                depth: 2,
+                item: TreeItem::RoutinesRoot(p.id),
+                label: format!("Routines  {}", kids.routines.len()),
+                depth: 1,
             });
+            for r in &kids.routines {
+                rows.push(TreeRow {
+                    item: TreeItem::Routine {
+                        project_id: p.id,
+                        id: r.id,
+                    },
+                    label: format!(
+                        "{:<3} #{:<3} {}",
+                        if r.enabled { "on" } else { "off" },
+                        r.id,
+                        r.name
+                    ),
+                    depth: 2,
+                });
+            }
+
+            rows.push(TreeRow {
+                item: TreeItem::BacklogRoot(p.id),
+                label: format!("Backlog   {}", kids.backlog.len()),
+                depth: 1,
+            });
+            for b in &kids.backlog {
+                let consumed = if b.consumed_issue_id.is_some() {
+                    "*"
+                } else {
+                    " "
+                };
+                rows.push(TreeRow {
+                    item: TreeItem::Backlog {
+                        project_id: p.id,
+                        id: b.id,
+                    },
+                    label: format!(
+                        "{} {:<9} #{:<3} {}",
+                        consumed,
+                        b.approval.as_str(),
+                        b.id,
+                        b.text.lines().next().unwrap_or("")
+                    ),
+                    depth: 2,
+                });
+            }
+
+            rows.push(TreeRow {
+                item: TreeItem::IssuesRoot(p.id),
+                label: format!("Issues    {}", kids.issues.len()),
+                depth: 1,
+            });
+            for i in &kids.issues {
+                rows.push(TreeRow {
+                    item: TreeItem::Issue {
+                        project_id: p.id,
+                        id: i.id,
+                    },
+                    label: format!("#{: <3} {:<13} {}", i.id, i.status.as_str(), i.title),
+                    depth: 2,
+                });
+            }
         }
         rows
     }
@@ -538,22 +635,34 @@ impl App {
 
     pub fn selected_routine(&self) -> Option<&Routine> {
         match self.selected_tree_item()? {
-            TreeItem::Routine(id) => self.routines.iter().find(|r| r.id == id),
+            TreeItem::Routine { project_id, id } => self
+                .children_of(project_id)?
+                .routines
+                .iter()
+                .find(|r| r.id == id),
             _ => None,
         }
     }
 
     pub fn selected_backlog(&self) -> Option<&BacklogItem> {
         match self.selected_tree_item()? {
-            TreeItem::Backlog(id) => self.backlog.iter().find(|b| b.id == id),
+            TreeItem::Backlog { project_id, id } => self
+                .children_of(project_id)?
+                .backlog
+                .iter()
+                .find(|b| b.id == id),
             _ => None,
         }
     }
 
     pub fn selected_issue(&self) -> Option<&Issue> {
         match self.selected_tree_item()? {
-            TreeItem::Issue(id) => self.issues.iter().find(|i| i.id == id),
-            _ => self.issues.get(self.issue_sel),
+            TreeItem::Issue { project_id, id } => self
+                .children_of(project_id)?
+                .issues
+                .iter()
+                .find(|i| i.id == id),
+            _ => self.issues().get(self.issue_sel),
         }
     }
 
@@ -575,16 +684,22 @@ impl App {
 
     // --- data refresh -------------------------------------------------------
 
-    /// Full resync of every cached list for the current selection.
+    /// Full resync: project list + every project's children, then re-derive the
+    /// active project from the cursor and freshen the detail/activity panes.
     async fn refresh_all(&mut self) -> Result<()> {
         self.refresh_projects().await?;
-        self.refresh_routines().await?;
-        self.refresh_issues().await?;
-        self.refresh_backlog().await?;
+        for pid in self.project_ids() {
+            self.refresh_project_children(pid).await?;
+        }
+        self.clamp_tree();
+        self.sync_active_project();
         self.refresh_detail().await?;
         self.refresh_activity().await?;
-        self.clamp_tree();
         Ok(())
+    }
+
+    fn project_ids(&self) -> Vec<i64> {
+        self.projects.iter().map(|p| p.id).collect()
     }
 
     async fn refresh_projects(&mut self) -> Result<()> {
@@ -593,63 +708,90 @@ impl App {
             if self.proj_sel >= self.projects.len() {
                 self.proj_sel = self.projects.len().saturating_sub(1);
             }
+            // Drop caches for projects that no longer exist; first sight of a
+            // project auto-expands it so the tree is not a wall of collapsed rows.
+            let live: HashSet<i64> = self.projects.iter().map(|p| p.id).collect();
+            self.children.retain(|id, _| live.contains(id));
+            self.expanded.retain(|id| live.contains(id));
+            if self.expanded.is_empty() {
+                self.expanded.extend(live);
+            }
         }
         Ok(())
     }
 
-    async fn refresh_issues(&mut self) -> Result<()> {
-        let Some(pid) = self.selected_project_id() else {
-            self.issues.clear();
-            return Ok(());
-        };
+    /// Load routines + backlog + issues for one project into the cache.
+    async fn refresh_project_children(&mut self, project_id: i64) -> Result<()> {
+        let mut kids = ProjectChildren::default();
+        if let Response::Routines(items) = self
+            .req(Command::ListRoutines { project_id })
+            .await?
+        {
+            kids.routines = items;
+        }
+        if let Response::Backlog(items) = self
+            .req(Command::ListBacklog {
+                project_id,
+                approval: None,
+            })
+            .await?
+        {
+            kids.backlog = items;
+        }
         if let Response::Issues(mut is) = self
             .req(Command::ListIssues {
-                project_id: pid,
+                project_id,
                 status: None,
             })
             .await?
         {
             // Stable, readable order: oldest first (creation order == id order).
             is.sort_by_key(|i| i.id);
-            self.issues = is;
-            if self.issue_sel >= self.issues.len() {
-                self.issue_sel = self.issues.len().saturating_sub(1);
-            }
+            kids.issues = is;
+        }
+        self.children.insert(project_id, kids);
+        Ok(())
+    }
+
+    /// Refresh just the active project's children (used after local mutations).
+    async fn refresh_issues(&mut self) -> Result<()> {
+        if let Some(pid) = self.selected_project_id() {
+            self.refresh_project_children(pid).await?;
+        }
+        let len = self.issues().len();
+        if self.issue_sel >= len {
+            self.issue_sel = len.saturating_sub(1);
         }
         Ok(())
     }
 
     async fn refresh_backlog(&mut self) -> Result<()> {
-        let Some(pid) = self.selected_project_id() else {
-            self.backlog.clear();
-            return Ok(());
-        };
-        if let Response::Backlog(items) = self
-            .req(Command::ListBacklog {
-                project_id: pid,
-                approval: None,
-            })
-            .await?
-        {
-            self.backlog = items;
-            if self.backlog_sel >= self.backlog.len() {
-                self.backlog_sel = self.backlog.len().saturating_sub(1);
-            }
+        if let Some(pid) = self.selected_project_id() {
+            self.refresh_project_children(pid).await?;
+        }
+        let len = self.backlog().len();
+        if self.backlog_sel >= len {
+            self.backlog_sel = len.saturating_sub(1);
         }
         Ok(())
     }
 
     async fn refresh_routines(&mut self) -> Result<()> {
-        let Some(pid) = self.selected_project_id() else {
-            self.routines.clear();
-            return Ok(());
-        };
-        if let Response::Routines(items) =
-            self.req(Command::ListRoutines { project_id: pid }).await?
-        {
-            self.routines = items;
+        if let Some(pid) = self.selected_project_id() {
+            self.refresh_project_children(pid).await?;
         }
         Ok(())
+    }
+
+    /// Re-derive `proj_sel` from the row under the cursor so the detail pane and
+    /// per-project activity follow the cursor across project boundaries.
+    fn sync_active_project(&mut self) {
+        if let Some(item) = self.selected_tree_item() {
+            let pid = item.project_id();
+            if let Some(idx) = self.projects.iter().position(|p| p.id == pid) {
+                self.proj_sel = idx;
+            }
+        }
     }
 
     async fn refresh_detail(&mut self) -> Result<()> {
@@ -785,8 +927,8 @@ impl App {
                 }
             }
             Action::EditSelected => match self.selected_tree_item() {
-                Some(TreeItem::Backlog(item_id)) => {
-                    if let Some(item) = self.backlog.iter().find(|b| b.id == item_id) {
+                Some(TreeItem::Backlog { .. }) => {
+                    if let Some(item) = self.selected_backlog() {
                         if item.consumed_issue_id.is_some() {
                             self.status = "consumed backlog cannot be edited".into();
                         } else {
@@ -794,8 +936,8 @@ impl App {
                         }
                     }
                 }
-                Some(TreeItem::Routine(routine_id)) => {
-                    if let Some(routine) = self.routines.iter().find(|r| r.id == routine_id) {
+                Some(TreeItem::Routine { .. }) => {
+                    if let Some(routine) = self.selected_routine() {
                         self.form = Some(Form::routine_edit(routine));
                     }
                 }
@@ -804,7 +946,7 @@ impl App {
             Action::NewBacklog => {
                 if matches!(
                     self.selected_tree_item(),
-                    Some(TreeItem::RoutinesRoot | TreeItem::Routine(_))
+                    Some(TreeItem::RoutinesRoot(_) | TreeItem::Routine { .. })
                 ) {
                     if self.selected_project_id().is_some() {
                         self.form = Some(Form::routine());
@@ -877,13 +1019,11 @@ impl App {
 
     async fn execute_selected(&mut self) -> Result<()> {
         match self.selected_tree_item() {
-            Some(TreeItem::Project) => {
-                if let Some(project_id) = self.selected_project_id() {
-                    self.req_ok(Command::RunSchedulerOnce { project_id }, "scheduler tick")
-                        .await;
-                }
+            Some(TreeItem::Project(project_id)) => {
+                self.req_ok(Command::RunSchedulerOnce { project_id }, "scheduler tick")
+                    .await;
             }
-            Some(TreeItem::Backlog(item_id)) => {
+            Some(TreeItem::Backlog { id: item_id, .. }) => {
                 match self.req(Command::RunBacklogNow { item_id }).await {
                     Ok(Response::RanIssue { issue_id }) => {
                         self.status = format!("running issue #{issue_id}");
@@ -893,7 +1033,7 @@ impl App {
                     Err(e) => self.status = format!("run failed: {e}"),
                 }
             }
-            Some(TreeItem::Issue(issue_id)) => {
+            Some(TreeItem::Issue { id: issue_id, .. }) => {
                 match self.req(Command::RunIssueNow { issue_id }).await {
                     Ok(Response::RanIssue { issue_id }) => {
                         self.status = format!("running issue #{issue_id}");
@@ -903,7 +1043,7 @@ impl App {
                     Err(e) => self.status = format!("run failed: {e}"),
                 }
             }
-            Some(TreeItem::Routine(routine_id)) => {
+            Some(TreeItem::Routine { id: routine_id, .. }) => {
                 self.req_ok(Command::RunRoutineNow { routine_id }, "routine run")
                     .await;
             }
@@ -945,6 +1085,17 @@ impl App {
                 self.status = "cancelled".into();
             }
             KeyCode::Enter => self.advance_or_submit_form().await?,
+            // Tab on the repo_path field with a suggestion fills the top match;
+            // otherwise (and for Down) it advances to the next field.
+            KeyCode::Tab if !self.repo_suggestions().is_empty() => {
+                if let Some(top) = self.repo_suggestions().into_iter().next() {
+                    if let Some(form) = self.form.as_mut() {
+                        if let Some(field) = form.fields.get_mut(form.current) {
+                            field.value = top;
+                        }
+                    }
+                }
+            }
             KeyCode::Tab | KeyCode::Down => {
                 if let Some(form) = self.form.as_mut() {
                     form.current = (form.current + 1).min(form.fields.len().saturating_sub(1));
@@ -1017,8 +1168,20 @@ impl App {
                 self.submit_create(cmd, "project").await?;
                 self.refresh_projects().await?;
                 self.proj_sel = self.projects.len().saturating_sub(1);
-                self.refresh_issues().await?;
-                self.refresh_backlog().await?;
+                if let Some(pid) = self.selected_project_id() {
+                    self.expanded.insert(pid);
+                    self.refresh_project_children(pid).await?;
+                }
+                // Drop the cursor onto the new project's header row.
+                if let Some(pid) = self.selected_project_id() {
+                    if let Some(idx) = self
+                        .tree_rows()
+                        .iter()
+                        .position(|r| r.item == TreeItem::Project(pid))
+                    {
+                        self.tree_sel = idx;
+                    }
+                }
             }
             FormKind::ProjectConfig => {
                 let Some(project_id) = self.selected_project_id() else {
@@ -1268,11 +1431,16 @@ impl App {
     async fn move_sel(&mut self, delta: isize) -> Result<()> {
         let len = self.tree_rows().len();
         step(&mut self.tree_sel, delta, len);
-        if let Some(TreeItem::Issue(id)) = self.selected_tree_item() {
-            if let Some(idx) = self.issues.iter().position(|i| i.id == id) {
+        // The detail pane and per-project activity track whichever project the
+        // cursor now sits in.
+        self.sync_active_project();
+        if let Some(TreeItem::Issue { id, .. }) = self.selected_tree_item() {
+            if let Some(idx) = self.issues().iter().position(|i| i.id == id) {
                 self.issue_sel = idx;
             }
             self.refresh_detail().await?;
+        } else {
+            self.refresh_activity().await?;
         }
         Ok(())
     }
@@ -1283,13 +1451,27 @@ impl App {
     }
 
     async fn drill(&mut self) -> Result<()> {
-        if self.view == View::Overview {
-            if self.pane == Pane::Projects {
-                // Drill from a project into its issues pane.
-                self.pane = Pane::Issues;
-            } else if self.selected_issue_id().is_some() {
-                self.set_view(View::Issue).await?;
+        if self.view != View::Overview {
+            return Ok(());
+        }
+        match self.selected_tree_item() {
+            // Enter on a project header toggles its children.
+            Some(TreeItem::Project(pid)) => {
+                if self.expanded.contains(&pid) {
+                    self.expanded.remove(&pid);
+                } else {
+                    self.expanded.insert(pid);
+                }
+                self.clamp_tree();
+                self.sync_active_project();
             }
+            // Enter on an issue opens the detail view.
+            Some(TreeItem::Issue { .. }) => {
+                if self.selected_issue_id().is_some() {
+                    self.set_view(View::Issue).await?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1319,6 +1501,7 @@ impl App {
                 self.refresh_activity().await?;
             }
             Event::SchedulerTick { project_id } => {
+                self.refresh_project_children(project_id).await?;
                 if Some(project_id) == self.selected_project_id() {
                     self.refresh_activity().await?;
                 }
@@ -1456,6 +1639,11 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
         Err(_) => None,
     };
 
+    // One-shot background git-repo scan for the New-project form's completion.
+    // `spawn_blocking` keeps the filesystem walk off the async runtime; the
+    // result lands once via the select! arm below, then `repo_scan` is None.
+    let mut repo_scan = Some(tokio::task::spawn_blocking(crate::repo_scan::scan_git_repos));
+
     let mut tick = tokio::time::interval(Duration::from_secs(2));
 
     loop {
@@ -1482,10 +1670,25 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
                     app.connected = false;
                 }
             },
+            repos = drain_scan(&mut repo_scan) => {
+                app.scanned_repos = repos;
+                repo_scan = None; // consumed; never poll the finished handle again
+            }
             _ = tick.tick() => { /* periodic redraw for time-based fields */ }
         }
     }
     Ok(())
+}
+
+/// Await the repo-scan task if one is pending; an absent/finished handle parks
+/// forever so `select!` falls through to the other arms.
+async fn drain_scan(
+    handle: &mut Option<tokio::task::JoinHandle<Vec<String>>>,
+) -> Vec<String> {
+    match handle {
+        Some(h) => h.await.unwrap_or_default(),
+        None => std::future::pending().await,
+    }
 }
 
 /// Await the next event from an optional stream; an absent stream parks forever
@@ -1558,5 +1761,115 @@ mod tests {
         let mut sel = 0usize;
         step(&mut sel, 1, 0);
         assert_eq!(sel, 0);
+    }
+
+    // --- App::repo_suggestions -------------------------------------------
+
+    fn test_app() -> App {
+        App::new(std::path::PathBuf::from("/tmp/test.sock"))
+    }
+
+    fn repo_field(value: &str) -> FormField {
+        FormField {
+            label: "repo_path",
+            value: value.into(),
+            optional: false,
+        }
+    }
+
+    #[test]
+    fn given_no_form_when_repo_suggestions_then_empty() {
+        let app = test_app();
+        assert!(app.repo_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_non_project_form_when_repo_suggestions_then_empty() {
+        let mut app = test_app();
+        app.scanned_repos = vec!["~/foo".to_string()];
+        app.form = Some(Form {
+            kind: FormKind::Backlog,
+            title: "t",
+            fields: vec![repo_field("foo")],
+            current: 0,
+        });
+        assert!(app.repo_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_project_form_on_non_repo_field_when_repo_suggestions_then_empty() {
+        let mut app = test_app();
+        app.scanned_repos = vec!["~/foo".to_string()];
+        app.form = Some(Form {
+            kind: FormKind::Project,
+            title: "t",
+            fields: vec![FormField {
+                label: "name",
+                value: "foo".into(),
+                optional: false,
+            }],
+            current: 0,
+        });
+        assert!(app.repo_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_project_form_on_repo_field_with_match_when_repo_suggestions_then_non_empty() {
+        let mut app = test_app();
+        app.scanned_repos = vec!["~/foo".to_string(), "~/bar".to_string()];
+        app.form = Some(Form {
+            kind: FormKind::Project,
+            title: "t",
+            fields: vec![repo_field("foo")],
+            current: 0,
+        });
+        assert!(!app.repo_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_project_form_on_repo_field_no_match_when_repo_suggestions_then_empty() {
+        let mut app = test_app();
+        app.scanned_repos = vec!["~/foo".to_string(), "~/bar".to_string()];
+        app.form = Some(Form {
+            kind: FormKind::Project,
+            title: "t",
+            fields: vec![repo_field("zzzz")],
+            current: 0,
+        });
+        assert!(app.repo_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_repo_field_not_at_index_zero_when_repo_suggestions_then_resolves_focused_field() {
+        // The focused field is resolved via `form.current`, not hardcoded to 0.
+        let mut app = test_app();
+        app.scanned_repos = vec!["~/foo".to_string()];
+        app.form = Some(Form {
+            kind: FormKind::Project,
+            title: "t",
+            fields: vec![
+                FormField {
+                    label: "name",
+                    value: "x".into(),
+                    optional: false,
+                },
+                repo_field("foo"),
+            ],
+            current: 1,
+        });
+        assert!(!app.repo_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_more_than_eight_matches_when_repo_suggestions_then_capped_at_eight() {
+        let mut app = test_app();
+        app.scanned_repos = (0..20).map(|i| format!("~/foo{i}")).collect();
+        app.form = Some(Form {
+            kind: FormKind::Project,
+            title: "t",
+            fields: vec![repo_field("foo")],
+            current: 0,
+        });
+        assert_eq!(app.repo_suggestions().len(), 8);
     }
 }
