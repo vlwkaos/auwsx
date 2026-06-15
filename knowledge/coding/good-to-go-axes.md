@@ -77,3 +77,23 @@ Guarded at runtime by the `ui/mod.rs` render-smoke tests (draw every view at
 normal + tiny size, no panic) and the `input.rs` map_key tests. A missing draw
 arm fails to compile (non-exhaustive match), but a missing footer arm or an
 orphan Action does NOT — so eyeball the produced/consumed sets on UI changes.
+
+## TUI theme single-source-of-truth
+
+All TUI colors live in `auwsx-tui/src/ui/theme.rs` as named semantic roles
+(`BORDER`, `TEXT`, `TEXT_DIM`, `HINT`, `ACCENT`, `OK`/`WARN`/`ERR`,
+`TREE_CONNECTOR`, `HIGHLIGHT_FG`) plus `border()`/`title()`/`dim()`/`hint()`/
+`highlight()` style helpers. NO inline `ratatui::style::Color::X` anywhere under
+`ui/` except `theme.rs` itself — inline colors are how the dim-hint and
+border-equals-content regressions crept in originally. Contrast invariant:
+`BORDER` must differ from `TEXT_DIM`/`HINT`/`TEXT` so chrome never collides with
+content.
+
+Check:
+```bash
+rg -n 'Color::' crates/auwsx-tui/src/ui/ -g '!theme.rs'   # any hit = FAIL
+```
+Guarded by `theme.rs` unit tests (the `BORDER != TEXT_DIM/HINT/TEXT` asserts),
+but a NEW inline `Color::` in another `ui/` file is NOT caught by any test or
+compiler check — only this grep catches it. The rule is also stated in
+`AGENTS.md`, but enforcement is manual: run the grep on any `ui/` change.

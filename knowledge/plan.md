@@ -4,7 +4,8 @@ Backlog only. One line per feature. No checklists.
 
 ## IN PROGRESS
 
-(none)
+### tui-theme-and-polish
+Central theme module (single source of truth for colors; fixes dim hint text + border/content collision); version in footer; git-repo fuzzy search in the New-project form. AGENTS.md rule bans inline `Color::` in `ui/`.
 
 ## TODO
 
