@@ -3,9 +3,9 @@ slug: cli-parse-grammar
 kind: coding
 title: auwsx hand-rolled CLI parse grammar + Parsed helper
 description: Conventions for the no-clap hand-rolled `parse`/`Parsed` CLI layer — flag grammar, opt_int optional-int contract, enum-flag idiom, and the Parsed::new behavior gotchas pinned by tests.
-keywords: [parse, Parsed, opt_int, hand-rolled CLI, no clap, flag grammar, last-wins, equals-form, CliAction, project add, completion_policy flag, from_str lowercase, i64 overflow]
+keywords: [parse, Parsed, opt_int, hand-rolled CLI, no clap, flag grammar, last-wins, equals-form, CliAction, arsenal, project add, completion_policy flag, from_str lowercase, i64 overflow]
 created: 2026-06-09
-modified: 2026-06-09
+modified: 2026-06-17
 ---
 
 # auwsx hand-rolled CLI parse grammar
@@ -62,6 +62,20 @@ create-override-coalesce-default in db-crud-conventions.md):
 All optional → `None` when absent (DB DEFAULT kept). `print_response`'s Project
 arm prints a `policy:` line (completion / plan_gate / completion_soft /
 concurrency) so `project get` / `ls` verify an override actually took.
+
+## `arsenal` global preset grammar
+
+Global Arsenal presets are daemon-owned convenience rows for reusable per-role
+agent command templates. The CLI parses these into IPC commands:
+
+| Command | IPC |
+|---------|-----|
+| `arsenal ls` / `arsenal list` | `Command::ListArsenalPresets` |
+| `arsenal set <name> --main <cmd> --plan <cmd> --work <cmd> [--review <cmd>]` | `Command::UpsertArsenalPreset` |
+
+`name`, `--main`, `--plan`, and `--work` are required at parse time. `--review`
+is optional and maps to `None` when absent. Blank string validation belongs to
+the DB/IPC boundary (`db::arsenal::upsert`), not to `parse`.
 
 ## Behavior gotchas (pinned by tests)
 

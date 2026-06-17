@@ -108,3 +108,22 @@ projects in parallel. Intra-project parallelism is a later concern.
 Triage auto-groups + promotes **APPROVED** backlog items into issues — no
 grouping gate. The human gate is at **backlog admission** (see
 domain/db-schema.md `backlog_items.source`+`approval`), not at grouping.
+Promoted backlog retains its `consumed_issue_id` link for history, but normal
+backlog listing returns only live, unpromoted items.
+
+Manual issue removal is daemon-owned, not direct SQL: it refuses while an agent
+is running, tears down the issue worktree if present, marks any source backlog
+row dismissed so deletion does not resurrect old work, then deletes the issue
+and cascading child rows.
+
+## User-facing lanes
+
+`IssueStatus` stays the detailed scheduler marker. UI boards group those details
+into four broad lanes:
+
+| Lane | Detailed statuses |
+|------|-------------------|
+| TODO | `CONSOLIDATING`, `PLANNING`, `PLANNED`, `PLAN_BLOCKED` |
+| IN PROGRESS | `IMPLEMENTING`, `NEEDS_FIX`, `COMPLETING`, `CONFLICTED`, `CONFLICT_BLOCKED` |
+| REVIEW | `REVIEW`, `REVIEW_BLOCKED`, `AUDIT`, `ENDED` |
+| COMPLETE | `DONE`, `ABSORBED`, `FAILED` |

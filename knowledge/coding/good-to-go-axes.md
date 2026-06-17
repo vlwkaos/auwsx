@@ -14,7 +14,8 @@ Every Rust enum that serializes into a `TEXT` column constrained by a SQL
 variant with no CHECK value is a write that fails only at runtime; a CHECK value
 with no variant is a row the loader can't parse.
 
-Pairs to keep in lockstep (`src/db/migrations/0001_init.sql` is source of truth):
+Pairs to keep in lockstep (`src/db/migrations/*.sql` CHECK constraints are the
+source of truth):
 
 | Rust | SQL column |
 |------|-----------|
@@ -29,12 +30,13 @@ Pairs to keep in lockstep (`src/db/migrations/0001_init.sql` is source of truth)
 | `db::findings::FindingStatus` (snake) | `findings.status` |
 | `db::agent_runs::Role` (snake) | `agent_runs.role` |
 | `agent::ExitKind` (snake) | `agent_runs.exit_kind` |
+| `db::ask_answers::AskMode` (snake) | `ask_answers.mode` |
 
-These enums use hand-rolled `as_str`/`from_str` (NOT serde) for the SQL bind,
-mirroring `IssueStatus`. `tests/crud.rs` proves parity at runtime with a
+These enums use hand-rolled `as_str` plus parser helpers (NOT serde) for the SQL
+bind, mirroring `IssueStatus`. `tests/crud.rs` proves parity at runtime with a
 positive-control insert per enum (a valid `as_str()` value must pass the CHECK)
-plus a `from_str(as_str()) == Some(v)` round-trip — so a drift fails a test, not
-just the diff below.
+plus an `as_str()` parser round-trip — so a drift fails a test, not just the
+diff below.
 
 Check:
 ```bash

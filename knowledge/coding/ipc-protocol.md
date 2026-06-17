@@ -15,6 +15,17 @@ surface, two clients: the agent control CLI (`auwsx issue ...`) and the human
 TUI hit the SAME daemon ops. Agent ops ⊆ human ops; IPC enforces per-caller
 (agent token vs TUI). Human override is first-class at every gate.
 
+Global config commands include `ListArsenalPresets` and
+`UpsertArsenalPreset`; Arsenal presets are reusable per-role agent command
+templates consumed by project forms and stored separately from project rows.
+
+Runtime-owned manual commands include `RunSchedulerOnce`, `RunIssueNow`,
+`RunBacklogNow`, `RunRoutineNow`, `RemoveIssue`, and `AskProject`. They require
+the daemon's `Scheduler` instance, not pure `dispatch`, because they touch
+running-agent guards, worktree cleanup, runtime queues, or subprocess execution.
+`ListAskAnswers` is pure dispatch: it reads the persisted project-level answer
+stack.
+
 ## Tagging gotcha (cost a debug cycle)
 
 An enum used as a JSON-lines wire reply with **newtype variants wrapping a
