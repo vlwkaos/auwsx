@@ -3,9 +3,9 @@ slug: ipc-protocol
 kind: coding
 title: auwsx IPC protocol (Unix-socket Command/Response/Event)
 description: The JSON-lines Unix-socket IPC between daemon and clients — the serde internal-vs-adjacent tagging gotcha and why, serve/request/EventStream transport, socket path resolution, and pure dispatch.
-keywords: [ipc.rs, Command Response Event, serde internal tagging tag kind, serde adjacent tagging content data, cannot serialize tagged newtype variant, JSON lines UnixListener, serve request EventStream, socket path AUWSX_SOCK XDG_RUNTIME_DIR, pure dispatch unit-testable, Notify shutdown SIGINT, agent token TUI caller scoping, ipc protocol]
+keywords: [ipc.rs, Command Response Event, serde internal tagging tag kind, serde adjacent tagging content data, cannot serialize tagged newtype variant, JSON lines UnixListener, serve request EventStream, AskProject ListAskAnswers AskAnswered, socket path AUWSX_SOCK XDG_RUNTIME_DIR, pure dispatch unit-testable, Notify shutdown SIGINT, agent token TUI caller scoping, ipc protocol]
 created: 2026-06-09
-modified: 2026-06-09
+modified: 2026-06-17
 ---
 
 # auwsx IPC protocol
@@ -23,8 +23,10 @@ Runtime-owned manual commands include `RunSchedulerOnce`, `RunIssueNow`,
 `RunBacklogNow`, `RunRoutineNow`, `RemoveIssue`, and `AskProject`. They require
 the daemon's `Scheduler` instance, not pure `dispatch`, because they touch
 running-agent guards, worktree cleanup, runtime queues, or subprocess execution.
-`ListAskAnswers` is pure dispatch: it reads the persisted project-level answer
-stack.
+`AskProject` snapshots project status, issues, live backlog, and routines, asks
+the configured main agent once in recall/seek mode, stores the answer, and emits
+`Event::AskAnswered`. `ListAskAnswers` is pure dispatch: it reads the persisted
+project-level answer stack.
 
 ## Tagging gotcha (cost a debug cycle)
 

@@ -1,6 +1,11 @@
 ---
 slug: good-to-go-axes
 kind: coding
+title: auwsx good-to-go axes
+description: Project-specific verification axes for auwsx changes, including enum/SQL parity, TUI action and view wiring, theme color constraints, and test-target coverage after API shape changes.
+keywords: [good-to-go axes, enum SQL CHECK parity, IssueStatus, AskMode, TUI action view exhaustiveness, render smoke tests, theme single source of truth, Color grep, cargo test no-run, struct signature change, test target coverage]
+created: 2026-06-09
+modified: 2026-06-17
 ---
 
 # auwsx good-to-go axes
@@ -99,3 +104,17 @@ Guarded by `theme.rs` unit tests (the `BORDER != TEXT_DIM/HINT/TEXT` asserts),
 but a NEW inline `Color::` in another `ui/` file is NOT caught by any test or
 compiler check — only this grep catches it. The rule is also stated in
 `AGENTS.md`, but enforcement is manual: run the grep on any `ui/` change.
+
+## Struct or enum shape changes must build tests
+
+`cargo build` does not compile test-only constructors. After changing a public
+test-constructed struct or IPC enum variant such as `NewProject` or
+`Command::AddProject`, run at least:
+
+```bash
+cargo test --package auwsx-core --package auwsx-tui --no-run
+```
+
+The failure pattern is Rust `E0063` in tests after adding a field that normal
+builds miss. Full `cargo test --package auwsx-core --package auwsx-tui` remains
+the preferred final check.

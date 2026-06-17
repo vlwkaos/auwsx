@@ -3,7 +3,7 @@ slug: cli-parse-grammar
 kind: coding
 title: auwsx hand-rolled CLI parse grammar + Parsed helper
 description: Conventions for the no-clap hand-rolled `parse`/`Parsed` CLI layer — flag grammar, opt_int optional-int contract, enum-flag idiom, and the Parsed::new behavior gotchas pinned by tests.
-keywords: [parse, Parsed, opt_int, hand-rolled CLI, no clap, flag grammar, last-wins, equals-form, CliAction, arsenal, project add, completion_policy flag, from_str lowercase, i64 overflow]
+keywords: [parse, Parsed, opt_int, hand-rolled CLI, no clap, flag grammar, last-wins, equals-form, CliAction, arsenal, ask command, project add, schedule flag, completion_policy flag, from_str lowercase, i64 overflow]
 created: 2026-06-09
 modified: 2026-06-17
 ---
@@ -58,6 +58,7 @@ create-override-coalesce-default in db-crud-conventions.md):
 | `--completion-policy <manual\|soft\|auto>` | `completion_policy` | enum |
 | `--plan-gate-timeout <int>` | `plan_gate_timeout_min` | `opt_int` |
 | `--completion-timeout <int>` | `completion_soft_timeout_min` | `opt_int` |
+| `--schedule <int>` | `schedule_interval_min` | `opt_int` |
 
 All optional → `None` when absent (DB DEFAULT kept). `print_response`'s Project
 arm prints a `policy:` line (completion / plan_gate / completion_soft /
@@ -76,6 +77,14 @@ agent command templates. The CLI parses these into IPC commands:
 `name`, `--main`, `--plan`, and `--work` are required at parse time. `--review`
 is optional and maps to `None` when absent. Blank string validation belongs to
 the DB/IPC boundary (`db::arsenal::upsert`), not to `parse`.
+
+## `ask` project question grammar
+
+`ask <project_id> [--mode recall|seek] <question...>` maps to
+`Command::AskProject`. Mode defaults at the command layer when absent; accepted
+mode strings are the exact SQL enum values `recall` and `seek`. The remaining
+argv tokens are joined into one question string, so parsing stays deterministic
+without shell quoting rules beyond normal argv construction.
 
 ## Behavior gotchas (pinned by tests)
 

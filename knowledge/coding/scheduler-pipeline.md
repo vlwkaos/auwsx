@@ -3,9 +3,9 @@ slug: scheduler-pipeline
 kind: coding
 title: autonomy loop — scheduler + pipeline via ports & adapters
 description: How the daemon drives an issue through phases autonomously — pure plan_phase/decide domain, effectful pipeline::execute + Scheduler runtime, agent callback over the socket, all infra isolated behind Clock/AgentExecutor/Worktrees ports for deterministic drive-loop tests.
-keywords: [scheduler, pipeline, ports and adapters, hexagonal, Clock SystemClock, AgentExecutor SubprocessExecutor, Worktrees WsxWorktrees, plan_phase, scheduler decide, Spawn SoftGate Teardown, soft_gate_due, tick_project, spawn_phase running set, pipeline execute AgentSpec, agent callback AUWSX_SOCK AUWSX_ISSUE_ID, daemon wiring stop Notify, drive loop test FixedClock ScriptedAgent, max_concurrency, spawn_blocking wsx-core, autonomy loop how does the daemon drive an issue]
+keywords: [scheduler, pipeline, ports and adapters, hexagonal, Clock SystemClock, AgentExecutor SubprocessExecutor, Worktrees WsxWorktrees, plan_phase, scheduler decide, Spawn SoftGate Teardown, soft_gate_due, project_due_for_auto_tick, schedule_interval_min, AUWSX_TICK_SECS, tick_project, spawn_phase running set, pipeline execute AgentSpec, agent callback AUWSX_SOCK AUWSX_ISSUE_ID, daemon wiring stop Notify, ask_project, drive loop test FixedClock ScriptedAgent, max_concurrency, spawn_blocking wsx-core, autonomy loop how does the daemon drive an issue]
 created: 2026-06-09
-modified: 2026-06-09
+modified: 2026-06-17
 ---
 
 # autonomy loop: scheduler + pipeline
@@ -65,6 +65,25 @@ its own `.auwsx/` artifacts in the worktree).
 - `join_inflight` (drain, used by tests) / `prune_inflight` (drop finished
   handles so the Vec doesn't grow).
 - `run(shutdown)` — ticks all projects every `tick_interval`.
+
+## Project auto-tick cadence
+
+`projects.schedule_interval_min` controls whether the daemon evaluates a project
+on the global loop:
+
+| Value | Meaning |
+|-------|---------|
+| NULL | manual only; no auto-tick, only explicit scheduler IPC commands |
+| `<= 0` | due on every global daemon loop |
+| `n > 0` | due when `now - last_auto_tick >= n * 60_000` |
+
+The global loop cadence is `AUWSX_TICK_SECS` with default 10 seconds and a
+minimum of 1 second. A due tick only evaluates scheduler decisions; it spawns an
+agent only when work is actionable and `max_concurrency` has capacity.
+
+`Scheduler::ask_project` is a runtime-owned side path: it gathers project
+context, executes the configured main agent once, persists `ask_answers`, and
+emits an answer event. It does not mutate issue status or scheduler cadence.
 
 ## Agent callback contract
 

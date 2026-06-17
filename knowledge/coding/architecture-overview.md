@@ -3,9 +3,9 @@ slug: architecture-overview
 kind: coding
 title: auwsx architecture overview (daemon + thin clients)
 description: System architecture — a long-lived daemon owns SQLite, scheduler, pipeline, subprocess agent runners, IPC, inbox, and routines; thin clients (CLI/TUI/web) talk over a Unix socket; wsx-core consumed as a path dep.
-keywords: [daemon owns sqlite scheduler pipeline runners ipc, thin clients unix socket, auwsx daemon, control CLI agent vs TUI, wsx-core path dependency, two execution lanes issues routines, main queue main_jobs, skills injection inline per phase, routines report idea knowledge, status as sync marker, subprocess agent not tmux, architecture overview]
+keywords: [daemon owns sqlite scheduler pipeline runners ipc, thin clients unix socket, auwsx daemon, control CLI agent vs TUI, ask mode, wsx-core path dependency, two execution lanes issues routines, main queue main_jobs, skills injection inline per phase, routines report idea knowledge, status as sync marker, subprocess agent not tmux, macOS Application Support state db, architecture overview]
 created: 2026-06-09
-modified: 2026-06-09
+modified: 2026-06-17
 ---
 
 # auwsx architecture overview
@@ -28,10 +28,10 @@ Cargo.toml references in lockstep.
 
 A long-lived **`auwsx daemon`** owns: SQLite, the scheduler, the pipeline, the
 **direct-subprocess** agent runners, IPC, the file-watch inbox, routines, and the
-notification emitter. Front-ends (CLI, TUI v0.1, web v0.2) are **thin clients** —
+notification emitter. Front-ends (CLI, TUI v0.1, web v0.2) are **thin clients**:
 observers + command issuers over a JSON-lines Unix socket (see
-coding/ipc-protocol.md). One command surface, two callers (agent control CLI vs
-human TUI), scoped per-caller.
+coding/ipc-protocol.md). One command surface serves agent control, human TUI
+actions, and project ask/Q&A.
 
 The daemon now runs an **autonomous scheduler + pipeline**, not just IPC: it
 ticks each project, drives actionable issues through their phases by spawning
@@ -77,7 +77,10 @@ deepsleep) gated on `ir` presence with graceful degrade.
 
 ## Filesystem state (outside repo)
 
-`~/.local/share/auwsx/state.db`, `~/.auwsx/inbox/`, `<worktree>/.auwsx/`.
+State DB path resolves through `directories::ProjectDirs`: on macOS the default
+is `~/Library/Application Support/auwsx/state.db`; non-macOS fallback remains
+under the local data dir. Override with `AUWSX_DB_PATH`. Other state:
+`~/.auwsx/inbox/`, `<worktree>/.auwsx/`, and run logs under `AUWSX_DATA_DIR`.
 
 ## Historical note (2026-06-04, SUPERSEDED)
 

@@ -3,9 +3,9 @@ slug: agent-subprocess-runner
 kind: coding
 title: auwsx agent subprocess runner (direct tokio::process, no tmux)
 description: The agent runner — a direct tokio::process child auwsx owns (no tmux, no trait), with build_argv {prompt}-or-stdin substitution, timeout kill+reap, ExitKind classification, spawn-fail-as-Error-outcome, and per-agent DEFAULT_CMD templates.
-keywords: [agent run AgentSpec AgentOutcome, tokio process child, no tmux no trait, build_argv prompt substitution, prompt to stdin opencode, no shell no injection, timeout start_kill reap kill_on_drop, ExitKind Exited Killed Timeout Error, spawn failure Ok Error outcome, DEFAULT_CMD claude codex opencode, combined stdout stderr log_path, agent subprocess runner]
+keywords: [agent run AgentSpec AgentOutcome, tokio process child, no tmux no trait, build_argv prompt substitution, prompt to stdin opencode, no shell no injection, timeout start_kill reap kill_on_drop, ExitKind Exited Killed Timeout Error, spawn failure Ok Error outcome, DEFAULT_CMD claude codex opencode, ask mode main agent, combined stdout stderr log_path, agent subprocess runner]
 created: 2026-06-09
-modified: 2026-06-09
+modified: 2026-06-17
 ---
 
 # auwsx agent subprocess runner
@@ -54,6 +54,11 @@ classified outcome.
 `{claude,codex,opencode}.rs` are reduced to `NAME` + `DEFAULT_CMD` template
 constants. claude/codex use `{prompt}`; opencode uses stdin (no `{prompt}`
 token). agent_runs records role/phase/exit_kind/log_path/timestamps per run.
+
+One-shot project ask mode reuses the same subprocess execution path and the
+project's configured main-agent command. It is not an issue phase, so it stores
+answers in `ask_answers` rather than `agent_runs`, while still keeping a log path
+for operator inspection.
 
 ## Test notes
 

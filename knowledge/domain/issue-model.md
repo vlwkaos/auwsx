@@ -5,7 +5,7 @@ title: auwsx issue pipeline model (IssueStatus state machine)
 description: The per-project issue pipeline — 16 IssueStatus states, 3 scheduler classes, 37 transitions, status-as-sync-marker, and the soft-gate/working-phase/absorbed/failed rules that drive the daemon scheduler.
 keywords: [IssueStatus, scheduler class, state machine, ACTIONABLE HUMAN_GATED TERMINAL, status as synchronization marker, is_soft_gated, accepts_steering, is_working_phase, ABSORBED, FAILED, check_transition, CONSOLIDATING, PLANNING, IMPLEMENTING, REVIEW NEEDS_FIX loop, CONFLICTED, COMPLETING, completion policy, soft gate timeout, wait_until, crash resume, issue pipeline]
 created: 2026-06-09
-modified: 2026-06-09
+modified: 2026-06-17
 ---
 
 # auwsx issue model
@@ -127,3 +127,8 @@ into four broad lanes:
 | IN PROGRESS | `IMPLEMENTING`, `NEEDS_FIX`, `COMPLETING`, `CONFLICTED`, `CONFLICT_BLOCKED` |
 | REVIEW | `REVIEW`, `REVIEW_BLOCKED`, `AUDIT`, `ENDED` |
 | COMPLETE | `DONE`, `ABSORBED`, `FAILED` |
+
+TUI boards keep lane order fixed as TODO, IN PROGRESS, REVIEW, COMPLETE. Issue
+rows sort by id ascending inside each lane, so older work appears first. Backlog
+items render before issue rows in TODO; backlog ordering currently follows the
+daemon-return order unless a future board-specific sort is added.
