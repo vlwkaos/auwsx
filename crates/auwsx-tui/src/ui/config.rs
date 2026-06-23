@@ -24,11 +24,11 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         kv("Repository", p.repo_path.clone()),
         kv("Default branch", p.default_branch.clone()),
         sep(),
-        kv("Main agent", p.main_agent_cmd.clone()),
-        kv("Plan agent", p.plan_agent_cmd.clone()),
-        kv("Work agent", p.work_agent_cmd.clone()),
+        kv("Main command", p.main_agent_cmd.clone()),
+        kv("Plan command", p.plan_agent_cmd.clone()),
+        kv("Work command", p.work_agent_cmd.clone()),
         kv(
-            "Review agent",
+            "Review command",
             p.review_agent_cmd
                 .clone()
                 .unwrap_or_else(|| "(falls back to work)".into()),
@@ -38,9 +38,12 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             "Completion policy",
             p.completion_policy.as_str().to_string(),
         ),
-        kv("Plan gate", format!("{} min", p.plan_gate_timeout_min)),
         kv(
-            "Completion gate",
+            "Plan gate timeout",
+            format!("{} min", p.plan_gate_timeout_min),
+        ),
+        kv(
+            "Completion timeout",
             format!("{} min", p.completion_soft_timeout_min),
         ),
         kv(
@@ -55,7 +58,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         kv("Conflict attempts", p.conflict_max_attempts.to_string()),
         kv("Concurrency", p.max_concurrency.to_string()),
         kv(
-            "Schedule minutes",
+            "Schedule interval",
             p.schedule_interval_min
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "(manual)".into()),
@@ -65,7 +68,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             "Skills path",
             p.skill_path.clone().unwrap_or_else(|| "(none)".into()),
         ),
-        kv("Deepsleep days", p.deepsleep_interval_days.to_string()),
+        kv("Deepsleep interval", p.deepsleep_interval_days.to_string()),
     ];
 
     frame.render_widget(

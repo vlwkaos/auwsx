@@ -253,10 +253,10 @@ impl Form {
                 project_field("name", "Name", "", false),
                 project_field("repo_path", "Repository", &repo, false),
                 project_field("branch", "Default branch", "main", false),
-                project_field("main_cmd", "Main agent", &codex, false),
-                project_field("plan_cmd", "Plan agent", &codex, false),
-                project_field("work_cmd", "Work agent", &codex, false),
-                project_field("review_cmd", "Review agent", &codex, true),
+                project_field("main_cmd", "Main command", &codex, false),
+                project_field("plan_cmd", "Plan command", &codex, false),
+                project_field("work_cmd", "Work command", &codex, false),
+                project_field("review_cmd", "Review command", &codex, true),
             ],
             current: 0,
         }
@@ -270,12 +270,12 @@ impl Form {
                 project_field("name", "Name", &project.name, false),
                 project_field("repo_path", "Repository", &project.repo_path, false),
                 project_field("branch", "Default branch", &project.default_branch, false),
-                project_field("main_cmd", "Main agent", &project.main_agent_cmd, false),
-                project_field("plan_cmd", "Plan agent", &project.plan_agent_cmd, false),
-                project_field("work_cmd", "Work agent", &project.work_agent_cmd, false),
+                project_field("main_cmd", "Main command", &project.main_agent_cmd, false),
+                project_field("plan_cmd", "Plan command", &project.plan_agent_cmd, false),
+                project_field("work_cmd", "Work command", &project.work_agent_cmd, false),
                 project_field(
                     "review_cmd",
-                    "Review agent",
+                    "Review command",
                     project.review_agent_cmd.as_deref().unwrap_or(""),
                     true,
                 ),
@@ -287,13 +287,13 @@ impl Form {
                 ),
                 project_field(
                     "plan_gate",
-                    "Plan gate",
+                    "Plan gate timeout",
                     &project.plan_gate_timeout_min.to_string(),
                     false,
                 ),
                 project_field(
                     "complete_gate",
-                    "Completion gate",
+                    "Completion timeout",
                     &project.completion_soft_timeout_min.to_string(),
                     false,
                 ),
@@ -329,7 +329,7 @@ impl Form {
                 ),
                 project_field(
                     "schedule_min",
-                    "Schedule minutes",
+                    "Schedule interval",
                     &project
                         .schedule_interval_min
                         .map(|v| v.to_string())
@@ -350,7 +350,7 @@ impl Form {
                 ),
                 project_field(
                     "deepsleep_days",
-                    "Deepsleep days",
+                    "Deepsleep interval",
                     &project.deepsleep_interval_days.to_string(),
                     false,
                 ),
@@ -519,14 +519,30 @@ fn parse_bool(form: &Form, label: &'static str, status: &mut String) -> Option<b
     }
 }
 
-fn parse_routine_type(form: &Form, status: &mut String) -> Option<RoutineType> {
-    match RoutineType::from_str(&form.get("type")) {
+fn parse_choice<T>(
+    form: &Form,
+    label: &'static str,
+    expected: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+    status: &mut String,
+) -> Option<T> {
+    match parse(&form.get(label)) {
         Some(value) => Some(value),
         None => {
-            *status = "type must be report, idea, or knowledge".into();
+            *status = format!("{} must be {expected}", form.label_for(label));
             None
         }
     }
+}
+
+fn parse_routine_type(form: &Form, status: &mut String) -> Option<RoutineType> {
+    parse_choice(
+        form,
+        "type",
+        "report, idea, or knowledge",
+        RoutineType::from_str,
+        status,
+    )
 }
 
 pub struct App {
@@ -1342,9 +1358,13 @@ impl App {
                     self.status = "select a project first".into();
                     return Ok(());
                 };
-                let Some(completion_policy) = CompletionPolicy::from_str(&form.get("completion"))
-                else {
-                    self.status = "completion must be manual, soft, or auto".into();
+                let Some(completion_policy) = parse_choice(
+                    &form,
+                    "completion",
+                    "manual, soft, or auto",
+                    CompletionPolicy::from_str,
+                    &mut self.status,
+                ) else {
                     return Ok(());
                 };
                 let Some(plan_gate_timeout_min) = parse_i64(&form, "plan_gate", &mut self.status)
@@ -1384,8 +1404,13 @@ impl App {
                 else {
                     return Ok(());
                 };
-                let Some(merge_mode) = MergeMode::from_str(&form.get("merge_mode")) else {
-                    self.status = "merge_mode must be local or pr".into();
+                let Some(merge_mode) = parse_choice(
+                    &form,
+                    "merge_mode",
+                    "local or pr",
+                    MergeMode::from_str,
+                    &mut self.status,
+                ) else {
                     return Ok(());
                 };
                 let Some(deepsleep_interval_days) =
@@ -1915,6 +1940,114 @@ mod tests {
         let mut sel = 0usize;
         step(&mut sel, 1, 0);
         assert_eq!(sel, 0);
+    }
+
+    // --- project config validation ---------------------------------------
+
+    fn test_project() -> Project {
+        Project {
+            id: 42,
+            name: "demo".into(),
+            repo_path: "/repo".into(),
+            default_branch: "main".into(),
+            main_agent_cmd: "main-agent".into(),
+            plan_agent_cmd: "plan-agent".into(),
+            work_agent_cmd: "work-agent".into(),
+            review_agent_cmd: Some("review-agent".into()),
+            completion_policy: CompletionPolicy::Manual,
+            completion_soft_timeout_min: 30,
+            plan_gate_timeout_min: 10,
+            iteration_timeout_min: 60,
+            main_job_timeout_min: 120,
+            review_max_rounds: 2,
+            conflict_max_attempts: 3,
+            max_concurrency: 4,
+            schedule_interval_min: Some(15),
+            merge_mode: MergeMode::Local,
+            skill_path: Some("skills".into()),
+            deepsleep_interval_days: 7,
+            last_deepsleep_at: None,
+            created_at: 1,
+        }
+    }
+
+    fn optional_test_field(key: &'static str, label: &'static str, value: &str) -> FormField {
+        FormField {
+            key,
+            label,
+            value: value.into(),
+            optional: true,
+        }
+    }
+
+    fn project_config_form_with(key: &'static str, value: &str) -> Form {
+        let mut form = Form {
+            kind: FormKind::ProjectConfig,
+            title: "Project config",
+            fields: vec![
+                test_field("name", "Name", "demo"),
+                test_field("repo_path", "Repository", "/repo"),
+                test_field("branch", "Default branch", "main"),
+                test_field("main_cmd", "Main command", "main-agent"),
+                test_field("plan_cmd", "Plan command", "plan-agent"),
+                test_field("work_cmd", "Work command", "work-agent"),
+                optional_test_field("review_cmd", "Review command", "review-agent"),
+                test_field("completion", "Completion policy", "manual"),
+                test_field("plan_gate", "Plan gate timeout", "10"),
+                test_field("complete_gate", "Completion timeout", "30"),
+                test_field("iter_timeout", "Iteration timeout", "60"),
+                test_field("main_job_timeout", "Main job timeout", "120"),
+                test_field("review_rounds", "Review rounds", "2"),
+                test_field("conflict_attempts", "Conflict attempts", "3"),
+                test_field("concurrency", "Concurrency", "4"),
+                optional_test_field("schedule_min", "Schedule interval", "15"),
+                test_field("merge_mode", "Merge mode", "local"),
+                optional_test_field("skill_path", "Skills path", "skills"),
+                test_field("deepsleep_days", "Deepsleep interval", "7"),
+            ],
+            current: 0,
+        };
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == key)
+            .expect("test field exists")
+            .value = value.into();
+        form
+    }
+
+    async fn submitted_project_config_with(key: &'static str, value: &str) -> App {
+        let mut app = App::new(std::path::PathBuf::from(
+            "target/nonexistent-auwsx-test.sock",
+        ));
+        app.projects = vec![test_project()];
+        app.form = Some(project_config_form_with(key, value));
+        app.submit_form().await.unwrap();
+        app
+    }
+
+    #[tokio::test]
+    async fn given_invalid_completion_policy_when_submitting_project_config_then_status_uses_label()
+    {
+        let app = submitted_project_config_with("completion", "sometimes").await;
+
+        assert_eq!(
+            app.status,
+            "Completion policy must be manual, soft, or auto"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_invalid_merge_mode_when_submitting_project_config_then_status_uses_label() {
+        let app = submitted_project_config_with("merge_mode", "squash").await;
+
+        assert_eq!(app.status, "Merge mode must be local or pr");
+    }
+
+    #[tokio::test]
+    async fn given_invalid_project_config_choice_when_submitting_then_form_stays_open() {
+        let app = submitted_project_config_with("completion", "sometimes").await;
+
+        assert!(app.form.is_some());
     }
 
     // --- App::repo_suggestions -------------------------------------------

@@ -104,10 +104,11 @@ fn draw_form(frame: &mut Frame, app: &App) {
                 },
             ),
         ]));
+    }
 
-        if idx == form.current && field.key == "repo_path" && !suggestions.is_empty() {
-            push_repo_suggestions(&mut lines, &suggestions);
-        }
+    if !suggestions.is_empty() {
+        lines.push(Line::raw(""));
+        push_repo_suggestions(&mut lines, &suggestions);
     }
 
     lines.push(Line::raw(""));
@@ -136,7 +137,7 @@ fn active_form_value(field: &FormField) -> String {
 
 fn push_repo_suggestions(lines: &mut Vec<Line<'static>>, suggestions: &[String]) {
     lines.push(Line::from(Span::styled(
-        "    found repos (Tab fills top):",
+        "    repository suggestions (Tab fills top):",
         theme::dim(),
     )));
     for repo in suggestions {
@@ -325,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn given_focused_repo_field_with_suggestions_when_drawn_then_suggestion_precedes_next_field() {
+    fn given_focused_repo_field_with_suggestions_when_drawn_then_suggestion_follows_fields() {
         let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
         app.scanned_repos = vec!["~/foo".to_string()];
         app.form = Some(Form {
@@ -339,7 +340,12 @@ mod tests {
         });
         assert!(appears_in_order(
             &rendered_app(&app),
-            &["Repository", "found repos", "~/foo", "Default branch"],
+            &[
+                "Repository",
+                "Default branch",
+                "repository suggestions",
+                "~/foo",
+            ],
         ));
     }
 }

@@ -10,6 +10,7 @@ Read the design plan at `~/.claude/plans/current-wsx-is-agent-cosmic-gadget.md` 
 
 ```bash
 cargo build --workspace             # NOT before /sec on dep set
+cargo fmt -p auwsx-core -p auwsx-tui -p auwsx-web
 cargo run --bin auwsx               # default = TUI (auto-starts daemon if none running)
 cargo run --bin auwsx -- daemon     # start daemon explicitly
 ```
