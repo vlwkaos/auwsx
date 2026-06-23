@@ -1976,6 +1976,7 @@ mod tests {
             key,
             label,
             value: value.into(),
+            cursor: value.chars().count(),
             optional: true,
         }
     }

@@ -104,11 +104,9 @@ fn draw_form(frame: &mut Frame, app: &App) {
                 },
             ),
         ]));
-    }
-
-    if !suggestions.is_empty() {
-        lines.push(Line::raw(""));
-        push_repo_suggestions(&mut lines, &suggestions);
+        if idx == form.current && field.key == "repo_path" && !suggestions.is_empty() {
+            push_repo_suggestions(&mut lines, &suggestions);
+        }
     }
 
     lines.push(Line::raw(""));
@@ -326,25 +324,43 @@ mod tests {
     }
 
     #[test]
-    fn given_focused_repo_field_with_suggestions_when_drawn_then_suggestion_follows_fields() {
-        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+    fn given_focused_repo_field_with_suggestions_when_drawn_then_suggestion_stays_near_field() {
+        let mut app = App::new(std::path::PathBuf::from("target/nonexistent.sock"));
         app.scanned_repos = vec!["~/foo".to_string()];
         app.form = Some(Form {
-            kind: FormKind::Project,
-            title: "t",
+            kind: FormKind::ProjectConfig,
+            title: "Project config",
             fields: vec![
+                test_field("name", "Name", "auwsx"),
                 test_field("repo_path", "Repository", "foo"),
                 test_field("branch", "Default branch", "main"),
+                test_field("main_cmd", "Main command", "codex"),
+                test_field("plan_cmd", "Plan command", "codex"),
+                test_field("work_cmd", "Work command", "codex"),
+                test_field("review_cmd", "Review command", "codex"),
+                test_field("completion", "Completion policy", "manual"),
+                test_field("plan_gate", "Plan gate timeout", "0"),
+                test_field("complete_gate", "Completion timeout", "0"),
+                test_field("iter_timeout", "Iteration timeout", "60"),
+                test_field("main_job_timeout", "Main job timeout", "60"),
+                test_field("review_rounds", "Review rounds", "1"),
+                test_field("conflict_attempts", "Conflict attempts", "1"),
+                test_field("concurrency", "Concurrency", "1"),
+                test_field("schedule_min", "Schedule interval", "0"),
+                test_field("merge_mode", "Merge mode", "manual"),
+                test_field("skill_path", "Skills path", ""),
+                test_field("deepsleep_days", "Deepsleep interval", "7"),
             ],
-            current: 0,
+            current: 1,
         });
         assert!(appears_in_order(
             &rendered_app(&app),
             &[
                 "Repository",
-                "Default branch",
                 "repository suggestions",
                 "~/foo",
+                "Default branch",
+                "Deepsleep interval",
             ],
         ));
     }

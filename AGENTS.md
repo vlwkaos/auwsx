@@ -51,3 +51,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - No AI attribution in commits or PRs.
 
 - Uncertain about project term/schema/convention/prior decision → `/seek <topic>` first (lightweight KB lookup; same tier as grep/Glob).
+
+## Command Notes
+
+- Finding adjudication needs the literal finding id when `$AUWSX_FINDING_ID` is unset: `"$AUWSX_BIN" finding accept 2 "<how you'll fix>"`
