@@ -69,11 +69,11 @@ fn draw_form(frame: &mut Frame, app: &App) {
     let Some(form) = app.form.as_ref() else {
         return;
     };
-    // Git-repo completions, shown only when the cursor is on the repo_path field.
+    // Git-repo completions, shown only when the cursor is on the repository field.
     let suggestions = app.repo_suggestions();
     let extra = suggestions.len() as u16 + if suggestions.is_empty() { 0 } else { 1 };
     let area = centered_rect(
-        74,
+        84,
         form_height(form.fields.len() as u16, extra),
         frame.area(),
     );
@@ -92,7 +92,7 @@ fn draw_form(frame: &mut Frame, app: &App) {
         };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{marker} {:>12}{optional}: ", field.label),
+                format!("{marker} {:>18}{optional}: ", field.label),
                 theme::dim(),
             ),
             Span::styled(
@@ -104,19 +104,9 @@ fn draw_form(frame: &mut Frame, app: &App) {
                 },
             ),
         ]));
-    }
 
-    // Repo completions block (Tab on the field accepts the top match).
-    if !suggestions.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  found repos (Tab fills top):",
-            theme::dim(),
-        )));
-        for repo in &suggestions {
-            lines.push(Line::from(vec![
-                Span::styled("    • ", Style::default().fg(theme::TREE_CONNECTOR)),
-                Span::styled(repo.clone(), Style::default().fg(theme::TEXT)),
-            ]));
+        if idx == form.current && field.key == "repo_path" && !suggestions.is_empty() {
+            push_repo_suggestions(&mut lines, &suggestions);
         }
     }
 
@@ -142,6 +132,19 @@ fn active_form_value(field: &FormField) -> String {
     let mut value = field.value.clone();
     value.insert(field.cursor_byte_index(), '_');
     value
+}
+
+fn push_repo_suggestions(lines: &mut Vec<Line<'static>>, suggestions: &[String]) {
+    lines.push(Line::from(Span::styled(
+        "    found repos (Tab fills top):",
+        theme::dim(),
+    )));
+    for repo in suggestions {
+        lines.push(Line::from(vec![
+            Span::styled("      • ", Style::default().fg(theme::TREE_CONNECTOR)),
+            Span::styled(repo.clone(), Style::default().fg(theme::TEXT)),
+        ]));
+    }
 }
 
 fn form_height(field_count: u16, extra: u16) -> u16 {
@@ -192,7 +195,7 @@ pub(crate) fn render_list(
 
 #[cfg(test)]
 mod tests {
-    use crate::app::{App, FormField, View};
+    use crate::app::{App, Form, FormField, FormKind, View};
     use crate::ui::draw;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -214,6 +217,38 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    fn rendered_app(app: &App) -> String {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn test_field(key: &'static str, label: &'static str, value: &str) -> FormField {
+        FormField {
+            key,
+            label,
+            value: value.into(),
+            cursor: value.chars().count(),
+            optional: false,
+        }
+    }
+
+    fn appears_in_order(rendered: &str, needles: &[&str]) -> bool {
+        let mut offset = 0;
+        for needle in needles {
+            let Some(found) = rendered[offset..].find(needle) else {
+                return false;
+            };
+            offset += found + needle.len();
+        }
+        true
     }
 
     #[test]
@@ -279,6 +314,7 @@ mod tests {
     #[test]
     fn active_form_value_renders_cursor_at_stored_char_position() {
         let field = FormField {
+            key: "text",
             label: "text",
             value: "abé".to_string(),
             cursor: 2,
@@ -286,5 +322,24 @@ mod tests {
         };
 
         assert_eq!(super::active_form_value(&field), "ab_é");
+    }
+
+    #[test]
+    fn given_focused_repo_field_with_suggestions_when_drawn_then_suggestion_precedes_next_field() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.scanned_repos = vec!["~/foo".to_string()];
+        app.form = Some(Form {
+            kind: FormKind::Project,
+            title: "t",
+            fields: vec![
+                test_field("repo_path", "Repository", "foo"),
+                test_field("branch", "Default branch", "main"),
+            ],
+            current: 0,
+        });
+        assert!(appears_in_order(
+            &rendered_app(&app),
+            &["Repository", "found repos", "~/foo", "Default branch"],
+        ));
     }
 }

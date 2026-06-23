@@ -145,6 +145,7 @@ pub struct Form {
 
 #[derive(Debug, Clone)]
 pub struct FormField {
+    pub key: &'static str,
     pub label: &'static str,
     pub value: String,
     pub cursor: usize,
@@ -152,8 +153,9 @@ pub struct FormField {
 }
 
 impl FormField {
-    fn new(label: &'static str, value: &str, optional: bool) -> Self {
+    fn new(key: &'static str, label: &'static str, value: &str, optional: bool) -> Self {
         Self {
+            key,
             label,
             value: value.to_string(),
             cursor: value.chars().count(),
@@ -248,13 +250,13 @@ impl Form {
             kind: FormKind::Project,
             title: "New project",
             fields: vec![
-                field("name", "", false),
-                field("repo_path", &repo, false),
-                field("branch", "main", false),
-                field("main_cmd", &codex, false),
-                field("plan_cmd", &codex, false),
-                field("work_cmd", &codex, false),
-                field("review_cmd", &codex, true),
+                project_field("name", "Name", "", false),
+                project_field("repo_path", "Repository", &repo, false),
+                project_field("branch", "Default branch", "main", false),
+                project_field("main_cmd", "Main agent", &codex, false),
+                project_field("plan_cmd", "Plan agent", &codex, false),
+                project_field("work_cmd", "Work agent", &codex, false),
+                project_field("review_cmd", "Review agent", &codex, true),
             ],
             current: 0,
         }
@@ -265,65 +267,90 @@ impl Form {
             kind: FormKind::ProjectConfig,
             title: "Project config",
             fields: vec![
-                field("name", &project.name, false),
-                field("repo_path", &project.repo_path, false),
-                field("branch", &project.default_branch, false),
-                field("main_cmd", &project.main_agent_cmd, false),
-                field("plan_cmd", &project.plan_agent_cmd, false),
-                field("work_cmd", &project.work_agent_cmd, false),
-                field(
+                project_field("name", "Name", &project.name, false),
+                project_field("repo_path", "Repository", &project.repo_path, false),
+                project_field("branch", "Default branch", &project.default_branch, false),
+                project_field("main_cmd", "Main agent", &project.main_agent_cmd, false),
+                project_field("plan_cmd", "Plan agent", &project.plan_agent_cmd, false),
+                project_field("work_cmd", "Work agent", &project.work_agent_cmd, false),
+                project_field(
                     "review_cmd",
+                    "Review agent",
                     project.review_agent_cmd.as_deref().unwrap_or(""),
                     true,
                 ),
-                field("completion", project.completion_policy.as_str(), false),
-                field(
+                project_field(
+                    "completion",
+                    "Completion policy",
+                    project.completion_policy.as_str(),
+                    false,
+                ),
+                project_field(
                     "plan_gate",
+                    "Plan gate",
                     &project.plan_gate_timeout_min.to_string(),
                     false,
                 ),
-                field(
+                project_field(
                     "complete_gate",
+                    "Completion gate",
                     &project.completion_soft_timeout_min.to_string(),
                     false,
                 ),
-                field(
+                project_field(
                     "iter_timeout",
+                    "Iteration timeout",
                     &project.iteration_timeout_min.to_string(),
                     false,
                 ),
-                field(
+                project_field(
                     "main_job_timeout",
+                    "Main job timeout",
                     &project.main_job_timeout_min.to_string(),
                     false,
                 ),
-                field(
+                project_field(
                     "review_rounds",
+                    "Review rounds",
                     &project.review_max_rounds.to_string(),
                     false,
                 ),
-                field(
+                project_field(
                     "conflict_attempts",
+                    "Conflict attempts",
                     &project.conflict_max_attempts.to_string(),
                     false,
                 ),
-                field("concurrency", &project.max_concurrency.to_string(), false),
-                field(
+                project_field(
+                    "concurrency",
+                    "Concurrency",
+                    &project.max_concurrency.to_string(),
+                    false,
+                ),
+                project_field(
                     "schedule_min",
+                    "Schedule minutes",
                     &project
                         .schedule_interval_min
                         .map(|v| v.to_string())
                         .unwrap_or_default(),
                     true,
                 ),
-                field("merge_mode", project.merge_mode.as_str(), false),
-                field(
+                project_field(
+                    "merge_mode",
+                    "Merge mode",
+                    project.merge_mode.as_str(),
+                    false,
+                ),
+                project_field(
                     "skill_path",
+                    "Skills path",
                     project.skill_path.as_deref().unwrap_or(""),
                     true,
                 ),
-                field(
+                project_field(
                     "deepsleep_days",
+                    "Deepsleep days",
                     &project.deepsleep_interval_days.to_string(),
                     false,
                 ),
@@ -423,7 +450,7 @@ impl Form {
     fn get(&self, label: &str) -> String {
         self.fields
             .iter()
-            .find(|f| f.label == label)
+            .find(|f| f.key == label)
             .map(|f| f.value.trim().to_string())
             .unwrap_or_default()
     }
@@ -439,17 +466,29 @@ impl Form {
             .find(|f| !f.optional && f.value.trim().is_empty())
             .map(|f| f.label)
     }
+
+    fn label_for<'a>(&'a self, key: &'a str) -> &'a str {
+        self.fields
+            .iter()
+            .find(|f| f.key == key)
+            .map(|f| f.label)
+            .unwrap_or(key)
+    }
 }
 
 fn field(label: &'static str, value: &str, optional: bool) -> FormField {
-    FormField::new(label, value, optional)
+    FormField::new(label, label, value, optional)
+}
+
+fn project_field(key: &'static str, label: &'static str, value: &str, optional: bool) -> FormField {
+    FormField::new(key, label, value, optional)
 }
 
 fn parse_i64(form: &Form, label: &'static str, status: &mut String) -> Option<i64> {
     match form.get(label).parse::<i64>() {
         Ok(value) => Some(value),
         Err(_) => {
-            *status = format!("{label} must be an integer");
+            *status = format!("{} must be an integer", form.label_for(label));
             None
         }
     }
@@ -463,7 +502,7 @@ fn parse_opt_i64(form: &Form, label: &'static str, status: &mut String) -> Optio
     match raw.parse::<i64>() {
         Ok(value) => Some(Some(value)),
         Err(_) => {
-            *status = format!("{label} must be blank or an integer");
+            *status = format!("{} must be blank or an integer", form.label_for(label));
             None
         }
     }
@@ -474,7 +513,7 @@ fn parse_bool(form: &Form, label: &'static str, status: &mut String) -> Option<b
         "true" | "yes" | "1" | "on" => Some(true),
         "false" | "no" | "0" | "off" => Some(false),
         _ => {
-            *status = format!("{label} must be true or false");
+            *status = format!("{} must be true or false", form.label_for(label));
             None
         }
     }
@@ -554,20 +593,20 @@ impl App {
         }
     }
 
-    /// Fuzzy-completion suggestions for the New-project `repo_path` field, based
-    /// on the current field text. Empty unless a Project form is open on that
-    /// field. Capped to keep the dropdown short.
+    /// Fuzzy-completion suggestions for the project `repo_path` field, based on
+    /// the current field text. Empty unless a project form is open on that field.
+    /// Capped to keep the dropdown short.
     pub fn repo_suggestions(&self) -> Vec<String> {
         let Some(form) = &self.form else {
             return Vec::new();
         };
-        if form.kind != FormKind::Project {
+        if !matches!(form.kind, FormKind::Project | FormKind::ProjectConfig) {
             return Vec::new();
         }
         let Some(field) = form.fields.get(form.current) else {
             return Vec::new();
         };
-        if field.label != "repo_path" {
+        if field.key != "repo_path" {
             return Vec::new();
         }
         crate::repo_scan::filter_repos(&field.value, &self.scanned_repos, 8)
@@ -1165,7 +1204,7 @@ impl App {
                 self.status = "cancelled".into();
             }
             KeyCode::Enter => self.advance_or_submit_form().await?,
-            // Tab on the repo_path field with a suggestion fills the top match;
+            // Tab on the repository field with a suggestion fills the top match;
             // otherwise (and for Down) it advances to the next field.
             KeyCode::Tab if !self.repo_suggestions().is_empty() => {
                 if let Some(top) = self.repo_suggestions().into_iter().next() {
@@ -1885,7 +1924,7 @@ mod tests {
     }
 
     fn repo_field(value: &str) -> FormField {
-        FormField::new("repo_path", value, false)
+        FormField::new("repo_path", "Repository", value, false)
     }
 
     fn form_app_with_field(field: FormField) -> App {
@@ -1901,6 +1940,10 @@ mod tests {
 
     fn form_field(app: &App) -> &FormField {
         &app.form.as_ref().unwrap().fields[0]
+    }
+
+    fn test_field(key: &'static str, label: &'static str, value: &str) -> FormField {
+        FormField::new(key, label, value, false)
     }
 
     #[test]
@@ -1929,12 +1972,7 @@ mod tests {
         app.form = Some(Form {
             kind: FormKind::Project,
             title: "t",
-            fields: vec![FormField {
-                label: "name",
-                value: "foo".into(),
-                cursor: 3,
-                optional: false,
-            }],
+            fields: vec![test_field("name", "Name", "foo")],
             current: 0,
         });
         assert!(app.repo_suggestions().is_empty());
@@ -1974,18 +2012,49 @@ mod tests {
         app.form = Some(Form {
             kind: FormKind::Project,
             title: "t",
-            fields: vec![
-                FormField {
-                    label: "name",
-                    value: "x".into(),
-                    cursor: 1,
-                    optional: false,
-                },
-                repo_field("foo"),
-            ],
+            fields: vec![test_field("name", "Name", "x"), repo_field("foo")],
             current: 1,
         });
         assert!(!app.repo_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_repo_field_label_differs_when_repo_suggestions_then_uses_field_key() {
+        let mut app = test_app();
+        app.scanned_repos = vec!["~/foo".to_string()];
+        app.form = Some(Form {
+            kind: FormKind::Project,
+            title: "t",
+            fields: vec![test_field("repo_path", "Source directory", "foo")],
+            current: 0,
+        });
+        assert_eq!(app.repo_suggestions(), vec!["~/foo".to_string()]);
+    }
+
+    #[test]
+    fn given_project_config_form_on_repo_field_when_repo_suggestions_then_returns_matches() {
+        let mut app = test_app();
+        app.scanned_repos = vec!["~/foo".to_string()];
+        app.form = Some(Form {
+            kind: FormKind::ProjectConfig,
+            title: "t",
+            fields: vec![repo_field("foo")],
+            current: 0,
+        });
+        assert_eq!(app.repo_suggestions(), vec!["~/foo".to_string()]);
+    }
+
+    #[test]
+    fn given_project_form_with_unfocused_repo_field_when_repo_suggestions_then_empty() {
+        let mut app = test_app();
+        app.scanned_repos = vec!["~/foo".to_string()];
+        app.form = Some(Form {
+            kind: FormKind::Project,
+            title: "t",
+            fields: vec![repo_field("foo"), test_field("name", "Name", "")],
+            current: 1,
+        });
+        assert!(app.repo_suggestions().is_empty());
     }
 
     #[test]
@@ -2003,7 +2072,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_cursor_in_middle_when_char_typed_then_inserts_at_cursor() {
-        let mut field = FormField::new("text", "ab", false);
+        let mut field = FormField::new("text", "text", "ab", false);
         field.cursor = 1;
         let mut app = form_app_with_field(field);
 
@@ -2018,7 +2087,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_cursor_after_middle_char_when_backspace_then_removes_left_char() {
-        let mut field = FormField::new("text", "abc", false);
+        let mut field = FormField::new("text", "text", "abc", false);
         field.cursor = 2;
         let mut app = form_app_with_field(field);
 
@@ -2033,7 +2102,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_cursor_before_middle_char_when_delete_then_removes_right_char() {
-        let mut field = FormField::new("text", "abc", false);
+        let mut field = FormField::new("text", "text", "abc", false);
         field.cursor = 1;
         let mut app = form_app_with_field(field);
 
@@ -2048,7 +2117,7 @@ mod tests {
 
     #[test]
     fn given_stale_cursor_when_inserting_utf8_then_clamps_to_char_end() {
-        let mut field = FormField::new("text", "éa", false);
+        let mut field = FormField::new("text", "text", "éa", false);
         field.cursor = 99;
 
         field.insert_char('中');

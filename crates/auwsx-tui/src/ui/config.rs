@@ -20,40 +20,52 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let lines = vec![
-        kv("name", p.name.clone()),
-        kv("repo", p.repo_path.clone()),
-        kv("default_branch", p.default_branch.clone()),
+        kv("Name", p.name.clone()),
+        kv("Repository", p.repo_path.clone()),
+        kv("Default branch", p.default_branch.clone()),
         sep(),
-        kv("main_agent", p.main_agent_cmd.clone()),
-        kv("plan_agent", p.plan_agent_cmd.clone()),
-        kv("work_agent", p.work_agent_cmd.clone()),
+        kv("Main agent", p.main_agent_cmd.clone()),
+        kv("Plan agent", p.plan_agent_cmd.clone()),
+        kv("Work agent", p.work_agent_cmd.clone()),
         kv(
-            "review_agent",
+            "Review agent",
             p.review_agent_cmd
                 .clone()
                 .unwrap_or_else(|| "(falls back to work)".into()),
         ),
         sep(),
         kv(
-            "completion_policy",
+            "Completion policy",
             p.completion_policy.as_str().to_string(),
         ),
+        kv("Plan gate", format!("{} min", p.plan_gate_timeout_min)),
         kv(
-            "plan_gate_timeout",
-            format!("{} min", p.plan_gate_timeout_min),
-        ),
-        kv(
-            "completion_soft_timeout",
+            "Completion gate",
             format!("{} min", p.completion_soft_timeout_min),
         ),
         kv(
-            "iteration_timeout",
+            "Iteration timeout",
             format!("{} min", p.iteration_timeout_min),
         ),
-        kv("review_max_rounds", p.review_max_rounds.to_string()),
-        kv("conflict_max_attempts", p.conflict_max_attempts.to_string()),
-        kv("max_concurrency", p.max_concurrency.to_string()),
-        kv("merge_mode", p.merge_mode.as_str().to_string()),
+        kv(
+            "Main job timeout",
+            format!("{} min", p.main_job_timeout_min),
+        ),
+        kv("Review rounds", p.review_max_rounds.to_string()),
+        kv("Conflict attempts", p.conflict_max_attempts.to_string()),
+        kv("Concurrency", p.max_concurrency.to_string()),
+        kv(
+            "Schedule minutes",
+            p.schedule_interval_min
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "(manual)".into()),
+        ),
+        kv("Merge mode", p.merge_mode.as_str().to_string()),
+        kv(
+            "Skills path",
+            p.skill_path.clone().unwrap_or_else(|| "(none)".into()),
+        ),
+        kv("Deepsleep days", p.deepsleep_interval_days.to_string()),
     ];
 
     frame.render_widget(
@@ -72,7 +84,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
 fn kv(key: &str, val: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key:>24}: "), theme::dim()),
+        Span::styled(format!("{key:>20}: "), theme::dim()),
         Span::styled(val, Style::default().fg(theme::TEXT)),
     ])
 }
