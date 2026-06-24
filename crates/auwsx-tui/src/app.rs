@@ -1854,6 +1854,46 @@ impl App {
         }
     }
 
+    fn select_issue_in_tree(&mut self, issue_id: i64) -> bool {
+        if let Some(project_id) = self.children.iter().find_map(|(project_id, kids)| {
+            kids.issues
+                .iter()
+                .chain(kids.archived_issues.iter())
+                .any(|issue| issue.id == issue_id)
+                .then_some(*project_id)
+        }) {
+            return self.preserve_tree_issue_selection(project_id, issue_id);
+        }
+
+        let rows = self.tree_rows();
+        let Some((idx, item)) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(idx, row)| match row.item {
+                TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }
+                    if id == issue_id =>
+                {
+                    Some((idx, row.item.clone()))
+                }
+                _ => None,
+            })
+        else {
+            return false;
+        };
+
+        self.tree_sel = idx;
+        if let TreeItem::Issue { project_id, id } = item {
+            if let Some(idx) = self
+                .children_of(project_id)
+                .and_then(|kids| kids.issues.iter().position(|issue| issue.id == id))
+            {
+                self.issue_sel = idx;
+            }
+        }
+        self.sync_active_project();
+        true
+    }
+
     // --- IPC helpers --------------------------------------------------------
 
     async fn req(&self, cmd: Command) -> Result<Response> {
@@ -2175,6 +2215,7 @@ impl App {
                 self.log_tail_path = None;
                 self.issue_log_scroll = 0;
             }
+            self.clamp_issue_log_scroll();
         }
         Ok(())
     }
@@ -2182,6 +2223,11 @@ impl App {
     fn scroll_issue_log(&mut self, delta: isize) {
         let max = self.log_tail.lines().count().saturating_sub(1);
         self.issue_log_scroll = self.issue_log_scroll.saturating_add_signed(delta).min(max);
+    }
+
+    fn clamp_issue_log_scroll(&mut self) {
+        let max = self.log_tail.lines().count().saturating_sub(1);
+        self.issue_log_scroll = self.issue_log_scroll.min(max);
     }
 
     fn jump_issue_log_top(&mut self) {
@@ -3393,13 +3439,26 @@ impl App {
     async fn on_event(&mut self, ev: Event) -> Result<()> {
         self.push_log(format_event(&ev));
         match ev {
-            Event::IssueStatus { .. }
-            | Event::IssueRemoved { .. }
+            Event::IssueStatus { issue_id, .. } => {
+                let should_reselect_issue = self.selected_issue_id() == Some(issue_id);
+                self.refresh_issues().await?;
+                if should_reselect_issue {
+                    self.select_issue_in_tree(issue_id);
+                }
+                self.refresh_detail().await?;
+                self.refresh_activity().await?;
+            }
+            Event::IssueRemoved { .. }
             | Event::FindingAdded { .. }
             | Event::SteeringAdded { .. } => {
                 self.refresh_issues().await?;
                 self.refresh_detail().await?;
                 self.refresh_activity().await?;
+            }
+            Event::IssueLog { issue_id, .. } => {
+                if self.selected_issue_matches(issue_id) {
+                    self.refresh_issue_runs_and_tail().await?;
+                }
             }
             Event::BacklogChanged { .. } => {
                 self.refresh_backlog().await?;
@@ -3419,11 +3478,6 @@ impl App {
             Event::MainJobStatus { .. } | Event::RoutineFired { .. } => {
                 self.refresh_routines().await?;
                 self.refresh_activity().await?;
-            }
-            Event::IssueLog { issue_id, .. } => {
-                if self.selected_issue_matches(issue_id) {
-                    self.refresh_issue_runs_and_tail().await?;
-                }
             }
             _ => {}
         }
@@ -3633,6 +3687,10 @@ async fn next_event(es: &mut Option<ipc::EventStream>) -> Option<Result<Event>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use auwsx_core::db::agent_runs::Role;
+    use auwsx_core::state::IssueStatus;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
 
     #[test]
     fn view_step_forward_one() {
@@ -4009,12 +4067,185 @@ mod tests {
         assert_eq!(app.issue_log_scroll, 1);
     }
 
+    fn test_agent_run(id: i64, issue_id: i64, log_path: Option<&str>) -> AgentRun {
+        AgentRun {
+            id,
+            issue_id: Some(issue_id),
+            main_job_id: None,
+            role: Role::Work,
+            phase: "fix".into(),
+            agent_cmd: "agent".into(),
+            status_before: Some("implementing".into()),
+            status_after: None,
+            pid: Some(123),
+            exit_code: None,
+            exit_kind: None,
+            prompt_path: None,
+            log_path: log_path.map(str::to_string),
+            spawned_at: 1,
+            exited_at: None,
+            note: None,
+            phase_report: None,
+        }
+    }
+
+    fn issue_log_socket_path(name: &str) -> PathBuf {
+        let dir = PathBuf::from("target/auwsx-tui-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{name}-{}.sock", std::process::id()))
+    }
+
+    async fn serve_selected_issue_log(socket: PathBuf, ready: tokio::sync::oneshot::Sender<()>) {
+        if socket.exists() {
+            std::fs::remove_file(&socket).unwrap();
+        }
+        let listener = UnixListener::bind(&socket).unwrap();
+        let _ = ready.send(());
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let cmd: Command = serde_json::from_str(&line).unwrap();
+            let resp = match cmd {
+                Command::ListAgentRunsByIssue { issue_id: 7 } => {
+                    Response::AgentRuns(vec![test_agent_run(99, 7, Some("target/agent.log"))])
+                }
+                Command::TailAgentRunLog {
+                    agent_run_id: 99, ..
+                } => Response::LogTail {
+                    path: "target/agent.log".into(),
+                    text: "fresh\nlog".into(),
+                },
+                other => panic!("unexpected command: {other:?}"),
+            };
+            let mut stream = reader.into_inner();
+            let mut data = serde_json::to_vec(&resp).unwrap();
+            data.push(b'\n');
+            stream.write_all(&data).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+        std::fs::remove_file(&socket).unwrap();
+    }
+
     #[test]
     fn given_issue_log_at_oldest_when_scroll_older_then_clamps() {
         let mut app = test_app();
         app.log_tail = "one\ntwo\nthree\n".to_string();
 
         app.scroll_issue_log(10);
+
+        assert_eq!(app.issue_log_scroll, 2);
+    }
+
+    #[test]
+    fn given_archive_expanded_when_tree_rows_then_archived_issue_is_visible() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                issues: vec![test_issue(1, IssueStatus::Working, "active")],
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+
+        let rows = app.tree_rows();
+        let labels = rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>();
+
+        assert!(labels.contains(&"Issues    1"));
+        assert!(labels.contains(&"Archive   1"));
+        assert!(rows.iter().any(|r| r.item
+            == TreeItem::Issue {
+                project_id: 42,
+                id: 1
+            }));
+        assert!(rows.iter().any(|r| r.item
+            == TreeItem::ArchivedIssue {
+                project_id: 42,
+                id: 2
+            }));
+    }
+
+    #[test]
+    fn given_archived_issue_row_when_selected_then_issue_detail_selection_reuses_issue() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchivedIssue { id: 2, .. }))
+            .unwrap();
+
+        assert_eq!(app.selected_issue_id(), Some(2));
+        assert_eq!(
+            app.selected_issue().map(|issue| issue.title.as_str()),
+            Some("archived")
+        );
+    }
+
+    #[test]
+    fn given_issue_moves_to_archive_when_reselected_then_tree_focus_follows_issue() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(7, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+
+        assert!(app.select_issue_in_tree(7));
+
+        assert!(matches!(
+            app.selected_tree_item(),
+            Some(TreeItem::ArchivedIssue { id: 7, .. })
+        ));
+        assert!(app.archive_expanded.contains(&42));
+        assert_eq!(app.selected_issue_id(), Some(7));
+        assert_eq!(app.selected_project_id(), Some(42));
+    }
+
+    #[test]
+    fn given_missing_issue_when_reselected_then_tree_focus_is_preserved() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(7, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = 2;
+
+        assert!(!app.select_issue_in_tree(99));
+
+        assert_eq!(app.tree_sel, 2);
+    }
+
+    #[test]
+    fn given_log_scroll_past_end_when_clamped_then_last_line_is_max() {
+        let mut app = test_app();
+        app.log_tail = "one\ntwo\nthree".into();
+        app.issue_log_scroll = 99;
+
+        app.clamp_issue_log_scroll();
 
         assert_eq!(app.issue_log_scroll, 2);
     }
@@ -4042,22 +4273,90 @@ mod tests {
         assert_eq!(app.issue_log_scroll, 0);
     }
 
-    #[test]
-    fn given_issue_selected_when_issue_log_event_matches_then_live_tail_should_refresh() {
-        let mut app = test_app();
-        app.projects.push(project_fixture());
+    #[tokio::test]
+    async fn given_selected_issue_log_event_when_handled_then_log_tail_refreshes() {
+        let socket = issue_log_socket_path("selected-issue-log");
+        let server_socket = socket.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            serve_selected_issue_log(server_socket, ready_tx).await;
+        });
+        ready_rx.await.unwrap();
+        let mut app = App::new(socket);
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
         app.children.insert(
-            1,
+            42,
             ProjectChildren {
-                issues: vec![issue_fixture()],
+                issues: vec![test_issue(7, IssueStatus::Working, "active")],
                 ..ProjectChildren::default()
             },
         );
-        app.expanded.insert(1);
-        app.select_tree_issue(7);
+        app.select_issue_in_tree(7);
+        app.log_tail = "stale".into();
+        app.log_tail_path = Some("target/agent.log".into());
 
-        assert!(app.selected_issue_matches(7));
-        assert!(!app.selected_issue_matches(8));
+        app.on_event(Event::IssueLog {
+            issue_id: 7,
+            phase: "fix".into(),
+            chunk: "new".into(),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(app.log_tail, "fresh\nlog");
+        assert_eq!(app.detail.runs.len(), 1);
+        assert_eq!(app.issue_log_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn given_other_issue_log_event_when_handled_then_no_log_refresh_is_requested() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                issues: vec![test_issue(7, IssueStatus::Working, "active")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.select_issue_in_tree(7);
+        app.log_tail = "current".into();
+
+        app.on_event(Event::IssueLog {
+            issue_id: 8,
+            phase: "fix".into(),
+            chunk: "new".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.log_tail, "current");
+    }
+
+    // --- archive/log fixtures --------------------------------------------
+
+    fn test_project() -> Project {
+        let mut project = project_fixture();
+        project.id = 42;
+        project.name = "demo".into();
+        project.schedule_interval_min = Some(15);
+        project.skill_path = Some("skills".into());
+        project
+    }
+
+    fn test_issue(id: i64, status: IssueStatus, title: &str) -> Issue {
+        let mut issue = issue_fixture();
+        issue.id = id;
+        issue.project_id = 42;
+        issue.status = status;
+        issue.title = title.into();
+        issue
     }
 
     #[tokio::test]
@@ -4089,7 +4388,9 @@ mod tests {
     // --- App::repo_suggestions -------------------------------------------
 
     fn test_app() -> App {
-        App::new(std::path::PathBuf::from("/tmp/test.sock"))
+        App::new(std::path::PathBuf::from(
+            "target/nonexistent-auwsx-test.sock",
+        ))
     }
 
     #[test]
