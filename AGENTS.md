@@ -55,3 +55,4 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 ## Command Notes
 
 - Finding adjudication needs the literal finding id when `$AUWSX_FINDING_ID` is unset: `"$AUWSX_BIN" finding accept 2 "<how you'll fix>"`
+- Branch/upstream listing under zsh needs quoting: `git branch --format='%(refname:short) %(upstream:short)'`
