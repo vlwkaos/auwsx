@@ -61,7 +61,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme::border(false))
-                .title(Span::styled(format!(" Config — {} ", p.name), theme::title())),
+                .title(Span::styled(
+                    format!(" Config — {} ", p.name),
+                    theme::title(),
+                )),
         ),
         area,
     );

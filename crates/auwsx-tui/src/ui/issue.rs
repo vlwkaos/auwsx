@@ -55,7 +55,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme::border(false))
-                .title(Span::styled(format!(" Issue #{} ", issue.id), theme::title())),
+                .title(Span::styled(
+                    format!(" Issue #{} ", issue.id),
+                    theme::title(),
+                )),
         ),
         cols[0],
     );

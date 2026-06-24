@@ -147,7 +147,94 @@ pub struct Form {
 pub struct FormField {
     pub label: &'static str,
     pub value: String,
+    pub cursor: usize,
     pub optional: bool,
+}
+
+impl FormField {
+    fn new(label: &'static str, value: &str, optional: bool) -> Self {
+        Self {
+            label,
+            value: value.to_string(),
+            cursor: value.chars().count(),
+            optional,
+        }
+    }
+
+    fn char_len(&self) -> usize {
+        self.value.chars().count()
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.cursor = self.cursor.min(self.char_len());
+    }
+
+    pub(crate) fn cursor_byte_index(&self) -> usize {
+        self.value
+            .char_indices()
+            .nth(self.cursor.min(self.char_len()))
+            .map(|(idx, _)| idx)
+            .unwrap_or(self.value.len())
+    }
+
+    fn byte_index_at(&self, char_pos: usize) -> usize {
+        self.value
+            .char_indices()
+            .nth(char_pos.min(self.char_len()))
+            .map(|(idx, _)| idx)
+            .unwrap_or(self.value.len())
+    }
+
+    fn set_value(&mut self, value: String) {
+        self.value = value;
+        self.cursor = self.char_len();
+    }
+
+    fn move_left(&mut self) {
+        self.clamp_cursor();
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.clamp_cursor();
+        self.cursor = (self.cursor + 1).min(self.char_len());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.char_len();
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.clamp_cursor();
+        let byte_idx = self.cursor_byte_index();
+        self.value.insert(byte_idx, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        self.clamp_cursor();
+        if self.cursor == 0 {
+            return;
+        }
+        let start = self.byte_index_at(self.cursor - 1);
+        let end = self.byte_index_at(self.cursor);
+        self.value.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        self.clamp_cursor();
+        if self.cursor >= self.char_len() {
+            return;
+        }
+        let start = self.byte_index_at(self.cursor);
+        let end = self.byte_index_at(self.cursor + 1);
+        self.value.replace_range(start..end, "");
+    }
 }
 
 impl Form {
@@ -355,11 +442,7 @@ impl Form {
 }
 
 fn field(label: &'static str, value: &str, optional: bool) -> FormField {
-    FormField {
-        label,
-        value: value.to_string(),
-        optional,
-    }
+    FormField::new(label, value, optional)
 }
 
 fn parse_i64(form: &Form, label: &'static str, status: &mut String) -> Option<i64> {
@@ -723,10 +806,7 @@ impl App {
     /// Load routines + backlog + issues for one project into the cache.
     async fn refresh_project_children(&mut self, project_id: i64) -> Result<()> {
         let mut kids = ProjectChildren::default();
-        if let Response::Routines(items) = self
-            .req(Command::ListRoutines { project_id })
-            .await?
-        {
+        if let Response::Routines(items) = self.req(Command::ListRoutines { project_id }).await? {
             kids.routines = items;
         }
         if let Response::Backlog(items) = self
@@ -1091,7 +1171,7 @@ impl App {
                 if let Some(top) = self.repo_suggestions().into_iter().next() {
                     if let Some(form) = self.form.as_mut() {
                         if let Some(field) = form.fields.get_mut(form.current) {
-                            field.value = top;
+                            field.set_value(top);
                         }
                     }
                 }
@@ -1109,7 +1189,42 @@ impl App {
             KeyCode::Backspace => {
                 if let Some(form) = self.form.as_mut() {
                     if let Some(field) = form.fields.get_mut(form.current) {
-                        field.value.pop();
+                        field.backspace();
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(form) = self.form.as_mut() {
+                    if let Some(field) = form.fields.get_mut(form.current) {
+                        field.delete();
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if let Some(form) = self.form.as_mut() {
+                    if let Some(field) = form.fields.get_mut(form.current) {
+                        field.move_left();
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(form) = self.form.as_mut() {
+                    if let Some(field) = form.fields.get_mut(form.current) {
+                        field.move_right();
+                    }
+                }
+            }
+            KeyCode::Home => {
+                if let Some(form) = self.form.as_mut() {
+                    if let Some(field) = form.fields.get_mut(form.current) {
+                        field.move_home();
+                    }
+                }
+            }
+            KeyCode::End => {
+                if let Some(form) = self.form.as_mut() {
+                    if let Some(field) = form.fields.get_mut(form.current) {
+                        field.move_end();
                     }
                 }
             }
@@ -1117,7 +1232,7 @@ impl App {
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
                     if let Some(form) = self.form.as_mut() {
                         if let Some(field) = form.fields.get_mut(form.current) {
-                            field.value.push(c);
+                            field.insert_char(c);
                         }
                     }
                 }
@@ -1642,7 +1757,9 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
     // One-shot background git-repo scan for the New-project form's completion.
     // `spawn_blocking` keeps the filesystem walk off the async runtime; the
     // result lands once via the select! arm below, then `repo_scan` is None.
-    let mut repo_scan = Some(tokio::task::spawn_blocking(crate::repo_scan::scan_git_repos));
+    let mut repo_scan = Some(tokio::task::spawn_blocking(
+        crate::repo_scan::scan_git_repos,
+    ));
 
     let mut tick = tokio::time::interval(Duration::from_secs(2));
 
@@ -1682,9 +1799,7 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
 
 /// Await the repo-scan task if one is pending; an absent/finished handle parks
 /// forever so `select!` falls through to the other arms.
-async fn drain_scan(
-    handle: &mut Option<tokio::task::JoinHandle<Vec<String>>>,
-) -> Vec<String> {
+async fn drain_scan(handle: &mut Option<tokio::task::JoinHandle<Vec<String>>>) -> Vec<String> {
     match handle {
         Some(h) => h.await.unwrap_or_default(),
         None => std::future::pending().await,
@@ -1770,11 +1885,22 @@ mod tests {
     }
 
     fn repo_field(value: &str) -> FormField {
-        FormField {
-            label: "repo_path",
-            value: value.into(),
-            optional: false,
-        }
+        FormField::new("repo_path", value, false)
+    }
+
+    fn form_app_with_field(field: FormField) -> App {
+        let mut app = test_app();
+        app.form = Some(Form {
+            kind: FormKind::Backlog,
+            title: "t",
+            fields: vec![field],
+            current: 0,
+        });
+        app
+    }
+
+    fn form_field(app: &App) -> &FormField {
+        &app.form.as_ref().unwrap().fields[0]
     }
 
     #[test]
@@ -1806,6 +1932,7 @@ mod tests {
             fields: vec![FormField {
                 label: "name",
                 value: "foo".into(),
+                cursor: 3,
                 optional: false,
             }],
             current: 0,
@@ -1851,6 +1978,7 @@ mod tests {
                 FormField {
                     label: "name",
                     value: "x".into(),
+                    cursor: 1,
                     optional: false,
                 },
                 repo_field("foo"),
@@ -1871,5 +1999,83 @@ mod tests {
             current: 0,
         });
         assert_eq!(app.repo_suggestions().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn given_cursor_in_middle_when_char_typed_then_inserts_at_cursor() {
+        let mut field = FormField::new("text", "ab", false);
+        field.cursor = 1;
+        let mut app = form_app_with_field(field);
+
+        app.handle_form_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let field = form_field(&app);
+        assert_eq!(field.value, "aXb");
+        assert_eq!(field.cursor, 2);
+    }
+
+    #[tokio::test]
+    async fn given_cursor_after_middle_char_when_backspace_then_removes_left_char() {
+        let mut field = FormField::new("text", "abc", false);
+        field.cursor = 2;
+        let mut app = form_app_with_field(field);
+
+        app.handle_form_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let field = form_field(&app);
+        assert_eq!(field.value, "ac");
+        assert_eq!(field.cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn given_cursor_before_middle_char_when_delete_then_removes_right_char() {
+        let mut field = FormField::new("text", "abc", false);
+        field.cursor = 1;
+        let mut app = form_app_with_field(field);
+
+        app.handle_form_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let field = form_field(&app);
+        assert_eq!(field.value, "ac");
+        assert_eq!(field.cursor, 1);
+    }
+
+    #[test]
+    fn given_stale_cursor_when_inserting_utf8_then_clamps_to_char_end() {
+        let mut field = FormField::new("text", "éa", false);
+        field.cursor = 99;
+
+        field.insert_char('中');
+
+        assert_eq!(field.value, "éa中");
+        assert_eq!(field.cursor, 3);
+    }
+
+    #[tokio::test]
+    async fn given_repo_completion_when_tab_then_cursor_moves_to_suggestion_end() {
+        let mut app = test_app();
+        app.scanned_repos = vec!["~/foo".to_string()];
+        let mut field = repo_field("foo");
+        field.cursor = 1;
+        app.form = Some(Form {
+            kind: FormKind::Project,
+            title: "t",
+            fields: vec![field],
+            current: 0,
+        });
+
+        app.handle_form_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let field = form_field(&app);
+        assert_eq!(field.value, "~/foo");
+        assert_eq!(field.cursor, 5);
     }
 }
