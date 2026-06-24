@@ -14,6 +14,11 @@ cargo run --bin auwsx               # default = TUI (auto-starts daemon if none 
 cargo run --bin auwsx -- daemon     # start daemon explicitly
 ```
 
+## Command Notes
+
+- Formatting this worktree only: `cargo fmt --package auwsx-tui`. `cargo fmt --all` also targets sibling `wsx` crates outside this worktree.
+- If `$AUWSX_BIN subtask ...` points at an older sibling build without `subtask`, run `cargo build -p auwsx-tui` and use `target/debug/auwsx subtask done <id>`.
+
 ## Key Files (planned, mostly stubs at scaffold time)
 
 - `crates/auwsx-core/src/state.rs` — `IssueStatus` enum + scheduler classes + transition matrix

@@ -8,7 +8,7 @@ mod logs;
 mod overview;
 pub(crate) mod theme;
 
-use crate::app::{App, View};
+use crate::app::{App, FormField, View};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -87,7 +87,7 @@ fn draw_form(frame: &mut Frame, app: &App) {
         let marker = if idx == form.current { ">" } else { " " };
         let optional = if field.optional { " optional" } else { "" };
         let value = if idx == form.current {
-            format!("{}_", field.value)
+            active_form_value(field)
         } else if field.value.is_empty() {
             String::new()
         } else {
@@ -141,6 +141,12 @@ fn draw_form(frame: &mut Frame, app: &App) {
     );
 }
 
+fn active_form_value(field: &FormField) -> String {
+    let mut value = field.value.clone();
+    value.insert(field.cursor_byte_index(), '_');
+    value
+}
+
 fn form_height(field_count: u16, extra: u16) -> u16 {
     field_count
         .saturating_add(4)
@@ -189,7 +195,7 @@ pub(crate) fn render_list(
 
 #[cfg(test)]
 mod tests {
-    use crate::app::{App, View};
+    use crate::app::{App, FormField, View};
     use crate::ui::draw;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -271,5 +277,17 @@ mod tests {
     #[test]
     fn draw_empty_app_renders_project_row() {
         assert!(rendered_empty_app().contains("Project"));
+    }
+
+    #[test]
+    fn active_form_value_renders_cursor_at_stored_char_position() {
+        let field = FormField {
+            label: "text",
+            value: "abé".to_string(),
+            cursor: 2,
+            optional: false,
+        };
+
+        assert_eq!(super::active_form_value(&field), "ab_é");
     }
 }
