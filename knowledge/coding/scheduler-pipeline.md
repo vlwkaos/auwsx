@@ -28,9 +28,9 @@ history/daemon-spine.md.
 
 - `pipeline::plan_phase(status) -> Option<(Role, needs_worktree)>`. The
   `Some`-set == `is_actionable`. Map:
-  Consolidating→(Main, false); Planning→(Plan, true);
-  Implementing/NeedsFix/Audit/Conflicted/Completing→(Work, true);
-  Review→(Review, true).
+  New/Planning→(Plan, true);
+  Working/Fixing/Auditing/ResolvingConflict/Merging→(Work, true);
+  Reviewing→(Review, true).
 - `scheduler::decide(issues, project, running, now) -> Vec<Decision>` where
   `Decision = Spawn | SoftGate | Teardown`:
   - caps spawns at `max_concurrency - running.len()`;
@@ -44,12 +44,13 @@ history/daemon-spine.md.
 ## Effectful: pipeline::execute(&Deps, issue_id)
 
 load issue → `plan_phase` → ensure worktree (only if `needs_worktree` &&
-`worktree_path` is None; persist branch + path) → `cwd` = worktree else
+`worktree_path` is None; persist branch + path) → deterministic phase entry
+(`NEW` becomes `PLANNING` before prompt/snapshot/run) → `cwd` = worktree else
 `repo_path` → load steering / subtasks / findings → `prompt::build` →
-`agent_runs::start` → `executor.execute(AgentSpec)` → reload status for
-`status_after` → `agent_runs::finish`. Run logs + prompts go under
-`AUWSX_DATA_DIR` at `<data>/runs/issue-N/` — NOT in the repo (the agent writes
-its own `.auwsx/` artifacts in the worktree).
+`agent_runs::start` → `executor.execute(AgentSpec)` → replay the issue-local
+control outbox → reload status for `status_after` → `agent_runs::finish`. Run
+logs + prompts go under `AUWSX_DATA_DIR` at `<data>/runs/issue-N/` — NOT in the
+repo (the agent writes its own `.auwsx/` artifacts in the worktree).
 
 ## Scheduler runtime
 
@@ -61,7 +62,18 @@ its own `.auwsx/` artifacts in the worktree).
   **self-removes** from `running` on completion.
 - `service_soft_gate` — arms `wait_until` (= `now + timeout_min*60_000`) or
   releases (applies the transition) when `deadline <= 0` (auto policy) or due.
-- `teardown` — removes worktree + clears `branch`/`worktree_path`.
+- `teardown` — removes worktree + clears `branch`/`worktree_path`; scheduled
+  automatically for `DONE` and `ABANDONED`, not `FAILED`.
+- `cleanup_issue_worktree_by_id` / `auwsx issue cleanup <issue_id>` — explicit
+  operator cleanup for preserved failed worktrees.
+- `remove_project(shallow=false)` — refuses running issues, tears down every
+  DB-recorded issue worktree, then prunes any remaining git-registered
+  `auwsx/issue-*` worktrees for the repo before removing the project row.
+- `auwsx worktree prune <repo_path>` — local recovery command for orphaned
+  managed issue worktrees after an out-of-band DB reset.
+- `recover_interrupted_work` — daemon-start restoration: closes open issue and
+  main-job `agent_runs`, marks interrupted issue/main-job work `FAILED`, and
+  leaves queued main jobs queued.
 - `join_inflight` (drain, used by tests) / `prune_inflight` (drop finished
   handles so the Vec doesn't grow).
 - `run(shutdown)` — ticks all projects every `tick_interval`.
@@ -112,8 +124,15 @@ Set the project `completion_policy = 'auto'` + `plan_gate_timeout_min = 0` (raw
 sqlx UPDATE) so soft gates release with NO time travel. Drive by hand: loop
 `tick_project` + `join_inflight` until Done. Assert Done reached, worktree torn
 down, every `agent_runs` row finished with `status_after` + `exit_kind=Exited`.
-Note: PLANNED→IMPLEMENTING and ENDED→COMPLETING are scheduler soft-gate releases,
-NOT agent transitions.
+Note: `NEW→PLANNING` is pipeline-owned phase entry. `PLAN_READY→WORKING` and
+`READY_TO_MERGE→MERGING` are scheduler soft-gate releases, NOT agent
+transitions. `READY_TO_MERGE→WORKING` is the human loop-back path for extra
+verification, queue-message work, or branch polishing before merge.
+
+Prompt review surface: the TUI Settings screen (`S`) renders the Prompt Catalog
+from `auwsx_core::prompt::preview_catalog()`. Use that for reviewing all phase
+prompts at once; live run artifacts remain the source for issue-specific prompt
+context.
 
 ## Gotchas
 

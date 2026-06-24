@@ -118,3 +118,46 @@ cargo test --package auwsx-core --package auwsx-tui --no-run
 The failure pattern is Rust `E0063` in tests after adding a field that normal
 builds miss. Full `cargo test --package auwsx-core --package auwsx-tui` remains
 the preferred final check.
+
+## Project command-source contract
+
+When project agent command configuration changes, test both persisted source and
+runtime resolution. A project may store an Arsenal preset reference plus blank
+or partial per-role overrides; runtime must resolve effective commands from
+override first, then preset.
+
+Required checks:
+
+- CRUD tests prove blank overrides resolve to Arsenal commands.
+- CRUD tests prove later Arsenal edits change linked projects' effective
+  commands.
+- CRUD tests prove nonblank project overrides win over Arsenal.
+- TUI tests prove Settings opens linked projects with Arsenal selected and keeps
+  nonblank override fields visible.
+
+## Worktree lifecycle reset-collision coverage
+
+When worktree creation, branch naming, cleanup, or DB reset behavior changes,
+test the case where SQLite no longer knows about an auwsx issue but git still
+has `auwsx/issue-N` in its branch/worktree registry. Issue ids can be reused
+after a DB reset, so branch creation must not fail silently or destroy live
+work.
+
+Required checks:
+
+- A prunable stale worktree for `auwsx/issue-N` is pruned/archived and a new
+  worktree for the current issue is created.
+- A live checked-out `auwsx/issue-N` worktree is refused, not overwritten.
+- Any pre-agent setup failure records a run/log entry with the concrete cause
+  before the issue is marked `FAILED`.
+
+## Singleton settings and IPC response coverage
+
+When adding a singleton config table or a new IPC `Response` variant, verify the
+entire route, not just the database helper:
+
+- Migration creates the singleton row, with a smoke test that queries the row.
+- IPC dispatch exposes both read and write commands when the value is editable.
+- CLI response printing has an arm for the new `Response` variant.
+- TUI refresh state and render path handle missing/not-yet-loaded state without
+  panicking.

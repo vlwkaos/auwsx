@@ -2,8 +2,8 @@
 slug: issue-model
 kind: domain
 title: auwsx issue pipeline model (IssueStatus state machine)
-description: The per-project issue pipeline — 16 IssueStatus states, 3 scheduler classes, 37 transitions, status-as-sync-marker, and the soft-gate/working-phase/absorbed/failed rules that drive the daemon scheduler.
-keywords: [IssueStatus, scheduler class, state machine, ACTIONABLE HUMAN_GATED TERMINAL, status as synchronization marker, is_soft_gated, accepts_steering, is_working_phase, ABSORBED, FAILED, check_transition, CONSOLIDATING, PLANNING, IMPLEMENTING, REVIEW NEEDS_FIX loop, CONFLICTED, COMPLETING, completion policy, soft gate timeout, wait_until, crash resume, issue pipeline]
+description: The per-project issue pipeline — 16 IssueStatus states, 3 scheduler classes, status-as-sync-marker, and the soft-gate/working-phase/failed/abandoned rules that drive the daemon scheduler.
+keywords: [IssueStatus, scheduler class, state machine, ACTIONABLE HUMAN_GATED TERMINAL, status as synchronization marker, is_soft_gated, accepts_queue_message, FAILED, ABANDONED, check_transition, NEW, PLANNING, PLAN_READY, WORKING, REVIEWING, FIXING, AUDITING, READY_TO_MERGE, MERGING, RESOLVING_CONFLICT, CONFLICT_BLOCKED, completion policy, soft gate timeout, wait_until, crash resume, issue pipeline]
 created: 2026-06-09
 modified: 2026-06-17
 ---
@@ -36,39 +36,40 @@ parses agent prose; agent→auwsx is the validated control CLI over IPC.
 
 | Class | States |
 |-------|--------|
-| **Actionable** (spawn agent) | Consolidating, Planning, Implementing, Review, NeedsFix, Audit, Conflicted, Completing |
-| **HumanGated** (wait) | Planned, PlanBlocked, ReviewBlocked, ConflictBlocked, Ended |
-| **Terminal** (archive, zero outgoing) | Done, Absorbed, Failed |
+| **Actionable** (spawn agent) | New, Planning, Working, Reviewing, Fixing, Auditing, Merging, ResolvingConflict |
+| **HumanGated** (wait) | PlanReady, PlanBlocked, ReviewBlocked, ReadyToMerge, ConflictBlocked |
+| **Terminal** (archive, zero outgoing) | Done, Failed, Abandoned |
 
 ## Flow
 
 ```
-CONSOLIDATING ─┬─> PLANNING ─> PLANNED ─> IMPLEMENTING ─> REVIEW ⇄ NEEDS_FIX
-               │                                            │
-               └─> ABSORBED                                 └─> AUDIT ─> ENDED
-                                                                          │
-   PLAN_BLOCKED / REVIEW_BLOCKED / CONFLICT_BLOCKED (human)          COMPLETING ─> DONE
-                                                                          │
-                                                                     CONFLICTED ⇄ CONFLICT_BLOCKED
-   FAILED reachable from every non-terminal phase.
+NEW ─> PLANNING ─> PLAN_READY ─> WORKING ─> REVIEWING ⇄ FIXING
+                         │                         │
+                         │                         └─> AUDITING ─> READY_TO_MERGE
+                         │                                  ^          │
+                         │                                  └─ WORKING │
+ PLAN_BLOCKED / REVIEW_BLOCKED / CONFLICT_BLOCKED (human)          MERGING ─> DONE
+                                                                       │
+                                                              RESOLVING_CONFLICT ⇄ CONFLICT_BLOCKED
+ FAILED and ABANDONED are reachable from every non-terminal phase.
 ```
 
-- **37 legal transitions** enforced by `state::check_transition`.
-- **ABSORBED** only from CONSOLIDATING (and only via `mark_absorbed`).
-- **FAILED** reachable from every non-terminal phase.
-- Terminal states (Done, Absorbed, Failed) have zero outgoing transitions.
+- Legal transitions are enforced by `state::check_transition`.
+- `NEW→PLANNING` is daemon-owned phase entry before the planner prompt runs.
+- **FAILED** and **ABANDONED** are reachable from every non-terminal phase.
+- Terminal states (Done, Failed, Abandoned) have zero outgoing transitions.
 
 ## Phase semantics
 
 | Phase | What happens | Worktree |
 |-------|--------------|----------|
-| CONSOLIDATING | main agent checks for a similar in-flight issue in a WORKING phase. Found → fold this task in as steering, self-close to **ABSORBED** (no new worktree). Else → standalone → PLANNING. | none yet |
-| PLANNING → PLANNED | plan agent writes plan; PLANNED is a soft-gate. | worktree created at CONSOLIDATING→PLANNING (standalone only; delegated tasks reuse target's) |
-| IMPLEMENTING | work agent codes. | issue's worktree |
-| REVIEW ⇄ NEEDS_FIX | fresh REVIEW agent (3rd eye + devil's-advocate) emits findings via `auwsx finding add`; implementer RE-SPAWNED to adjudicate each (accept→fix / reject→rationale). Loop until clean or `review_max_rounds`. | issue's worktree |
-| AUDIT → ENDED | final audit then ENDED gate. | issue's worktree |
-| CONFLICTED ⇄ CONFLICT_BLOCKED | work agent attempts rebase/merge resolution; after `conflict_max_attempts` → CONFLICT_BLOCKED (human). | issue's worktree |
-| COMPLETING → DONE | merge + post-merge `/dream`; worktree torn down at DONE. | torn down |
+| NEW → PLANNING | daemon creates/records the issue worktree and enters PLANNING before spawning the plan agent. | created here |
+| PLANNING → PLAN_READY | plan agent writes plan; PLAN_READY is a soft gate. | issue's worktree |
+| WORKING | work agent codes. | issue's worktree |
+| REVIEWING ⇄ FIXING | fresh REVIEW agent emits findings via `auwsx finding add`; implementer is re-spawned to adjudicate each (accept→fix / reject→rationale). Loop until clean or `review_max_rounds`. | issue's worktree |
+| AUDITING → READY_TO_MERGE | final audit then merge gate. | issue's worktree |
+| MERGING → DONE | merge; worktree torn down at DONE. | torn down |
+| RESOLVING_CONFLICT ⇄ CONFLICT_BLOCKED | work agent attempts rebase/merge resolution; after `conflict_max_attempts` → CONFLICT_BLOCKED (human). | issue's worktree |
 
 Deadlocks escalate to human gates: REVIEW after N rounds → REVIEW_BLOCKED;
 conflict after N attempts → CONFLICT_BLOCKED; planning issue → PLAN_BLOCKED.
@@ -77,10 +78,10 @@ conflict after N attempts → CONFLICT_BLOCKED; planning issue → PLAN_BLOCKED.
 
 | Predicate | True for |
 |-----------|----------|
-| `is_soft_gated()` | **Planned** only. (ENDED is soft-gated only when `completion_policy='soft'`, ORed in by the scheduler — not by the predicate.) |
-| `accepts_steering()` == `is_working_phase()` | **Implementing, Review, NeedsFix, Audit** |
+| `is_soft_gated()` | **PlanReady** only. (ReadyToMerge is soft-gated only when `completion_policy='soft'` or auto-released when `completion_policy='auto'`, ORed in by the scheduler — not by the predicate.) |
+| `accepts_queue_message()` | **Planning, Working, Reviewing, Fixing, Auditing, ReadyToMerge** |
 
-- **Soft-gate-with-timeout** (`issues.wait_until`): PLANNED waits for human N min
+- **Soft-gate-with-timeout** (`issues.wait_until`): PLAN_READY waits for human N min
   (`plan_gate_timeout_min`) then auto-advances.
 - **Steering** = append-only guidance into a WORKING-phase issue. NEVER edits
   plan.md; sets `has_pending_steering=1` to re-trigger the scheduler. Sources:
@@ -88,11 +89,15 @@ conflict after N attempts → CONFLICT_BLOCKED; planning issue → PLAN_BLOCKED.
 
 ## Completion policy (per project)
 
-| Policy | Behavior at ENDED |
+| Policy | Behavior at READY_TO_MERGE |
 |--------|-------------------|
-| `manual` (default) | hard gate — human checks COMPLETE; no auto-merge |
+| `manual` (default) | hard gate — human checks readiness; no auto-merge; human may add a queue message and move the issue back to WORKING |
 | `soft` | timeout (`completion_soft_timeout_min`) then auto-advance |
-| `auto` | merge on ENDED |
+| `auto` | merge immediately |
+
+Agents that pass audit write/update `.auwsx/human-verify.md` before setting
+READY_TO_MERGE. Keep that file as the compact, stable handoff: app run command,
+pass/fail checks, and issue-specific behavior to inspect.
 
 **Merge (local):** rebase-to-current (NEVER merge main into branch; no mid-branch
 merges) + single `--no-ff` merge commit; post-merge `/dream` auto on default
@@ -100,8 +105,8 @@ branch. PR mode (`merge_mode='pr'`) = `/gh-pr`.
 
 ## Concurrency
 
-Serial-per-project v1 (`max_concurrency=1`, one active issue/worktree); N
-projects in parallel. Intra-project parallelism is a later concern.
+Per-project concurrency is capped by `projects.max_concurrency`; N projects may
+run in parallel.
 
 ## Triage / backlog
 
@@ -123,12 +128,12 @@ into four broad lanes:
 
 | Lane | Detailed statuses |
 |------|-------------------|
-| TODO | `CONSOLIDATING`, `PLANNING`, `PLANNED`, `PLAN_BLOCKED` |
-| IN PROGRESS | `IMPLEMENTING`, `NEEDS_FIX`, `COMPLETING`, `CONFLICTED`, `CONFLICT_BLOCKED` |
-| REVIEW | `REVIEW`, `REVIEW_BLOCKED`, `AUDIT`, `ENDED` |
-| COMPLETE | `DONE`, `ABSORBED`, `FAILED` |
+| PLAN | `NEW`, `PLANNING`, `PLAN_READY`, `PLAN_BLOCKED` |
+| IN PROGRESS | `WORKING`, `REVIEWING`, `FIXING`, `REVIEW_BLOCKED`, `AUDITING` |
+| FINALIZING | `READY_TO_MERGE`, `MERGING`, `RESOLVING_CONFLICT`, `CONFLICT_BLOCKED` |
+| DONE | `DONE`, `FAILED`, `ABANDONED` |
 
-TUI boards keep lane order fixed as TODO, IN PROGRESS, REVIEW, COMPLETE. Issue
+TUI boards keep lane order fixed as PLAN, IN PROGRESS, FINALIZING, DONE. Issue
 rows sort by id ascending inside each lane, so older work appears first. Backlog
-items render before issue rows in TODO; backlog ordering currently follows the
+items render before issue rows in PLAN; backlog ordering currently follows the
 daemon-return order unless a future board-specific sort is added.
