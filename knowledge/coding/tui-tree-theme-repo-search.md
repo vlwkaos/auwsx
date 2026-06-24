@@ -2,10 +2,10 @@
 slug: tui-tree-theme-repo-search
 kind: coding
 title: TUI tree, theme, footer, and repo search conventions
-description: Reusable TUI conventions for the multi-project tree model, central theme roles, version footer, and dependency-free git repository search.
-keywords: [TUI tree, TreeItem project_id, ProjectChildren cache, expanded projects, ui theme, Color ban, version footer, repo_scan, fuzzy_score, filter_repos, format_repo_path, spawn_blocking scan, repo suggestions]
+description: Reusable TUI conventions for the one-screen operator console, focus stack, project tree, central theme roles, footer, and dependency-free git repository search.
+keywords: [TUI tree, one-screen operator console, focus stack, Screen Main Settings Modal, TreeItem project_id, ProjectChildren cache, expanded projects, Kanban, archive strip, ui theme, Color ban, version footer, repo_scan, fuzzy_score, filter_repos, format_repo_path, spawn_blocking scan, repo suggestions]
 created: 2026-06-17
-modified: 2026-06-17
+modified: 2026-06-24
 ---
 
 # TUI tree, theme, footer, and repo search
@@ -20,6 +20,25 @@ modified: 2026-06-17
   project-id set. `refresh_all` eager-loads all projects and their children.
 - `sync_active_project()` re-derives the active project from the cursor row.
   Enter toggles project expansion or opens issue detail depending on row type.
+
+## Operator console target
+
+The TUI should keep one stable main screen plus Settings and modals. Avoid
+top-level tabs with shared cursors; use an explicit focus stack:
+
+| Focus | Notes |
+|-------|-------|
+| LeftNav | profile/project/item selection |
+| ProjectPane | Kanban, archive strip, preview |
+| ItemDetail | detail, findings, tasks, queue messages, log |
+| Settings | global settings only |
+| Modal | forms, confirmation, ask |
+
+Navigation target: `Enter` enters the right pane or opens item detail, `Esc`
+unwinds focus, Kanban uses `h/l` for columns and `j/k` for rows. Context keys
+should be object-driven: `n` new backlog/routine/queue message, `a` approve or
+toggle, `e` edit, `d` dismiss/delete/abandon/unregister, `?` ask, `E` run
+scheduler now, `m` move project profile, `S` settings.
 
 ## Theme rules
 

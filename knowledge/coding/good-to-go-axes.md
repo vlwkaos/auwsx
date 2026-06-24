@@ -2,10 +2,10 @@
 slug: good-to-go-axes
 kind: coding
 title: auwsx good-to-go axes
-description: Project-specific verification axes for auwsx changes, including enum/SQL parity, TUI action and view wiring, theme color constraints, and test-target coverage after API shape changes.
-keywords: [good-to-go axes, enum SQL CHECK parity, IssueStatus, AskMode, TUI action view exhaustiveness, render smoke tests, theme single source of truth, Color grep, cargo test no-run, struct signature change, test target coverage]
+description: Project-specific verification axes for auwsx changes, including enum/SQL parity, TUI action/view wiring, theme constraints, singleton settings, IPC routes, and prompt-policy safety.
+keywords: [good-to-go axes, enum SQL CHECK parity, IssueStatus, AskMode, TUI action view exhaustiveness, render smoke tests, theme single source of truth, Color grep, cargo test no-run, struct signature change, test target coverage, singleton settings, IPC response coverage, prompt policy, issue-local proxy, TUI capability mismatch]
 created: 2026-06-09
-modified: 2026-06-17
+modified: 2026-06-24
 ---
 
 # auwsx good-to-go axes
@@ -161,3 +161,24 @@ entire route, not just the database helper:
 - CLI response printing has an arm for the new `Response` variant.
 - TUI refresh state and render path handle missing/not-yet-loaded state without
   panicking.
+
+## Prompt policy and control-channel safety
+
+When global prompt/profile guidance or issue-local control changes, verify the
+public boundary rather than only helper functions:
+
+- Issue-local socket/proxy commands are filtered by the same issue allowlist as
+  the control outbox, or `AUWSX_SOCK` is absent from issue workers.
+- Regression test: issue-local control cannot call `UpdateGlobalSettings`.
+- Persisted guidance has a max length, rows-affected checks, and tests.
+- Prompt guidance block is delimited and says it cannot bypass controls, reveal
+  secrets, or override system/developer/repo instructions.
+- CLI printing strips or escapes ASCII control characters from persisted text.
+
+## TUI capability and typed-form assertions
+
+Capability-driven UI must not advertise actions that the selected row cannot
+perform. Check that read-only config rows do not show Enter edit/open, hidden
+project actions such as `p` are gated, and sectioned typed forms preserve
+select/completion behavior. Prefer focused buffer assertions for footer/action
+labels over broad render-only smoke tests.

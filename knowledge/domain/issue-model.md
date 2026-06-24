@@ -2,10 +2,10 @@
 slug: issue-model
 kind: domain
 title: auwsx issue pipeline model (IssueStatus state machine)
-description: The per-project issue pipeline — 16 IssueStatus states, 3 scheduler classes, status-as-sync-marker, and the soft-gate/working-phase/failed/abandoned rules that drive the daemon scheduler.
-keywords: [IssueStatus, scheduler class, state machine, ACTIONABLE HUMAN_GATED TERMINAL, status as synchronization marker, is_soft_gated, accepts_queue_message, FAILED, ABANDONED, check_transition, NEW, PLANNING, PLAN_READY, WORKING, REVIEWING, FIXING, AUDITING, READY_TO_MERGE, MERGING, RESOLVING_CONFLICT, CONFLICT_BLOCKED, completion policy, soft gate timeout, wait_until, crash resume, issue pipeline]
+description: The per-project issue pipeline with 16 IssueStatus states, scheduler classes, operator lanes, queue-message admission, and soft-gate rules.
+keywords: [IssueStatus, scheduler class, state machine, ACTIONABLE HUMAN_GATED TERMINAL, status as synchronization marker, progress lane, attention marker, is_soft_gated, accepts_queue_message, queue message, backlog routing, FAILED, ABANDONED, check_transition, NEW, PLANNING, PLAN_READY, WORKING, REVIEWING, FIXING, AUDITING, READY_TO_MERGE, MERGING, RESOLVING_CONFLICT, CONFLICT_BLOCKED, completion policy, soft gate timeout, wait_until, crash resume, issue pipeline]
 created: 2026-06-09
-modified: 2026-06-17
+modified: 2026-06-24
 ---
 
 # auwsx issue model
@@ -79,13 +79,15 @@ conflict after N attempts → CONFLICT_BLOCKED; planning issue → PLAN_BLOCKED.
 | Predicate | True for |
 |-----------|----------|
 | `is_soft_gated()` | **PlanReady** only. (ReadyToMerge is soft-gated only when `completion_policy='soft'` or auto-released when `completion_policy='auto'`, ORed in by the scheduler — not by the predicate.) |
-| `accepts_queue_message()` | **Planning, Working, Reviewing, Fixing, Auditing, ReadyToMerge** |
+| `accepts_queue_message()` target | **Planning, Working, Reviewing, Fixing, Auditing** |
 
 - **Soft-gate-with-timeout** (`issues.wait_until`): PLAN_READY waits for human N min
   (`plan_gate_timeout_min`) then auto-advances.
-- **Steering** = append-only guidance into a WORKING-phase issue. NEVER edits
-  plan.md; sets `has_pending_steering=1` to re-trigger the scheduler. Sources:
-  human, consolidation (delegation).
+- **Queue message** is the user-facing name for append-only guidance into active
+  issue work. Target admission excludes `PLAN_READY`, blocked states,
+  finalizing states, and terminal/archive states; joining new backlog into
+  existing work should be visible through backlog history plus the target
+  issue's queue messages, not as a separate joined issue card.
 
 ## Completion policy (per project)
 
@@ -121,6 +123,12 @@ is running, tears down the issue worktree if present, marks any source backlog
 row dismissed so deletion does not resurrect old work, then deletes the issue
 and cascading child rows.
 
+Target routing model from 2026-06-18: approved backlog is routed by project-level
+activity before issue creation. A standalone item becomes a new issue at `NEW` or
+`PLANNING`; related active work attaches as a queue message to an attachable
+issue. `CONSOLIDATING` is not an issue status, and `ABSORBED`/`JOINED` should be
+backlog history rather than a Kanban card.
+
 ## User-facing lanes
 
 `IssueStatus` stays the detailed scheduler marker. UI boards group those details
@@ -137,3 +145,7 @@ TUI boards keep lane order fixed as PLAN, IN PROGRESS, FINALIZING, DONE. Issue
 rows sort by id ascending inside each lane, so older work appears first. Backlog
 items render before issue rows in PLAN; backlog ordering currently follows the
 daemon-return order unless a future board-specific sort is added.
+
+Operator attention is a separate marker from progress. Needs-attention statuses:
+`PLAN_READY`, `PLAN_BLOCKED`, `REVIEW_BLOCKED`, `READY_TO_MERGE`,
+`CONFLICT_BLOCKED`, and `FAILED`.

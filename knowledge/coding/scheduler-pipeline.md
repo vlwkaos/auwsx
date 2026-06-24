@@ -2,10 +2,10 @@
 slug: scheduler-pipeline
 kind: coding
 title: autonomy loop — scheduler + pipeline via ports & adapters
-description: How the daemon drives an issue through phases autonomously — pure plan_phase/decide domain, effectful pipeline::execute + Scheduler runtime, agent callback over the socket, all infra isolated behind Clock/AgentExecutor/Worktrees ports for deterministic drive-loop tests.
-keywords: [scheduler, pipeline, ports and adapters, hexagonal, Clock SystemClock, AgentExecutor SubprocessExecutor, Worktrees WsxWorktrees, plan_phase, scheduler decide, Spawn SoftGate Teardown, soft_gate_due, project_due_for_auto_tick, schedule_interval_min, AUWSX_TICK_SECS, tick_project, spawn_phase running set, pipeline execute AgentSpec, agent callback AUWSX_SOCK AUWSX_ISSUE_ID, daemon wiring stop Notify, ask_project, drive loop test FixedClock ScriptedAgent, max_concurrency, spawn_blocking wsx-core, autonomy loop how does the daemon drive an issue]
+description: How the daemon drives an issue through phases using pure plan_phase/decide domain logic, pipeline::execute, Scheduler runtime, issue-scoped callbacks, and deterministic drive-loop tests.
+keywords: [scheduler, pipeline, ports and adapters, hexagonal, Clock SystemClock, AgentExecutor SubprocessExecutor, Worktrees WsxWorktrees, plan_phase, scheduler decide, Spawn SoftGate Teardown, soft_gate_due, project_due_for_auto_tick, schedule_interval_min, AUWSX_TICK_SECS, tick_project, spawn_phase running set, pipeline execute AgentSpec, agent callback AUWSX_SOCK AUWSX_ISSUE_ID, issue-local proxy allowlist, daemon wiring stop Notify, ask_project, drive loop test FixedClock ScriptedAgent, max_concurrency, spawn_blocking wsx-core, autonomy loop how does the daemon drive an issue]
 created: 2026-06-09
-modified: 2026-06-17
+modified: 2026-06-24
 ---
 
 # autonomy loop: scheduler + pipeline
@@ -102,8 +102,13 @@ emits an answer event. It does not mutate issue status or scheduler cadence.
 Agent reports back by running the SAME `auwsx` CLI as a thin IPC client. The
 pipeline injects into the child env: `AUWSX_SOCK`, `AUWSX_ISSUE_ID`,
 `AUWSX_AGENT_ROLE`. Prompts tell it to run
-`auwsx issue status "$AUWSX_ISSUE_ID" <NEXT>`. No per-run token / caller scoping
-yet — the local 0700 socket is the v1 boundary (scoping deferred, see plan.md).
+`auwsx issue status "$AUWSX_ISSUE_ID" <NEXT>`.
+
+Security target from the 2026-06-24 backpressure audit: issue-local socket/proxy
+access must be filtered by the same issue-scoped allowlist as the control
+outbox, or issue workers should not receive `AUWSX_SOCK`. A regression should
+prove issue-local control cannot call global settings mutations such as
+`UpdateGlobalSettings`.
 
 ## Daemon wiring
 
