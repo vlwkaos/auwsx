@@ -806,10 +806,7 @@ impl App {
     /// Load routines + backlog + issues for one project into the cache.
     async fn refresh_project_children(&mut self, project_id: i64) -> Result<()> {
         let mut kids = ProjectChildren::default();
-        if let Response::Routines(items) = self
-            .req(Command::ListRoutines { project_id })
-            .await?
-        {
+        if let Response::Routines(items) = self.req(Command::ListRoutines { project_id }).await? {
             kids.routines = items;
         }
         if let Response::Backlog(items) = self
@@ -1760,7 +1757,9 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
     // One-shot background git-repo scan for the New-project form's completion.
     // `spawn_blocking` keeps the filesystem walk off the async runtime; the
     // result lands once via the select! arm below, then `repo_scan` is None.
-    let mut repo_scan = Some(tokio::task::spawn_blocking(crate::repo_scan::scan_git_repos));
+    let mut repo_scan = Some(tokio::task::spawn_blocking(
+        crate::repo_scan::scan_git_repos,
+    ));
 
     let mut tick = tokio::time::interval(Duration::from_secs(2));
 
@@ -1800,9 +1799,7 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
 
 /// Await the repo-scan task if one is pending; an absent/finished handle parks
 /// forever so `select!` falls through to the other arms.
-async fn drain_scan(
-    handle: &mut Option<tokio::task::JoinHandle<Vec<String>>>,
-) -> Vec<String> {
+async fn drain_scan(handle: &mut Option<tokio::task::JoinHandle<Vec<String>>>) -> Vec<String> {
     match handle {
         Some(h) => h.await.unwrap_or_default(),
         None => std::future::pending().await,

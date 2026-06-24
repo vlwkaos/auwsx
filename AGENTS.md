@@ -18,6 +18,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 
 - Formatting this worktree only: `cargo fmt --package auwsx-tui`. `cargo fmt --all` also targets sibling `wsx` crates outside this worktree.
 - If `$AUWSX_BIN subtask ...` points at an older sibling build without `subtask`, run `cargo build -p auwsx-tui` and use `target/debug/auwsx subtask done <id>`.
+- For review findings, use the literal provided id: `"$AUWSX_BIN" finding accept 3 "..."`; there is no `$AUWSX_FINDING_ID` env var in issue workers.
 
 ## Key Files (planned, mostly stubs at scaffold time)
 

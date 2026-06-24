@@ -62,10 +62,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         )
     };
     frame.render_widget(Paragraph::new(Span::styled(text, style)), cols[0]);
-    frame.render_widget(
-        Paragraph::new(Span::styled(version, theme::dim())),
-        cols[1],
-    );
+    frame.render_widget(Paragraph::new(Span::styled(version, theme::dim())), cols[1]);
 }
 
 fn draw_form(frame: &mut Frame, app: &App) {

@@ -271,7 +271,10 @@ mod tests {
     #[test]
     fn given_nonpath_query_with_surrounding_whitespace_when_filtered_then_still_matches() {
         let repos = vec!["~/alpha".to_string()];
-        assert_eq!(filter_repos("  alph  ", &repos, 5), vec!["~/alpha".to_string()]);
+        assert_eq!(
+            filter_repos("  alph  ", &repos, 5),
+            vec!["~/alpha".to_string()]
+        );
     }
 
     #[test]
@@ -386,7 +389,10 @@ mod tests {
         std::fs::write(root.join("a/.git"), b"gitdir: ../real/.git").unwrap();
         let mut out = Vec::new();
         walk_for_git(root, root, 0, &mut out);
-        assert!(out.is_empty(), ".git file must not register as a repo; got: {out:?}");
+        assert!(
+            out.is_empty(),
+            ".git file must not register as a repo; got: {out:?}"
+        );
     }
 
     #[test]
@@ -419,7 +425,9 @@ mod tests {
         std::fs::create_dir_all(root.join("node_modules/pkg/.git")).unwrap();
         let mut out = Vec::new();
         walk_for_git(root, root, 0, &mut out);
-        assert!(!out.iter().any(|s| s.contains("node_modules") || s.contains("pkg")));
+        assert!(!out
+            .iter()
+            .any(|s| s.contains("node_modules") || s.contains("pkg")));
     }
 
     #[test]
@@ -431,7 +439,10 @@ mod tests {
         }
         let mut out = Vec::new();
         walk_for_git(root, root, 0, &mut out);
-        assert!(out.is_empty(), "all skip-dir repos must be pruned; got: {out:?}");
+        assert!(
+            out.is_empty(),
+            "all skip-dir repos must be pruned; got: {out:?}"
+        );
     }
 
     #[test]
@@ -454,7 +465,10 @@ mod tests {
         std::fs::create_dir_all(root.join("shallow/.git")).unwrap();
         let mut out = Vec::new();
         walk_for_git(root, root, 0, &mut out);
-        assert!(out.contains(&"~/shallow".to_string()), "shallow repo must be found");
+        assert!(
+            out.contains(&"~/shallow".to_string()),
+            "shallow repo must be found"
+        );
         assert!(
             !out.iter().any(|s| s.ends_with("/d9")),
             "too-deep repo must not be found; got: {out:?}"
@@ -496,8 +510,14 @@ mod tests {
         std::fs::create_dir_all(root.join("b/.git")).unwrap();
         let mut out = Vec::new();
         walk_for_git(root, root, 0, &mut out);
-        assert!(out.contains(&"~/a".to_string()), "~/a missing; got: {out:?}");
-        assert!(out.contains(&"~/b".to_string()), "~/b missing; got: {out:?}");
+        assert!(
+            out.contains(&"~/a".to_string()),
+            "~/a missing; got: {out:?}"
+        );
+        assert!(
+            out.contains(&"~/b".to_string()),
+            "~/b missing; got: {out:?}"
+        );
     }
 
     #[test]
@@ -511,6 +531,10 @@ mod tests {
         std::fs::create_dir_all(root.join("src/lib")).unwrap();
         let mut out = Vec::new();
         walk_for_git(root, root, 0, &mut out);
-        assert_eq!(out, vec!["~/valid".to_string()], "only valid sibling; got: {out:?}");
+        assert_eq!(
+            out,
+            vec!["~/valid".to_string()],
+            "only valid sibling; got: {out:?}"
+        );
     }
 }
