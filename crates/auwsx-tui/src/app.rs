@@ -95,6 +95,8 @@ pub enum TreeItem {
     Backlog { project_id: i64, id: i64 },
     IssuesRoot(i64),
     Issue { project_id: i64, id: i64 },
+    ArchiveRoot(i64),
+    ArchivedIssue { project_id: i64, id: i64 },
 }
 
 impl TreeItem {
@@ -105,9 +107,11 @@ impl TreeItem {
             | TreeItem::RoutinesRoot(id)
             | TreeItem::BacklogRoot(id)
             | TreeItem::IssuesRoot(id)
+            | TreeItem::ArchiveRoot(id)
             | TreeItem::Routine { project_id: id, .. }
             | TreeItem::Backlog { project_id: id, .. }
-            | TreeItem::Issue { project_id: id, .. } => *id,
+            | TreeItem::Issue { project_id: id, .. }
+            | TreeItem::ArchivedIssue { project_id: id, .. } => *id,
         }
     }
 }
@@ -988,6 +992,8 @@ pub struct App {
     pub children: HashMap<i64, ProjectChildren>,
     /// Project ids whose children are expanded in the tree.
     pub expanded: HashSet<i64>,
+    /// Project ids whose low-frequency archive section is expanded.
+    pub archive_expanded: HashSet<i64>,
     pub issue_sel: usize,
     pub backlog_sel: usize,
     pub tree_sel: usize,
@@ -1047,6 +1053,7 @@ impl App {
             proj_sel: 0,
             children: HashMap::new(),
             expanded: HashSet::new(),
+            archive_expanded: HashSet::new(),
             issue_sel: 0,
             backlog_sel: 0,
             tree_sel: 0,
@@ -1422,9 +1429,16 @@ impl App {
                 _ => None,
             };
         }
+        self.selected_issue_row_id().or_else(|| {
+            (self.view == View::Issue)
+                .then(|| self.issues().get(self.issue_sel).map(|i| i.id))
+                .flatten()
+        })
+    }
+
+    fn selected_issue_row_id(&self) -> Option<i64> {
         match self.selected_tree_item() {
-            Some(TreeItem::Issue { id, .. }) => Some(id),
-            _ if self.view == View::Issue => self.issues().get(self.issue_sel).map(|i| i.id),
+            Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) => Some(id),
             _ => None,
         }
     }
@@ -1526,6 +1540,24 @@ impl App {
                     depth: 2,
                 });
             }
+
+            rows.push(TreeRow {
+                item: TreeItem::ArchiveRoot(p.id),
+                label: format!("Archive   {}", kids.archived_issues.len()),
+                depth: 1,
+            });
+            if self.archive_expanded.contains(&p.id) {
+                for i in &kids.archived_issues {
+                    rows.push(TreeRow {
+                        item: TreeItem::ArchivedIssue {
+                            project_id: p.id,
+                            id: i.id,
+                        },
+                        label: crate::ui::vm::issue_tree_label(i),
+                        depth: 2,
+                    });
+                }
+            }
         }
         rows
     }
@@ -1600,7 +1632,11 @@ impl App {
                 .children_of(project_id)?
                 .issues
                 .iter()
-                .chain(self.children_of(project_id)?.archived_issues.iter())
+                .find(|i| i.id == id),
+            TreeItem::ArchivedIssue { project_id, id } => self
+                .children_of(project_id)?
+                .archived_issues
+                .iter()
                 .find(|i| i.id == id),
             _ if self.view == View::Issue => self.issues().get(self.issue_sel),
             _ => None,
@@ -1746,6 +1782,9 @@ impl App {
             Some(TreeItem::IssuesRoot(_)) => {
                 caps.push(CapabilityAction::Drill, "Enter fold");
             }
+            Some(TreeItem::ArchiveRoot(_)) => {
+                caps.push(CapabilityAction::Drill, "Enter fold");
+            }
             Some(TreeItem::Issue { .. }) => {
                 caps.push(CapabilityAction::Drill, "Enter detail");
                 if self.selected_issue_accepts_queue_message() {
@@ -1754,6 +1793,10 @@ impl App {
                 if self.selected_issue_can_execute() {
                     caps.push(CapabilityAction::Execute, "E run");
                 }
+                caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
+            }
+            Some(TreeItem::ArchivedIssue { .. }) => {
+                caps.push(CapabilityAction::Drill, "Enter detail");
                 caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
             }
             None => {}
@@ -1866,6 +1909,7 @@ impl App {
             let live: HashSet<i64> = self.projects.iter().map(|p| p.id).collect();
             self.children.retain(|id, _| live.contains(id));
             self.expanded.retain(|id| live.contains(id));
+            self.archive_expanded.retain(|id| live.contains(id));
             if self.expanded.is_empty() {
                 self.expanded.extend(live);
             }
@@ -1973,7 +2017,9 @@ impl App {
     /// Refresh just the active project's children (used after local mutations).
     async fn refresh_issues(&mut self) -> Result<()> {
         let selected_issue = match self.selected_tree_item() {
-            Some(TreeItem::Issue { project_id, id }) => Some((project_id, id)),
+            Some(
+                TreeItem::Issue { project_id, id } | TreeItem::ArchivedIssue { project_id, id },
+            ) => Some((project_id, id)),
             _ => None,
         };
         if let Some(pid) = self.selected_project_id() {
@@ -2425,7 +2471,7 @@ impl App {
                             .await;
                         self.refresh_backlog().await?;
                     }
-                    Some(TreeItem::Issue { id, .. }) => {
+                    Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) => {
                         let (cmd, label) = self.issue_delete_command(id);
                         self.req_ok(cmd, label).await;
                         self.refresh_issues().await?;
@@ -2504,6 +2550,9 @@ impl App {
                     self.execute_control(Command::ExecuteIssue { issue_id })
                         .await;
                 }
+            }
+            Some(TreeItem::ArchivedIssue { .. }) => {
+                self.status = "archived issue is terminal; no run action available".into();
             }
             Some(TreeItem::Routine { id: routine_id, .. }) => {
                 self.req_ok(Command::RunRoutineNow { routine_id }, "routine run")
@@ -3075,7 +3124,9 @@ impl App {
         // cursor now sits in.
         self.sync_active_project();
         self.refresh_asks().await?;
-        if let Some(TreeItem::Issue { id, .. }) = self.selected_tree_item() {
+        if let Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) =
+            self.selected_tree_item()
+        {
             if let Some(idx) = self.issues().iter().position(|i| i.id == id) {
                 self.issue_sel = idx;
             }
@@ -3219,11 +3270,16 @@ impl App {
             self.issue_sel = idx;
         }
         if is_archived.is_some() {
-            if let Some(idx) = self
-                .tree_rows()
-                .iter()
-                .position(|row| row.item == TreeItem::Project(project_id))
-            {
+            self.archive_expanded.insert(project_id);
+            if let Some(idx) = self.tree_rows().iter().position(|row| {
+                matches!(
+                    &row.item,
+                    TreeItem::ArchivedIssue {
+                        project_id: pid,
+                        id
+                    } if *pid == project_id && *id == issue_id
+                )
+            }) {
                 self.tree_sel = idx;
                 self.sync_active_project();
                 return true;
@@ -3284,8 +3340,17 @@ impl App {
                 self.clamp_tree();
                 self.sync_active_project();
             }
+            Some(TreeItem::ArchiveRoot(pid)) => {
+                if self.archive_expanded.contains(&pid) {
+                    self.archive_expanded.remove(&pid);
+                } else {
+                    self.archive_expanded.insert(pid);
+                }
+                self.clamp_tree();
+                self.sync_active_project();
+            }
             // Enter on an issue keeps the main screen and moves focus to the detail pane.
-            Some(TreeItem::Issue { .. }) => {
+            Some(TreeItem::Issue { .. } | TreeItem::ArchivedIssue { .. }) => {
                 if self.enter_selected_issue_detail_from_left() {
                     self.refresh_detail().await?;
                 }
@@ -3792,7 +3857,15 @@ mod tests {
         assert!(app.preserve_tree_issue_selection(1, 8));
 
         assert!(app.expanded.contains(&1));
-        assert_eq!(app.selected_tree_item(), Some(TreeItem::Project(1)));
+        assert!(app.archive_expanded.contains(&1));
+        assert_eq!(app.selected_issue_row_id(), Some(8));
+        assert_eq!(
+            app.selected_tree_item(),
+            Some(TreeItem::ArchivedIssue {
+                project_id: 1,
+                id: 8
+            })
+        );
     }
 
     #[test]

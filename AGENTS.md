@@ -30,6 +30,8 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - Process inspection should use the plain approved form `ps -axo pid,command`; avoid filtering it with a pipe in this sandbox.
 - Package-scoped formatting avoids the sibling `wsx` path dependency: `cargo fmt --package auwsx-core --package auwsx-tui`.
 - If the configured current plan path is missing, list available plan files with `rg --files /Users/eliot/.claude/plans`.
+- During conflict resolution, restore the default-side worktree copy with `git restore --ours --worktree <paths>`; `git restore --source=:2 --worktree <paths>` does not address conflict stages.
+- During non-interactive rebase conflict resolution, continue with `GIT_EDITOR=true git rebase --continue` so Git reuses the existing commit message instead of opening `nvim`.
 - On macOS the default DB path is `~/Library/Application Support/auwsx/state.db`, not `~/.local/share/auwsx/state.db`.
 - The `agent_runs` start-time column is `spawned_at`; latest run inspection can use `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, issue_id, role, phase, status_before, status_after, spawned_at, exited_at, exit_kind, exit_code, log_path FROM agent_runs ORDER BY id DESC LIMIT 5;"`.
 - The findings review round column is `review_round`, not `round`; latest finding inspection can use `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, issue_id, review_round, severity, status, title FROM findings ORDER BY id DESC LIMIT 5;"`.
