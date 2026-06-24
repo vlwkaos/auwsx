@@ -1437,16 +1437,24 @@ impl App {
         })
     }
 
-    fn selected_issue_row_id(&self) -> Option<i64> {
+    fn selected_active_issue_id(&self) -> Option<i64> {
         match self.selected_tree_item() {
-            Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) => Some(id),
-            _ => None,
+            Some(TreeItem::Issue { id, .. }) => self
+                .selected_issue()
+                .filter(|issue| !issue.status.is_terminal())
+                .map(|_| id),
+            Some(TreeItem::ArchivedIssue { .. }) => None,
+            _ => self
+                .issues()
+                .get(self.issue_sel)
+                .filter(|issue| !issue.status.is_terminal())
+                .map(|issue| issue.id),
         }
     }
 
-    fn selected_backlog_id(&self) -> Option<i64> {
+    fn selected_issue_row_id(&self) -> Option<i64> {
         match self.selected_tree_item() {
-            Some(TreeItem::Backlog { id, .. }) => Some(id),
+            Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) => Some(id),
             _ => None,
         }
     }
@@ -3106,8 +3114,8 @@ impl App {
                 self.refresh_asks().await?;
             }
             FormKind::QueueMessage => {
-                let Some(issue_id) = self.selected_issue_id() else {
-                    self.status = "select an issue first".into();
+                let Some(issue_id) = self.selected_active_issue_id() else {
+                    self.status = "select an active issue first".into();
                     return Ok(());
                 };
                 self.submit_create(
@@ -4230,6 +4238,58 @@ mod tests {
             app.selected_issue().map(|issue| issue.title.as_str()),
             Some("archived")
         );
+    }
+
+    #[tokio::test]
+    async fn given_archived_issue_row_when_new_context_then_action_is_read_only() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchivedIssue { id: 2, .. }))
+            .unwrap();
+
+        app.apply(Action::NewContext).await.unwrap();
+
+        assert!(app.form.is_none());
+        assert_eq!(app.status, "issue cannot receive queue messages in DONE");
+    }
+
+    #[tokio::test]
+    async fn given_queue_message_form_when_selection_becomes_archived_then_submit_is_blocked() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchivedIssue { id: 2, .. }))
+            .unwrap();
+        let mut form = Form::steering();
+        form.set("note", "do it");
+        app.form = Some(form);
+
+        app.submit_form().await.unwrap();
+
+        assert_eq!(app.status, "select an active issue first");
     }
 
     #[test]
