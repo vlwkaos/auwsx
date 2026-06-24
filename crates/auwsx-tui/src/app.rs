@@ -1444,6 +1444,13 @@ impl App {
         }
     }
 
+    fn selected_backlog_id(&self) -> Option<i64> {
+        match self.selected_tree_item() {
+            Some(TreeItem::Backlog { id, .. }) => Some(id),
+            _ => None,
+        }
+    }
+
     pub fn tree_rows(&self) -> Vec<TreeRow> {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now_ms = SystemTime::now()
@@ -3441,7 +3448,7 @@ impl App {
         self.push_log(format_event(&ev));
         match ev {
             Event::IssueStatus { issue_id, .. } => {
-                let should_reselect_issue = self.selected_issue_id() == Some(issue_id);
+                let should_reselect_issue = self.selected_issue_row_id() == Some(issue_id);
                 self.refresh_issues().await?;
                 if should_reselect_issue {
                     self.select_issue_in_tree(issue_id);
@@ -4223,6 +4230,30 @@ mod tests {
             app.selected_issue().map(|issue| issue.title.as_str()),
             Some("archived")
         );
+    }
+
+    #[test]
+    fn given_non_issue_row_when_issue_selection_falls_back_then_issue_row_id_is_empty() {
+        let mut app = test_app();
+        app.view = View::Issue;
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                issues: vec![test_issue(7, IssueStatus::Working, "active")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.issue_sel = 0;
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::Project(42)))
+            .unwrap();
+
+        assert_eq!(app.selected_issue_id(), Some(7));
+        assert_eq!(app.selected_issue_row_id(), None);
     }
 
     #[tokio::test]
