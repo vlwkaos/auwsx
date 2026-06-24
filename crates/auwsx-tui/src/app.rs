@@ -992,7 +992,8 @@ pub struct App {
     pub children: HashMap<i64, ProjectChildren>,
     /// Project ids whose children are expanded in the tree.
     pub expanded: HashSet<i64>,
-    /// Project ids whose low-frequency archive section is expanded.
+    /// Project ids whose archive section is expanded. Archives are low-frequency
+    /// UX, so expanding a project does not automatically expose terminal issues.
     pub archive_expanded: HashSet<i64>,
     pub issue_sel: usize,
     pub backlog_sel: usize,
@@ -4139,11 +4140,10 @@ mod tests {
     }
 
     #[test]
-    fn given_archive_expanded_when_tree_rows_then_archived_issue_is_visible() {
+    fn given_terminal_and_active_issues_when_tree_rows_then_archive_is_collapsed_by_default() {
         let mut app = test_app();
         app.projects = vec![test_project()];
         app.expanded.insert(42);
-        app.archive_expanded.insert(42);
         app.children.insert(
             42,
             ProjectChildren {
@@ -4158,6 +4158,35 @@ mod tests {
 
         assert!(labels.contains(&"Issues    1"));
         assert!(labels.contains(&"Archive   1"));
+        assert!(rows.iter().any(|r| r.item
+            == TreeItem::Issue {
+                project_id: 42,
+                id: 1
+            }));
+        assert!(!rows.iter().any(|r| r.item
+            == TreeItem::ArchivedIssue {
+                project_id: 42,
+                id: 2
+            }));
+    }
+
+    #[test]
+    fn given_expanded_archive_when_tree_rows_then_archived_issues_are_visible() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                issues: vec![test_issue(1, IssueStatus::Working, "active")],
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+
+        let rows = app.tree_rows();
+
         assert!(rows.iter().any(|r| r.item
             == TreeItem::Issue {
                 project_id: 42,
@@ -4196,6 +4225,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn given_archive_root_when_drilled_then_archived_issue_rows_toggle() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchiveRoot(42)))
+            .unwrap();
+
+        app.drill().await.unwrap();
+
+        assert!(app.archive_expanded.contains(&42));
+        assert!(app.tree_rows().iter().any(|r| matches!(
+            r.item,
+            TreeItem::ArchivedIssue {
+                project_id: 42,
+                id: 2
+            }
+        )));
+
+        app.drill().await.unwrap();
+
+        assert!(!app.archive_expanded.contains(&42));
+        assert!(!app.tree_rows().iter().any(|r| matches!(
+            r.item,
+            TreeItem::ArchivedIssue {
+                project_id: 42,
+                id: 2
+            }
+        )));
+    }
+
     #[test]
     fn given_issue_moves_to_archive_when_reselected_then_tree_focus_follows_issue() {
         let mut app = test_app();
@@ -4211,6 +4281,7 @@ mod tests {
 
         assert!(app.select_issue_in_tree(7));
 
+        assert!(app.archive_expanded.contains(&42));
         assert!(matches!(
             app.selected_tree_item(),
             Some(TreeItem::ArchivedIssue { id: 7, .. })
