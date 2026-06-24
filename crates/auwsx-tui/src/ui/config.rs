@@ -20,40 +20,55 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let lines = vec![
-        kv("name", p.name.clone()),
-        kv("repo", p.repo_path.clone()),
-        kv("default_branch", p.default_branch.clone()),
+        kv("Name", p.name.clone()),
+        kv("Repository", p.repo_path.clone()),
+        kv("Default branch", p.default_branch.clone()),
         sep(),
-        kv("main_agent", p.main_agent_cmd.clone()),
-        kv("plan_agent", p.plan_agent_cmd.clone()),
-        kv("work_agent", p.work_agent_cmd.clone()),
+        kv("Main command", p.main_agent_cmd.clone()),
+        kv("Plan command", p.plan_agent_cmd.clone()),
+        kv("Work command", p.work_agent_cmd.clone()),
         kv(
-            "review_agent",
+            "Review command",
             p.review_agent_cmd
                 .clone()
                 .unwrap_or_else(|| "(falls back to work)".into()),
         ),
         sep(),
         kv(
-            "completion_policy",
+            "Completion policy",
             p.completion_policy.as_str().to_string(),
         ),
         kv(
-            "plan_gate_timeout",
+            "Plan gate timeout",
             format!("{} min", p.plan_gate_timeout_min),
         ),
         kv(
-            "completion_soft_timeout",
+            "Completion timeout",
             format!("{} min", p.completion_soft_timeout_min),
         ),
         kv(
-            "iteration_timeout",
+            "Iteration timeout",
             format!("{} min", p.iteration_timeout_min),
         ),
-        kv("review_max_rounds", p.review_max_rounds.to_string()),
-        kv("conflict_max_attempts", p.conflict_max_attempts.to_string()),
-        kv("max_concurrency", p.max_concurrency.to_string()),
-        kv("merge_mode", p.merge_mode.as_str().to_string()),
+        kv(
+            "Main job timeout",
+            format!("{} min", p.main_job_timeout_min),
+        ),
+        kv("Review rounds", p.review_max_rounds.to_string()),
+        kv("Conflict attempts", p.conflict_max_attempts.to_string()),
+        kv("Concurrency", p.max_concurrency.to_string()),
+        kv(
+            "Schedule interval",
+            p.schedule_interval_min
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "(manual)".into()),
+        ),
+        kv("Merge mode", p.merge_mode.as_str().to_string()),
+        kv(
+            "Skills path",
+            p.skill_path.clone().unwrap_or_else(|| "(none)".into()),
+        ),
+        kv("Deepsleep interval", p.deepsleep_interval_days.to_string()),
     ];
 
     frame.render_widget(
@@ -72,7 +87,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
 fn kv(key: &str, val: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key:>24}: "), theme::dim()),
+        Span::styled(format!("{key:>20}: "), theme::dim()),
         Span::styled(val, Style::default().fg(theme::TEXT)),
     ])
 }
