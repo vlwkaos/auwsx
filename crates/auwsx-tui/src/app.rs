@@ -16,15 +16,21 @@ use anyhow::{Context, Result};
 use auwsx_core::agent::codex;
 use auwsx_core::backlog::{BacklogItem, Source};
 use auwsx_core::db::agent_runs::AgentRun;
+use auwsx_core::db::arsenal::ArsenalPreset;
+use auwsx_core::db::ask_answers::{AskAnswer, AskMode};
 use auwsx_core::db::findings::Finding;
+use auwsx_core::db::global_settings::{GlobalSettings, PIPELINE_UX_GUIDANCE_MAX_CHARS};
 use auwsx_core::db::issues::Issue;
+use auwsx_core::db::memory_presets::MemoryPreset;
+use auwsx_core::db::profiles::Profile;
 use auwsx_core::db::projects::{CompletionPolicy, MergeMode, Project};
-use auwsx_core::db::scheduler_runs::SchedulerRun;
+use auwsx_core::db::scheduler_runs::{SchedulerRun, SchedulerRunSource};
 use auwsx_core::db::subtasks::Subtask;
 use auwsx_core::events::Event;
 use auwsx_core::ipc::{self, Command, Response};
 use auwsx_core::main_jobs::MainJob;
-use auwsx_core::routines::{Routine, RoutineType};
+use auwsx_core::routines::{OutputRoute, Routine};
+use auwsx_core::state::IssueStatus;
 use auwsx_core::steering::Steering;
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -36,9 +42,9 @@ use ratatui::Terminal;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// The top-level views, in tab order.
+/// The top-level views. `ORDER` is the user-facing tab cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Overview,
@@ -46,15 +52,24 @@ pub enum View {
     Backlog,
     Logs,
     Config,
+    Ask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Left,
+    ProjectKanban,
+    IssueDetail,
+    Settings,
 }
 
 impl View {
     pub const ORDER: [View; 5] = [
         View::Overview,
-        View::Issue,
         View::Backlog,
         View::Logs,
         View::Config,
+        View::Ask,
     ];
 
     fn index(self) -> usize {
@@ -110,7 +125,61 @@ pub struct TreeRow {
 pub struct ProjectChildren {
     pub routines: Vec<Routine>,
     pub backlog: Vec<BacklogItem>,
+    /// Non-terminal issues shown in the main issue list and kanban.
     pub issues: Vec<Issue>,
+    /// Terminal issues shown only through the low-frequency Archive section.
+    pub archived_issues: Vec<Issue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsRow {
+    RuntimeDefaults,
+    ProfilesOverview,
+    Profile(i64),
+    ArsenalOverview,
+    ArsenalPreset(usize),
+    MemoryOverview,
+    MemoryPreset(usize),
+    PromptCatalog,
+    PipelineUxStandard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityAction {
+    Drill,
+    NewProject,
+    NewContext,
+    Edit,
+    Ask,
+    Settings,
+    MoveMode,
+    Toggle,
+    Delete,
+    Execute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionHint {
+    pub action: CapabilityAction,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextCapabilities {
+    pub hints: Vec<ActionHint>,
+}
+
+impl ContextCapabilities {
+    fn push(&mut self, action: CapabilityAction, label: impl Into<String>) {
+        self.hints.push(ActionHint {
+            action,
+            label: label.into(),
+        });
+    }
+
+    pub fn has(&self, action: CapabilityAction) -> bool {
+        self.hints.iter().any(|hint| hint.action == action)
+    }
 }
 
 /// Everything the issue-detail pane shows, fetched together.
@@ -120,19 +189,21 @@ pub struct IssueDetail {
     pub subtasks: Vec<Subtask>,
     pub findings: Vec<Finding>,
     pub steering: Vec<Steering>,
+    pub runs: Vec<AgentRun>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormKind {
     Project,
     ProjectConfig,
+    ArsenalPreset,
     Backlog,
     BacklogEdit(i64),
     Routine,
     RoutineEdit(i64),
-    Issue,
-    Subtask,
-    Steering,
+    Ask,
+    QueueMessage,
+    GlobalSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -141,102 +212,28 @@ pub struct Form {
     pub title: &'static str,
     pub fields: Vec<FormField>,
     pub current: usize,
+    pub cursor: usize,
+    pub completion_sel: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct FormField {
-    pub key: &'static str,
     pub label: &'static str,
+    pub display: &'static str,
+    pub section: &'static str,
+    pub help: &'static str,
+    pub kind: FieldKind,
     pub value: String,
-    pub cursor: usize,
     pub optional: bool,
 }
 
-impl FormField {
-    fn new(key: &'static str, label: &'static str, value: &str, optional: bool) -> Self {
-        Self {
-            key,
-            label,
-            value: value.to_string(),
-            cursor: value.chars().count(),
-            optional,
-        }
-    }
-
-    fn char_len(&self) -> usize {
-        self.value.chars().count()
-    }
-
-    fn clamp_cursor(&mut self) {
-        self.cursor = self.cursor.min(self.char_len());
-    }
-
-    pub(crate) fn cursor_byte_index(&self) -> usize {
-        self.value
-            .char_indices()
-            .nth(self.cursor.min(self.char_len()))
-            .map(|(idx, _)| idx)
-            .unwrap_or(self.value.len())
-    }
-
-    fn byte_index_at(&self, char_pos: usize) -> usize {
-        self.value
-            .char_indices()
-            .nth(char_pos.min(self.char_len()))
-            .map(|(idx, _)| idx)
-            .unwrap_or(self.value.len())
-    }
-
-    fn set_value(&mut self, value: String) {
-        self.value = value;
-        self.cursor = self.char_len();
-    }
-
-    fn move_left(&mut self) {
-        self.clamp_cursor();
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn move_right(&mut self) {
-        self.clamp_cursor();
-        self.cursor = (self.cursor + 1).min(self.char_len());
-    }
-
-    fn move_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.char_len();
-    }
-
-    fn insert_char(&mut self, c: char) {
-        self.clamp_cursor();
-        let byte_idx = self.cursor_byte_index();
-        self.value.insert(byte_idx, c);
-        self.cursor += 1;
-    }
-
-    fn backspace(&mut self) {
-        self.clamp_cursor();
-        if self.cursor == 0 {
-            return;
-        }
-        let start = self.byte_index_at(self.cursor - 1);
-        let end = self.byte_index_at(self.cursor);
-        self.value.replace_range(start..end, "");
-        self.cursor -= 1;
-    }
-
-    fn delete(&mut self) {
-        self.clamp_cursor();
-        if self.cursor >= self.char_len() {
-            return;
-        }
-        let start = self.byte_index_at(self.cursor);
-        let end = self.byte_index_at(self.cursor + 1);
-        self.value.replace_range(start..end, "");
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldKind {
+    Text,
+    Number { unit: Option<&'static str> },
+    TextArea,
+    Select { options: &'static [&'static str] },
+    Combo { free_text: bool },
 }
 
 impl Form {
@@ -250,112 +247,150 @@ impl Form {
             kind: FormKind::Project,
             title: "New project",
             fields: vec![
-                project_field("name", "Name", "", false),
-                project_field("repo_path", "Repository", &repo, false),
-                project_field("branch", "Default branch", "main", false),
-                project_field("main_cmd", "Main command", &codex, false),
-                project_field("plan_cmd", "Plan command", &codex, false),
-                project_field("work_cmd", "Work command", &codex, false),
-                project_field("review_cmd", "Review command", &codex, true),
+                field("name", "", false),
+                field("repo_path", &repo, false),
+                field("branch", "main", false),
+                field("arsenal", "", true),
+                field("main_cmd", &codex, true),
+                field("plan_cmd", &codex, true),
+                field("work_cmd", &codex, true),
+                field("review_cmd", "", true),
+                // @tick = tick every daemon loop; blank/manual = manual-only.
+                field("schedule_cron", "@tick", true),
             ],
             current: 0,
+            cursor: 0,
+            completion_sel: 0,
         }
     }
 
     fn project_config(project: &Project) -> Self {
+        let schedule_value = project.schedule_cron.clone().or_else(|| {
+            auwsx_core::schedule::legacy_interval_to_cron(project.schedule_interval_min)
+        });
+        let deepsleep_value = project.deepsleep_cron.clone().or_else(|| {
+            auwsx_core::schedule::legacy_deepsleep_to_cron(project.deepsleep_interval_days)
+        });
         Self {
             kind: FormKind::ProjectConfig,
             title: "Project config",
             fields: vec![
-                project_field("name", "Name", &project.name, false),
-                project_field("repo_path", "Repository", &project.repo_path, false),
-                project_field("branch", "Default branch", &project.default_branch, false),
-                project_field("main_cmd", "Main command", &project.main_agent_cmd, false),
-                project_field("plan_cmd", "Plan command", &project.plan_agent_cmd, false),
-                project_field("work_cmd", "Work command", &project.work_agent_cmd, false),
-                project_field(
-                    "review_cmd",
-                    "Review command",
-                    project.review_agent_cmd.as_deref().unwrap_or(""),
+                field("name", &project.name, false),
+                field("repo_path", &project.repo_path, false),
+                field("branch", &project.default_branch, false),
+                field(
+                    "arsenal",
+                    project.arsenal_preset_name.as_deref().unwrap_or(""),
                     true,
                 ),
-                project_field(
-                    "completion",
-                    "Completion policy",
-                    project.completion_policy.as_str(),
-                    false,
+                field(
+                    "main_cmd",
+                    project.main_agent_cmd_override.as_deref().unwrap_or(""),
+                    true,
                 ),
-                project_field(
+                field(
+                    "plan_cmd",
+                    project.plan_agent_cmd_override.as_deref().unwrap_or(""),
+                    true,
+                ),
+                field(
+                    "work_cmd",
+                    project.work_agent_cmd_override.as_deref().unwrap_or(""),
+                    true,
+                ),
+                field(
+                    "review_cmd",
+                    project.review_agent_cmd_override.as_deref().unwrap_or(""),
+                    true,
+                ),
+                field("completion", project.completion_policy.as_str(), false),
+                field(
                     "plan_gate",
-                    "Plan gate timeout",
                     &project.plan_gate_timeout_min.to_string(),
                     false,
                 ),
-                project_field(
-                    "complete_gate",
-                    "Completion timeout",
+                field(
+                    "merge_delay",
                     &project.completion_soft_timeout_min.to_string(),
                     false,
                 ),
-                project_field(
+                field(
                     "iter_timeout",
-                    "Iteration timeout",
                     &project.iteration_timeout_min.to_string(),
                     false,
                 ),
-                project_field(
+                field(
                     "main_job_timeout",
-                    "Main job timeout",
                     &project.main_job_timeout_min.to_string(),
                     false,
                 ),
-                project_field(
+                field(
                     "review_rounds",
-                    "Review rounds",
                     &project.review_max_rounds.to_string(),
                     false,
                 ),
-                project_field(
+                field(
                     "conflict_attempts",
-                    "Conflict attempts",
                     &project.conflict_max_attempts.to_string(),
                     false,
                 ),
-                project_field(
-                    "concurrency",
-                    "Concurrency",
-                    &project.max_concurrency.to_string(),
-                    false,
-                ),
-                project_field(
-                    "schedule_min",
-                    "Schedule interval",
-                    &project
-                        .schedule_interval_min
-                        .map(|v| v.to_string())
-                        .unwrap_or_default(),
+                field("concurrency", &project.max_concurrency.to_string(), false),
+                field(
+                    "schedule_cron",
+                    schedule_value.as_deref().unwrap_or(""),
                     true,
                 ),
-                project_field(
-                    "merge_mode",
-                    "Merge mode",
-                    project.merge_mode.as_str(),
-                    false,
-                ),
-                project_field(
+                field("merge_mode", project.merge_mode.as_str(), false),
+                field(
                     "skill_path",
-                    "Skills path",
                     project.skill_path.as_deref().unwrap_or(""),
                     true,
                 ),
-                project_field(
-                    "deepsleep_days",
-                    "Deepsleep interval",
-                    &project.deepsleep_interval_days.to_string(),
+                field(
+                    "deepsleep_cron",
+                    deepsleep_value.as_deref().unwrap_or(""),
                     false,
                 ),
             ],
             current: 0,
+            cursor: project.name.chars().count(),
+            completion_sel: 0,
+        }
+    }
+
+    fn arsenal_preset(preset: Option<&ArsenalPreset>) -> Self {
+        let codex = codex::DEFAULT_CMD.to_string();
+        Self {
+            kind: FormKind::ArsenalPreset,
+            title: "Arsenal preset",
+            fields: vec![
+                field("name", preset.map(|p| p.name.as_str()).unwrap_or(""), false),
+                field(
+                    "main_cmd",
+                    preset.map(|p| p.main_agent_cmd.as_str()).unwrap_or(&codex),
+                    false,
+                ),
+                field(
+                    "plan_cmd",
+                    preset.map(|p| p.plan_agent_cmd.as_str()).unwrap_or(&codex),
+                    false,
+                ),
+                field(
+                    "work_cmd",
+                    preset.map(|p| p.work_agent_cmd.as_str()).unwrap_or(&codex),
+                    false,
+                ),
+                field(
+                    "review_cmd",
+                    preset
+                        .and_then(|p| p.review_agent_cmd.as_deref())
+                        .unwrap_or(""),
+                    true,
+                ),
+            ],
+            current: 0,
+            cursor: preset.map(|p| p.name.chars().count()).unwrap_or_default(),
+            completion_sel: 0,
         }
     }
 
@@ -365,6 +400,8 @@ impl Form {
             title: "New backlog item",
             fields: vec![field("text", "", false)],
             current: 0,
+            cursor: 0,
+            completion_sel: 0,
         }
     }
 
@@ -374,6 +411,8 @@ impl Form {
             title: "Edit backlog item",
             fields: vec![field("text", &item.text, false)],
             current: 0,
+            cursor: item.text.chars().count(),
+            completion_sel: 0,
         }
     }
 
@@ -383,13 +422,15 @@ impl Form {
             title: "New routine",
             fields: vec![
                 field("name", "", false),
-                field("type", "report", false),
+                field("output", "report", false),
                 field("cron", "0 9 * * *", false),
                 field("prompt", "", false),
                 field("writable_paths", "", true),
                 field("enabled", "true", false),
             ],
             current: 0,
+            cursor: 0,
+            completion_sel: 0,
         }
     }
 
@@ -399,7 +440,7 @@ impl Form {
             title: "Edit routine",
             fields: vec![
                 field("name", &routine.name, false),
-                field("type", routine.routine_type.as_str(), false),
+                field("output", routine.output_route.as_str(), false),
                 field("cron", &routine.cron, false),
                 field("prompt", &routine.prompt, false),
                 field(
@@ -414,43 +455,66 @@ impl Form {
                 ),
             ],
             current: 0,
-        }
-    }
-
-    fn issue() -> Self {
-        Self {
-            kind: FormKind::Issue,
-            title: "New issue",
-            fields: vec![field("title", "", false), field("description", "", true)],
-            current: 0,
-        }
-    }
-
-    fn subtask(next_ord: i64) -> Self {
-        Self {
-            kind: FormKind::Subtask,
-            title: "New subtask",
-            fields: vec![
-                field("ord", &next_ord.to_string(), false),
-                field("text", "", false),
-            ],
-            current: 1,
+            cursor: 0,
+            completion_sel: 0,
         }
     }
 
     fn steering() -> Self {
         Self {
-            kind: FormKind::Steering,
-            title: "New steering note",
+            kind: FormKind::QueueMessage,
+            title: "New queue message",
             fields: vec![field("note", "", false)],
             current: 0,
+            cursor: 0,
+            completion_sel: 0,
+        }
+    }
+
+    fn ask() -> Self {
+        Self {
+            kind: FormKind::Ask,
+            title: "Ask project",
+            fields: vec![field("mode", "recall", false), field("question", "", false)],
+            current: 1,
+            cursor: 0,
+            completion_sel: 0,
+        }
+    }
+
+    fn global_settings(settings: Option<&GlobalSettings>) -> Self {
+        Self {
+            kind: FormKind::GlobalSettings,
+            title: "Global settings",
+            fields: vec![
+                field(
+                    "memory_preset",
+                    settings
+                        .map(|settings| settings.memory_preset_name.as_str())
+                        .unwrap_or("portable-markdown"),
+                    false,
+                ),
+                textarea_field(
+                    "pipeline_ux_guidance",
+                    "Worker guidance",
+                    "Pipeline UX Standard",
+                    "Persistent non-secret guidance injected into issue worker prompts.",
+                    settings
+                        .map(|settings| settings.pipeline_ux_guidance.as_str())
+                        .unwrap_or(DEFAULT_PIPELINE_UX_GUIDANCE),
+                    false,
+                ),
+            ],
+            current: 0,
+            cursor: 0,
+            completion_sel: 0,
         }
     }
 
     fn get(&self, label: &str) -> String {
         self.fields
             .iter()
-            .find(|f| f.key == label)
+            .find(|f| f.label == label)
             .map(|f| f.value.trim().to_string())
             .unwrap_or_default()
     }
@@ -460,51 +524,315 @@ impl Form {
         (!s.is_empty()).then_some(s)
     }
 
+    fn set(&mut self, label: &str, value: &str) {
+        let Some(idx) = self.fields.iter().position(|f| f.label == label) else {
+            return;
+        };
+        if let Some(field) = self.fields.get_mut(idx) {
+            field.value = value.to_string();
+        }
+        if idx == self.current {
+            self.clamp_cursor();
+        }
+    }
+
+    fn current_field_mut(&mut self) -> Option<&mut FormField> {
+        self.fields.get_mut(self.current)
+    }
+
+    pub fn current_field(&self) -> Option<&FormField> {
+        self.fields.get(self.current)
+    }
+
+    fn current_len(&self) -> usize {
+        self.current_field()
+            .map(|field| field.value.chars().count())
+            .unwrap_or(0)
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.cursor = self.cursor.min(self.current_len());
+    }
+
+    fn move_field(&mut self, delta: isize) {
+        let len = self.fields.len();
+        if len == 0 {
+            self.current = 0;
+            self.cursor = 0;
+            return;
+        }
+        self.current = if delta < 0 {
+            self.current.saturating_sub(delta.unsigned_abs())
+        } else {
+            (self.current + delta as usize).min(len - 1)
+        };
+        self.cursor = self.current_len();
+        self.completion_sel = 0;
+    }
+
+    fn set_current_value(&mut self, value: String) {
+        if let Some(field) = self.current_field_mut() {
+            field.value = value;
+        }
+        self.cursor = self.current_len();
+        self.completion_sel = 0;
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let cursor = self.cursor;
+        if let Some(field) = self.current_field_mut() {
+            let byte_idx = char_to_byte_idx(&field.value, cursor);
+            field.value.insert(byte_idx, c);
+        }
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let cursor = self.cursor;
+        if let Some(field) = self.current_field_mut() {
+            let start = char_to_byte_idx(&field.value, cursor - 1);
+            let end = char_to_byte_idx(&field.value, cursor);
+            field.value.replace_range(start..end, "");
+        }
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        let cursor = self.cursor;
+        if cursor >= self.current_len() {
+            return;
+        }
+        if let Some(field) = self.current_field_mut() {
+            let start = char_to_byte_idx(&field.value, cursor);
+            let end = char_to_byte_idx(&field.value, cursor + 1);
+            field.value.replace_range(start..end, "");
+        }
+    }
+
     fn missing_required(&self) -> Option<&'static str> {
         self.fields
             .iter()
             .find(|f| !f.optional && f.value.trim().is_empty())
             .map(|f| f.label)
     }
+}
 
-    fn label_for<'a>(&'a self, key: &'a str) -> &'a str {
-        self.fields
-            .iter()
-            .find(|f| f.key == key)
-            .map(|f| f.label)
-            .unwrap_or(key)
-    }
+const COMPLETION_OPTIONS: &[&str] = &["manual", "soft", "auto"];
+const MERGE_MODE_OPTIONS: &[&str] = &["local", "pr"];
+const OUTPUT_ROUTE_OPTIONS: &[&str] = &["report", "backlog", "memory"];
+const BOOL_OPTIONS: &[&str] = &["true", "false"];
+const ASK_MODE_OPTIONS: &[&str] = &["recall", "seek"];
+const DEFAULT_PIPELINE_UX_GUIDANCE: &str = "Build auwsx as an operator console. Derive visible actions from current capabilities, preserve focus/return context, use typed controls for closed domains, avoid duplicate paths, handle invalid/terminal states explicitly, and cover failure/restoration paths instead of only happy paths.";
+
+fn char_to_byte_idx(value: &str, char_idx: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len())
 }
 
 fn field(label: &'static str, value: &str, optional: bool) -> FormField {
-    FormField::new(label, label, value, optional)
+    let (display, section, help, kind) = match label {
+        "name" => ("Name", "Identity", "", FieldKind::Text),
+        "repo_path" => (
+            "Repository path",
+            "Repository",
+            "Path to the git repository.",
+            FieldKind::Combo { free_text: true },
+        ),
+        "branch" => ("Default branch", "Repository", "", FieldKind::Text),
+        "arsenal" => (
+            "Arsenal preset",
+            "Agents",
+            "Pick an existing preset or leave blank for custom commands.",
+            FieldKind::Combo { free_text: false },
+        ),
+        "main_cmd" => ("Main command", "Agents", "", FieldKind::TextArea),
+        "plan_cmd" => ("Plan command", "Agents", "", FieldKind::TextArea),
+        "work_cmd" => ("Work command", "Agents", "", FieldKind::TextArea),
+        "review_cmd" => (
+            "Review command",
+            "Agents",
+            "Blank falls back to work command.",
+            FieldKind::TextArea,
+        ),
+        "completion" => (
+            "Completion policy",
+            "Pipeline",
+            "",
+            FieldKind::Select {
+                options: COMPLETION_OPTIONS,
+            },
+        ),
+        "plan_gate" => (
+            "Plan gate",
+            "Pipeline",
+            "Minutes before PLAN_READY auto-releases.",
+            FieldKind::Number { unit: Some("min") },
+        ),
+        "merge_delay" => (
+            "Merge delay",
+            "Merge",
+            "Minutes before READY_TO_MERGE auto-releases under soft policy.",
+            FieldKind::Number { unit: Some("min") },
+        ),
+        "iter_timeout" => (
+            "Worker timeout",
+            "Pipeline",
+            "",
+            FieldKind::Number { unit: Some("min") },
+        ),
+        "main_job_timeout" => (
+            "Routine timeout",
+            "Pipeline",
+            "",
+            FieldKind::Number { unit: Some("min") },
+        ),
+        "review_rounds" => (
+            "Review rounds",
+            "Pipeline",
+            "",
+            FieldKind::Number { unit: None },
+        ),
+        "conflict_attempts" => (
+            "Conflict attempts",
+            "Merge",
+            "",
+            FieldKind::Number { unit: None },
+        ),
+        "concurrency" => (
+            "Concurrency",
+            "Scheduler",
+            "Project-local maximum active issues.",
+            FieldKind::Number { unit: None },
+        ),
+        "merge_mode" => (
+            "Merge mode",
+            "Merge",
+            "",
+            FieldKind::Select {
+                options: MERGE_MODE_OPTIONS,
+            },
+        ),
+        "schedule_cron" => (
+            "Scheduler cadence",
+            "Schedule",
+            "Use cron or shorthand: @tick, manual, 30m, 1h, 1d.",
+            FieldKind::Text,
+        ),
+        "skill_path" => ("Skill path", "Knowledge", "", FieldKind::Text),
+        "deepsleep_cron" => (
+            "Deepsleep cadence",
+            "Knowledge",
+            "Use cron or shorthand. Blank/manual disables the project-owned memory routine.",
+            FieldKind::Text,
+        ),
+        "memory_preset" => (
+            "Memory preset",
+            "Memory",
+            "Pick an existing Memory preset. portable-markdown is local; auwsx-skills uses the configured skill stack.",
+            FieldKind::Combo { free_text: false },
+        ),
+        "text" => ("Text", "Content", "", FieldKind::TextArea),
+        "output" => (
+            "Output route",
+            "Output",
+            "",
+            FieldKind::Select {
+                options: OUTPUT_ROUTE_OPTIONS,
+            },
+        ),
+        "cron" => ("Cron", "Schedule", "", FieldKind::Text),
+        "prompt" => ("Prompt", "Prompt", "", FieldKind::TextArea),
+        "writable_paths" => (
+            "Memory scope",
+            "Safety",
+            "Optional scope hint for memory routines; not source write permission.",
+            FieldKind::TextArea,
+        ),
+        "enabled" => (
+            "Enabled",
+            "Schedule",
+            "",
+            FieldKind::Select {
+                options: BOOL_OPTIONS,
+            },
+        ),
+        "note" => ("Queue message", "Content", "", FieldKind::TextArea),
+        "mode" => (
+            "Mode",
+            "Question",
+            "",
+            FieldKind::Select {
+                options: ASK_MODE_OPTIONS,
+            },
+        ),
+        "question" => ("Question", "Question", "", FieldKind::TextArea),
+        _ => (label, "General", "", FieldKind::Text),
+    };
+    FormField {
+        label,
+        display,
+        section,
+        help,
+        kind,
+        value: value.to_string(),
+        optional,
+    }
 }
 
-fn project_field(key: &'static str, label: &'static str, value: &str, optional: bool) -> FormField {
-    FormField::new(key, label, value, optional)
+fn textarea_field(
+    label: &'static str,
+    display: &'static str,
+    section: &'static str,
+    help: &'static str,
+    value: &str,
+    optional: bool,
+) -> FormField {
+    FormField {
+        label,
+        display,
+        section,
+        help,
+        kind: FieldKind::TextArea,
+        value: value.to_string(),
+        optional,
+    }
 }
 
 fn parse_i64(form: &Form, label: &'static str, status: &mut String) -> Option<i64> {
     match form.get(label).parse::<i64>() {
         Ok(value) => Some(value),
         Err(_) => {
-            *status = format!("{} must be an integer", form.label_for(label));
+            *status = format!("{label} must be an integer");
             None
         }
     }
 }
 
-fn parse_opt_i64(form: &Form, label: &'static str, status: &mut String) -> Option<Option<i64>> {
+fn parse_cadence(form: &Form, label: &'static str, status: &mut String) -> Option<Option<String>> {
     let raw = form.get(label);
-    if raw.is_empty() {
-        return Some(None);
-    }
-    match raw.parse::<i64>() {
-        Ok(value) => Some(Some(value)),
-        Err(_) => {
-            *status = format!("{} must be blank or an integer", form.label_for(label));
+    match auwsx_core::schedule::normalize_cadence_input(&raw) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            *status = format!("{label}: {e}");
             None
         }
+    }
+}
+
+fn cron_days_hint(cron: &str) -> Option<i64> {
+    match cron {
+        "0 0 * * *" => Some(1),
+        "0 0 * * 0" => Some(7),
+        _ => cron
+            .strip_prefix("0 0 */")
+            .and_then(|rest| rest.strip_suffix(" * *"))
+            .and_then(|days| days.parse::<i64>().ok()),
     }
 }
 
@@ -513,43 +841,145 @@ fn parse_bool(form: &Form, label: &'static str, status: &mut String) -> Option<b
         "true" | "yes" | "1" | "on" => Some(true),
         "false" | "no" | "0" | "off" => Some(false),
         _ => {
-            *status = format!("{} must be true or false", form.label_for(label));
+            *status = format!("{label} must be true or false");
             None
         }
     }
 }
 
-fn parse_choice<T>(
+fn project_tree_label(
+    name: &str,
+    schedule: &str,
+    children: &ProjectChildren,
+    expanded: bool,
+) -> String {
+    if expanded {
+        format!("{name}  {schedule}")
+    } else {
+        format!(
+            "{name}  {schedule}  R{} B{} I{}{}",
+            children.routines.len(),
+            children.backlog.len(),
+            children.issues.len(),
+            project_archive_count_label(children)
+        )
+    }
+}
+
+fn project_archive_count_label(children: &ProjectChildren) -> String {
+    if children.archived_issues.is_empty() {
+        String::new()
+    } else {
+        format!(" A{}", children.archived_issues.len())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectAgentConfig {
+    arsenal_preset_name: Option<String>,
+    main: String,
+    plan: String,
+    work: String,
+    review: Option<String>,
+}
+
+fn required_cmd(form: &Form, label: &'static str, status: &mut String) -> Option<String> {
+    let value = form.get(label);
+    if value.is_empty() {
+        *status = format!("{label} is required unless an Arsenal preset is selected");
+        return None;
+    }
+    Some(value)
+}
+
+fn project_agent_config_from_form(
     form: &Form,
-    label: &'static str,
-    expected: &str,
-    parse: impl FnOnce(&str) -> Option<T>,
+    preset: Option<&ArsenalPreset>,
     status: &mut String,
-) -> Option<T> {
-    match parse(&form.get(label)) {
+) -> Option<ProjectAgentConfig> {
+    if !form.get("arsenal").is_empty() && preset.is_none() {
+        *status = format!("unknown Arsenal preset {}", form.get("arsenal"));
+        return None;
+    }
+    let has_preset = preset.is_some();
+    Some(ProjectAgentConfig {
+        arsenal_preset_name: preset.map(|p| p.name.clone()),
+        main: form
+            .opt("main_cmd")
+            .or_else(|| has_preset.then(String::new))
+            .or_else(|| required_cmd(form, "main_cmd", status))?,
+        plan: form
+            .opt("plan_cmd")
+            .or_else(|| has_preset.then(String::new))
+            .or_else(|| required_cmd(form, "plan_cmd", status))?,
+        work: form
+            .opt("work_cmd")
+            .or_else(|| has_preset.then(String::new))
+            .or_else(|| required_cmd(form, "work_cmd", status))?,
+        review: form.opt("review_cmd"),
+    })
+}
+
+fn add_project_command_from_form(
+    form: &Form,
+    preset: Option<&ArsenalPreset>,
+    status: &mut String,
+) -> Option<Command> {
+    let schedule_cron = parse_cadence(form, "schedule_cron", status)?;
+    let agent_config = project_agent_config_from_form(form, preset, status)?;
+    Some(Command::AddProject {
+        name: form.get("name"),
+        repo_path: form.get("repo_path"),
+        default_branch: form.get("branch"),
+        arsenal_preset_name: agent_config.arsenal_preset_name,
+        main_agent_cmd: agent_config.main,
+        plan_agent_cmd: agent_config.plan,
+        work_agent_cmd: agent_config.work,
+        review_agent_cmd: agent_config.review,
+        completion_policy: None,
+        plan_gate_timeout_min: None,
+        completion_soft_timeout_min: None,
+        schedule_interval_min: None,
+        schedule_cron,
+    })
+}
+
+fn parse_output_route(form: &Form, status: &mut String) -> Option<OutputRoute> {
+    match OutputRoute::from_str(&form.get("output")) {
         Some(value) => Some(value),
         None => {
-            *status = format!("{} must be {expected}", form.label_for(label));
+            *status = "output must be report, backlog, or memory".into();
             None
         }
     }
 }
 
-fn parse_routine_type(form: &Form, status: &mut String) -> Option<RoutineType> {
-    parse_choice(
-        form,
-        "type",
-        "report, idea, or knowledge",
-        RoutineType::from_str,
-        status,
-    )
+fn daemon_tick_secs() -> i64 {
+    std::env::var("AUWSX_TICK_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(10)
+        .max(1)
+}
+
+fn issue_delete_hint(status: IssueStatus) -> &'static str {
+    match status {
+        IssueStatus::Done | IssueStatus::Abandoned => "d archive",
+        IssueStatus::Failed => "d cleanup",
+        _ => "d abandon",
+    }
 }
 
 pub struct App {
     pub socket: PathBuf,
     pub view: View,
+    pub focus: Focus,
 
     pub projects: Vec<Project>,
+    pub profiles: Vec<Profile>,
+    pub arsenal_presets: Vec<ArsenalPreset>,
+    pub memory_presets: Vec<MemoryPreset>,
+    pub global_settings: Option<GlobalSettings>,
     /// Index of the "active" project — the one the cursor currently sits in.
     /// Kept in sync with `tree_sel` so the detail pane and per-project activity
     /// (recent runs, config) track the cursor across project boundaries.
@@ -561,12 +991,28 @@ pub struct App {
     pub issue_sel: usize,
     pub backlog_sel: usize,
     pub tree_sel: usize,
+    pub kanban_lane_sel: usize,
+    pub kanban_card_sel: usize,
+    pub issue_section_sel: usize,
+    pub issue_return_focus: Focus,
+    pub issue_return_tree_sel: Option<usize>,
+    pub move_mode: bool,
     pub detail: IssueDetail,
     pub recent_agent_runs: Vec<AgentRun>,
     pub recent_main_jobs: Vec<MainJob>,
     pub recent_scheduler_runs: Vec<SchedulerRun>,
+    pub ask_answers: Vec<AskAnswer>,
+    pub daemon_tick_secs: i64,
+    /// Per-project epoch ms of the most recent AUTO scheduler tick.
+    /// Used by the tree to render live countdowns without a per-project detail fetch.
+    pub last_auto_tick: HashMap<i64, i64>,
     pub log_tail: String,
     pub log_tail_path: Option<String>,
+    /// Issue log scroll offset measured from the newest visible line.
+    pub issue_log_scroll: usize,
+    /// Settings scroll offset for long config/prompt review content.
+    pub config_scroll: usize,
+    pub settings_sel: usize,
 
     /// Most-recent-last ring of formatted daemon events for the Logs view.
     pub log: VecDeque<String>,
@@ -574,8 +1020,12 @@ pub struct App {
     pub connected: bool,
     /// A transient status/error message shown in the footer.
     pub status: String,
+    pub status_until: Option<Instant>,
     /// Active inline data-entry form, rendered as a modal overlay.
     pub form: Option<Form>,
+    /// When true, the quit-with-daemon confirm popup is open.
+    pub confirm_quit: bool,
+    pub pending_project_delete: Option<i64>,
     /// Git repos discovered under `$HOME` (display paths), for the New-project
     /// form's `repo_path` completion. Populated once by a background scan.
     pub scanned_repos: Vec<String>,
@@ -588,30 +1038,50 @@ impl App {
         App {
             socket,
             view: View::Overview,
+            focus: Focus::Left,
             projects: Vec::new(),
+            profiles: Vec::new(),
+            arsenal_presets: Vec::new(),
+            memory_presets: Vec::new(),
+            global_settings: None,
             proj_sel: 0,
             children: HashMap::new(),
             expanded: HashSet::new(),
             issue_sel: 0,
             backlog_sel: 0,
             tree_sel: 0,
+            kanban_lane_sel: 0,
+            kanban_card_sel: 0,
+            issue_section_sel: 0,
+            issue_return_focus: Focus::Left,
+            issue_return_tree_sel: None,
+            move_mode: false,
             detail: IssueDetail::default(),
             recent_agent_runs: Vec::new(),
             recent_main_jobs: Vec::new(),
             recent_scheduler_runs: Vec::new(),
+            ask_answers: Vec::new(),
+            daemon_tick_secs: daemon_tick_secs(),
+            last_auto_tick: HashMap::new(),
             log_tail: String::new(),
             log_tail_path: None,
+            issue_log_scroll: 0,
+            config_scroll: 0,
+            settings_sel: 0,
             log: VecDeque::new(),
             connected: false,
             status: String::new(),
+            status_until: None,
             form: None,
+            confirm_quit: false,
+            pending_project_delete: None,
             scanned_repos: Vec::new(),
         }
     }
 
-    /// Fuzzy-completion suggestions for the project `repo_path` field, based on
-    /// the current field text. Empty unless a project form is open on that field.
-    /// Capped to keep the dropdown short.
+    /// Fuzzy-completion suggestions for the New-project `repo_path` field, based
+    /// on the current field text. Empty unless a Project form is open on that
+    /// field. Capped to keep the dropdown short.
     pub fn repo_suggestions(&self) -> Vec<String> {
         let Some(form) = &self.form else {
             return Vec::new();
@@ -622,10 +1092,196 @@ impl App {
         let Some(field) = form.fields.get(form.current) else {
             return Vec::new();
         };
-        if field.key != "repo_path" {
+        if field.label != "repo_path" {
             return Vec::new();
         }
         crate::repo_scan::filter_repos(&field.value, &self.scanned_repos, 8)
+    }
+
+    /// Preset-name completions for the `arsenal` field in project forms.
+    /// Tab accepts the top match and expands it into the four agent commands.
+    pub fn arsenal_suggestions(&self) -> Vec<String> {
+        let Some(form) = &self.form else {
+            return Vec::new();
+        };
+        if !matches!(form.kind, FormKind::Project | FormKind::ProjectConfig) {
+            return Vec::new();
+        }
+        let Some(field) = form.fields.get(form.current) else {
+            return Vec::new();
+        };
+        if field.label != "arsenal" {
+            return Vec::new();
+        }
+        let query = field.value.trim().to_lowercase();
+        self.arsenal_presets
+            .iter()
+            .filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query))
+            .take(8)
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    pub fn memory_preset_suggestions(&self) -> Vec<String> {
+        let Some(form) = &self.form else {
+            return Vec::new();
+        };
+        if !matches!(form.kind, FormKind::GlobalSettings) {
+            return Vec::new();
+        }
+        let Some(field) = form.fields.get(form.current) else {
+            return Vec::new();
+        };
+        if field.label != "memory_preset" {
+            return Vec::new();
+        }
+        let query = field.value.trim().to_lowercase();
+        self.memory_presets
+            .iter()
+            .filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query))
+            .take(8)
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    pub fn active_suggestions(&self) -> Vec<String> {
+        let repo = self.repo_suggestions();
+        if !repo.is_empty() {
+            return repo;
+        }
+        let arsenal = self.arsenal_suggestions();
+        if !arsenal.is_empty() {
+            return arsenal;
+        }
+        self.memory_preset_suggestions()
+    }
+
+    pub fn selected_suggestion_index(&self) -> usize {
+        let count = self.active_suggestions().len();
+        if count == 0 {
+            return 0;
+        }
+        self.form
+            .as_ref()
+            .map(|form| form.completion_sel.min(count - 1))
+            .unwrap_or(0)
+    }
+
+    fn move_completion(&mut self, delta: isize) -> bool {
+        let count = self.active_suggestions().len();
+        if count == 0 {
+            return false;
+        }
+        if let Some(form) = self.form.as_mut() {
+            step(&mut form.completion_sel, delta, count);
+        }
+        true
+    }
+
+    fn accept_completion(&mut self) -> bool {
+        let suggestions = self.active_suggestions();
+        if suggestions.is_empty() {
+            return false;
+        }
+        let idx = self.selected_suggestion_index();
+        let Some(value) = suggestions.get(idx).cloned() else {
+            return false;
+        };
+        if !self.memory_preset_suggestions().is_empty() {
+            if let Some(form) = self.form.as_mut() {
+                form.set_current_value(value);
+            }
+        } else if self.repo_suggestions().is_empty() {
+            if let Some(preset) = self.find_arsenal_preset(&value) {
+                if let Some(form) = self.form.as_mut() {
+                    Self::select_arsenal_preset(form, &preset);
+                }
+            }
+        } else if let Some(form) = self.form.as_mut() {
+            form.set_current_value(value);
+        }
+        true
+    }
+
+    fn cycle_current_select(&mut self, delta: isize) -> bool {
+        let Some(form) = self.form.as_mut() else {
+            return false;
+        };
+        let Some(field) = form.current_field() else {
+            return false;
+        };
+        let options = match &field.kind {
+            FieldKind::Select { options } => *options,
+            _ => return false,
+        };
+        if options.is_empty() {
+            return false;
+        }
+        let current = options
+            .iter()
+            .position(|option| *option == field.value)
+            .unwrap_or(0);
+        let mut idx = current;
+        step(&mut idx, delta, options.len());
+        form.set_current_value(options[idx].to_string());
+        true
+    }
+
+    fn find_arsenal_preset(&self, name: &str) -> Option<ArsenalPreset> {
+        let needle = name.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        self.arsenal_presets
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(needle))
+            .cloned()
+    }
+
+    fn select_arsenal_preset(form: &mut Form, preset: &ArsenalPreset) {
+        form.set("arsenal", &preset.name);
+        form.set("main_cmd", "");
+        form.set("plan_cmd", "");
+        form.set("work_cmd", "");
+        form.set("review_cmd", "");
+    }
+
+    fn project_matching_arsenal(&self, project: &Project) -> Option<ArsenalPreset> {
+        if let Some(name) = &project.arsenal_preset_name {
+            return self.find_arsenal_preset(name);
+        }
+        self.arsenal_presets
+            .iter()
+            .find(|preset| {
+                project.main_agent_cmd == preset.main_agent_cmd
+                    && project.plan_agent_cmd == preset.plan_agent_cmd
+                    && project.work_agent_cmd == preset.work_agent_cmd
+                    && project.review_agent_cmd == preset.review_agent_cmd
+            })
+            .cloned()
+    }
+
+    fn new_project_form(&self) -> Form {
+        let mut form = Form::project();
+        if let Some(preset) = self
+            .arsenal_presets
+            .iter()
+            .find(|preset| preset.name == "codex")
+            .or_else(|| self.arsenal_presets.first())
+        {
+            Self::select_arsenal_preset(&mut form, preset);
+        }
+        form
+    }
+
+    fn project_config_form(&self, project: &Project) -> Form {
+        let mut form = Form::project_config(project);
+        if project.arsenal_preset_name.is_none() {
+            if let Some(preset) = self.project_matching_arsenal(project) {
+                Self::select_arsenal_preset(&mut form, &preset);
+            }
+        }
+        form
     }
 
     /// The "active" project id — the one the cursor currently sits in.
@@ -661,22 +1317,124 @@ impl App {
             .unwrap_or(&[])
     }
 
-    /// The currently-selected issue id (if the cursor is on one).
-    pub fn selected_issue_id(&self) -> Option<i64> {
-        match self.selected_tree_item() {
-            Some(TreeItem::Issue { id, .. }) => Some(id),
-            _ => self.issues().get(self.issue_sel).map(|i| i.id),
+    /// Archived terminal issues of the active project.
+    pub fn archived_issues(&self) -> &[Issue] {
+        self.selected_project_id()
+            .and_then(|id| self.children_of(id))
+            .map(|c| c.archived_issues.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn active_profile_name(&self) -> &str {
+        let Some(project) = self.projects.get(self.proj_sel) else {
+            return "default";
+        };
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == project.profile_id)
+            .map(|profile| profile.name.as_str())
+            .unwrap_or("default")
+    }
+
+    pub fn settings_rows(&self) -> Vec<SettingsRow> {
+        let mut rows = vec![
+            SettingsRow::RuntimeDefaults,
+            SettingsRow::ArsenalOverview,
+            SettingsRow::MemoryOverview,
+            SettingsRow::ProfilesOverview,
+        ];
+        for profile in &self.profiles {
+            rows.push(SettingsRow::Profile(profile.id));
+        }
+        for idx in 0..self.arsenal_presets.len() {
+            rows.push(SettingsRow::ArsenalPreset(idx));
+        }
+        for idx in 0..self.memory_presets.len() {
+            rows.push(SettingsRow::MemoryPreset(idx));
+        }
+        rows.push(SettingsRow::PromptCatalog);
+        rows.push(SettingsRow::PipelineUxStandard);
+        rows
+    }
+
+    pub fn selected_settings_row(&self) -> SettingsRow {
+        let rows = self.settings_rows();
+        rows.get(self.settings_sel)
+            .cloned()
+            .unwrap_or(SettingsRow::RuntimeDefaults)
+    }
+
+    fn move_settings_row(&mut self, delta: isize) {
+        let max = self.settings_rows().len().saturating_sub(1);
+        self.settings_sel = self.settings_sel.saturating_add_signed(delta).min(max);
+        self.config_scroll = 0;
+    }
+
+    fn jump_settings_top(&mut self) {
+        self.settings_sel = 0;
+        self.config_scroll = 0;
+    }
+
+    fn jump_settings_bottom(&mut self) {
+        self.settings_sel = self.settings_rows().len().saturating_sub(1);
+        self.config_scroll = 0;
+    }
+
+    fn edit_selected_setting(&mut self) {
+        match self.selected_settings_row() {
+            SettingsRow::ArsenalPreset(idx) => {
+                self.form = Some(Form::arsenal_preset(self.arsenal_presets.get(idx)));
+            }
+            SettingsRow::MemoryPreset(_) | SettingsRow::MemoryOverview => {
+                self.form = Some(Form::global_settings(self.global_settings.as_ref()));
+            }
+            SettingsRow::PipelineUxStandard => {
+                self.form = Some(Form::global_settings(self.global_settings.as_ref()));
+            }
+            SettingsRow::RuntimeDefaults => {
+                self.status = "select a settings section to edit".into();
+            }
+            SettingsRow::ArsenalOverview => {
+                self.form = Some(Form::arsenal_preset(None));
+            }
+            SettingsRow::ProfilesOverview => {
+                self.status = "profile management is project-driven for now".into();
+            }
+            SettingsRow::Profile(_) => {
+                self.status = "profile editing is not wired yet".into();
+            }
+            SettingsRow::PromptCatalog => {
+                self.status = "prompt catalog is review-only".into();
+            }
         }
     }
 
-    fn selected_backlog_id(&self) -> Option<i64> {
+    /// The currently-selected issue id (if the cursor is on one).
+    pub fn selected_issue_id(&self) -> Option<i64> {
+        if self.focus == Focus::IssueDetail {
+            if let Some(issue) = &self.detail.issue {
+                return Some(issue.id);
+            }
+        }
+        if self.focus == Focus::ProjectKanban {
+            return match self.selected_kanban_item() {
+                Some(ui::vm::KanbanItem::Issue(id)) => Some(id),
+                _ => None,
+            };
+        }
         match self.selected_tree_item() {
-            Some(TreeItem::Backlog { id, .. }) => Some(id),
-            _ => self.backlog().get(self.backlog_sel).map(|b| b.id),
+            Some(TreeItem::Issue { id, .. }) => Some(id),
+            _ if self.view == View::Issue => self.issues().get(self.issue_sel).map(|i| i.id),
+            _ => None,
         }
     }
 
     pub fn tree_rows(&self) -> Vec<TreeRow> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         let mut rows = Vec::new();
         if self.projects.is_empty() {
             return rows;
@@ -685,15 +1443,26 @@ impl App {
             let expanded = self.expanded.contains(&p.id);
             let empty = ProjectChildren::default();
             let kids = self.children.get(&p.id).unwrap_or(&empty);
+            let last = self.last_auto_tick.get(&p.id).copied();
+            let interval = crate::ui::schedule::interval_label(
+                p.schedule_cron.as_deref(),
+                p.schedule_interval_min,
+                self.daemon_tick_secs,
+            );
+            let sched = match crate::ui::schedule::schedule_due_for_tree(
+                p.schedule_cron.as_deref(),
+                p.schedule_interval_min,
+                last,
+                p.created_at,
+                now_ms,
+                self.daemon_tick_secs,
+            ) {
+                Some(cd) => format!("\u{23f1}{interval} next {cd}"),
+                None => "manual".to_string(),
+            };
             rows.push(TreeRow {
                 item: TreeItem::Project(p.id),
-                label: format!(
-                    "{}  (r{} b{} i{})",
-                    p.name,
-                    kids.routines.len(),
-                    kids.backlog.len(),
-                    kids.issues.len()
-                ),
+                label: project_tree_label(&p.name, &sched, kids, expanded),
                 depth: 0,
             });
             if !expanded {
@@ -727,19 +1496,13 @@ impl App {
                 depth: 1,
             });
             for b in &kids.backlog {
-                let consumed = if b.consumed_issue_id.is_some() {
-                    "*"
-                } else {
-                    " "
-                };
                 rows.push(TreeRow {
                     item: TreeItem::Backlog {
                         project_id: p.id,
                         id: b.id,
                     },
                     label: format!(
-                        "{} {:<9} #{:<3} {}",
-                        consumed,
+                        "{:<9} #{:<3} {}",
                         b.approval.as_str(),
                         b.id,
                         b.text.lines().next().unwrap_or("")
@@ -759,7 +1522,7 @@ impl App {
                         project_id: p.id,
                         id: i.id,
                     },
-                    label: format!("#{: <3} {:<13} {}", i.id, i.status.as_str(), i.title),
+                    label: crate::ui::vm::issue_tree_label(i),
                     depth: 2,
                 });
             }
@@ -769,6 +1532,27 @@ impl App {
 
     pub fn selected_tree_item(&self) -> Option<TreeItem> {
         self.tree_rows().get(self.tree_sel).map(|r| r.item.clone())
+    }
+
+    fn selected_context_item(&self) -> Option<TreeItem> {
+        if self.focus == Focus::ProjectKanban {
+            let project_id = self.selected_project_id()?;
+            return match self.selected_kanban_item()? {
+                ui::vm::KanbanItem::Backlog(id) => Some(TreeItem::Backlog { project_id, id }),
+                ui::vm::KanbanItem::Issue(id) => Some(TreeItem::Issue { project_id, id }),
+            };
+        }
+        self.selected_tree_item()
+    }
+
+    pub fn clear_expired_status(&mut self) {
+        if self
+            .status_until
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.status.clear();
+            self.status_until = None;
+        }
     }
 
     pub fn selected_routine(&self) -> Option<&Routine> {
@@ -783,6 +1567,12 @@ impl App {
     }
 
     pub fn selected_backlog(&self) -> Option<&BacklogItem> {
+        if self.focus == Focus::ProjectKanban {
+            return match self.selected_kanban_item()? {
+                ui::vm::KanbanItem::Backlog(id) => self.backlog().iter().find(|b| b.id == id),
+                ui::vm::KanbanItem::Issue(_) => None,
+            };
+        }
         match self.selected_tree_item()? {
             TreeItem::Backlog { project_id, id } => self
                 .children_of(project_id)?
@@ -794,13 +1584,230 @@ impl App {
     }
 
     pub fn selected_issue(&self) -> Option<&Issue> {
+        if self.focus == Focus::IssueDetail {
+            if let Some(issue) = &self.detail.issue {
+                return Some(issue);
+            }
+        }
+        if self.focus == Focus::ProjectKanban {
+            return match self.selected_kanban_item()? {
+                ui::vm::KanbanItem::Issue(id) => self.issues().iter().find(|i| i.id == id),
+                ui::vm::KanbanItem::Backlog(_) => None,
+            };
+        }
         match self.selected_tree_item()? {
             TreeItem::Issue { project_id, id } => self
                 .children_of(project_id)?
                 .issues
                 .iter()
+                .chain(self.children_of(project_id)?.archived_issues.iter())
                 .find(|i| i.id == id),
-            _ => self.issues().get(self.issue_sel),
+            _ if self.view == View::Issue => self.issues().get(self.issue_sel),
+            _ => None,
+        }
+    }
+
+    fn issue_by_id(&self, issue_id: i64) -> Option<&Issue> {
+        self.children.values().find_map(|children| {
+            children
+                .issues
+                .iter()
+                .chain(children.archived_issues.iter())
+                .find(|issue| issue.id == issue_id)
+        })
+    }
+
+    pub fn selected_issue_delete_hint(&self) -> &'static str {
+        self.selected_issue()
+            .map(|issue| issue_delete_hint(issue.status))
+            .unwrap_or("d issue")
+    }
+
+    pub fn selected_issue_accepts_queue_message(&self) -> bool {
+        self.selected_issue()
+            .is_some_and(|issue| issue.status.accepts_queue_message())
+    }
+
+    pub fn selected_issue_can_execute(&self) -> bool {
+        self.selected_issue().is_some_and(|issue| {
+            issue.status.is_actionable()
+                || matches!(
+                    issue.status,
+                    IssueStatus::PlanReady
+                        | IssueStatus::ReadyToMerge
+                        | IssueStatus::ConflictBlocked
+                        | IssueStatus::Failed
+                )
+        })
+    }
+
+    pub fn capabilities(&self) -> ContextCapabilities {
+        let mut caps = ContextCapabilities::default();
+        if self.form.is_some() || self.confirm_quit {
+            return caps;
+        }
+        if self.view == View::Config {
+            match self.selected_settings_row() {
+                SettingsRow::ArsenalOverview => {
+                    caps.push(CapabilityAction::Drill, "Enter new preset");
+                    caps.push(CapabilityAction::NewContext, "n preset");
+                }
+                SettingsRow::ArsenalPreset(_) => {
+                    caps.push(CapabilityAction::Drill, "Enter edit");
+                    caps.push(CapabilityAction::Edit, "e edit");
+                }
+                SettingsRow::MemoryOverview | SettingsRow::MemoryPreset(_) => {
+                    caps.push(CapabilityAction::Drill, "Enter select");
+                    caps.push(CapabilityAction::Edit, "e select");
+                }
+                SettingsRow::PipelineUxStandard => {
+                    caps.push(CapabilityAction::Drill, "Enter edit");
+                    caps.push(CapabilityAction::Edit, "e edit");
+                }
+                _ => {}
+            }
+            return caps;
+        }
+        if self.view == View::Issue {
+            if self.selected_project_id().is_some() {
+                caps.push(CapabilityAction::Ask, "? ask");
+            }
+            if self.selected_issue_accepts_queue_message() {
+                caps.push(CapabilityAction::NewContext, "n queue message");
+            }
+            return caps;
+        }
+        if self.move_mode {
+            return caps;
+        }
+        if self.focus == Focus::IssueDetail {
+            if self.selected_issue_accepts_queue_message() {
+                caps.push(CapabilityAction::NewContext, "n queue message");
+            }
+            if self.selected_issue_can_execute() {
+                caps.push(CapabilityAction::Execute, "E run");
+            }
+            if self.selected_issue().is_some() {
+                caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
+            }
+            return caps;
+        }
+        if self.focus == Focus::ProjectKanban {
+            if self.selected_backlog().is_some() {
+                caps.push(CapabilityAction::Execute, "E run");
+                caps.push(CapabilityAction::Delete, "d dismiss");
+            } else if self.selected_issue().is_some() {
+                if self.selected_issue_can_execute() {
+                    caps.push(CapabilityAction::Execute, "E run");
+                }
+                caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
+            }
+            return caps;
+        }
+        if self.selected_project_id().is_some() {
+            caps.push(CapabilityAction::Ask, "? ask");
+        }
+        caps.push(CapabilityAction::NewProject, "p project");
+        match self.selected_tree_item() {
+            Some(TreeItem::Project(_)) => {
+                caps.push(CapabilityAction::Drill, "Enter kanban");
+                caps.push(CapabilityAction::Edit, "e edit");
+                caps.push(CapabilityAction::NewContext, "n backlog");
+                caps.push(CapabilityAction::Execute, "E run schedule");
+                caps.push(CapabilityAction::Settings, "S settings");
+                caps.push(CapabilityAction::MoveMode, "m move");
+                caps.push(CapabilityAction::Delete, "d unregister");
+            }
+            Some(TreeItem::RoutinesRoot(_)) => {
+                caps.push(CapabilityAction::Drill, "Enter fold");
+                caps.push(CapabilityAction::NewContext, "n routine");
+            }
+            Some(TreeItem::Routine { .. }) => {
+                caps.push(CapabilityAction::Toggle, "a toggle");
+                caps.push(CapabilityAction::Edit, "e edit");
+                caps.push(CapabilityAction::Delete, "d delete");
+                caps.push(CapabilityAction::Execute, "E run");
+            }
+            Some(TreeItem::BacklogRoot(_)) => {
+                caps.push(CapabilityAction::Drill, "Enter fold");
+                caps.push(CapabilityAction::NewContext, "n backlog");
+            }
+            Some(TreeItem::Backlog { .. }) => {
+                caps.push(CapabilityAction::Toggle, "a approve");
+                if self
+                    .selected_backlog()
+                    .is_some_and(|item| item.consumed_issue_id.is_none())
+                {
+                    caps.push(CapabilityAction::Edit, "e edit");
+                    caps.push(CapabilityAction::Execute, "E run");
+                }
+                caps.push(CapabilityAction::Delete, "d dismiss");
+            }
+            Some(TreeItem::IssuesRoot(_)) => {
+                caps.push(CapabilityAction::Drill, "Enter fold");
+            }
+            Some(TreeItem::Issue { .. }) => {
+                caps.push(CapabilityAction::Drill, "Enter detail");
+                if self.selected_issue_accepts_queue_message() {
+                    caps.push(CapabilityAction::NewContext, "n queue message");
+                }
+                if self.selected_issue_can_execute() {
+                    caps.push(CapabilityAction::Execute, "E run");
+                }
+                caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
+            }
+            None => {}
+        }
+        caps
+    }
+
+    pub fn selected_kanban_item(&self) -> Option<ui::vm::KanbanItem> {
+        self.kanban_items_for_lane(self.kanban_lane_sel)
+            .get(self.kanban_card_sel)
+            .copied()
+    }
+
+    pub fn selected_kanban_item_preview(&self) -> Option<ui::vm::KanbanPreview<'_>> {
+        match self.selected_kanban_item()? {
+            ui::vm::KanbanItem::Backlog(id) => self
+                .backlog()
+                .iter()
+                .find(|item| item.id == id)
+                .map(ui::vm::KanbanPreview::Backlog),
+            ui::vm::KanbanItem::Issue(id) => self
+                .issues()
+                .iter()
+                .find(|issue| issue.id == id)
+                .map(ui::vm::KanbanPreview::Issue),
+        }
+    }
+
+    pub fn is_kanban_item_selected(&self, item: ui::vm::KanbanItem) -> bool {
+        self.focus == Focus::ProjectKanban && self.selected_kanban_item() == Some(item)
+    }
+
+    fn kanban_items_for_lane(&self, lane_idx: usize) -> Vec<ui::vm::KanbanItem> {
+        let lane = ui::vm::KanbanLane::ALL
+            .get(lane_idx)
+            .copied()
+            .unwrap_or(ui::vm::KanbanLane::Plan);
+        ui::vm::kanban_cards(self.backlog(), self.issues())
+            .into_iter()
+            .filter(|card| card.belongs_to(lane))
+            .map(|card| card.item())
+            .collect()
+    }
+
+    fn clamp_kanban(&mut self) {
+        let lane_count = ui::vm::KanbanLane::ALL.len();
+        if self.kanban_lane_sel >= lane_count {
+            self.kanban_lane_sel = lane_count.saturating_sub(1);
+        }
+        let count = self.kanban_items_for_lane(self.kanban_lane_sel).len();
+        if count == 0 {
+            self.kanban_card_sel = 0;
+        } else if self.kanban_card_sel >= count {
+            self.kanban_card_sel = count - 1;
         }
     }
 
@@ -825,14 +1832,19 @@ impl App {
     /// Full resync: project list + every project's children, then re-derive the
     /// active project from the cursor and freshen the detail/activity panes.
     async fn refresh_all(&mut self) -> Result<()> {
+        self.refresh_global_settings().await?;
+        self.refresh_arsenal().await?;
+        self.refresh_memory_presets().await?;
         self.refresh_projects().await?;
         for pid in self.project_ids() {
             self.refresh_project_children(pid).await?;
         }
+        self.refresh_last_auto_ticks().await?;
         self.clamp_tree();
         self.sync_active_project();
         self.refresh_detail().await?;
         self.refresh_activity().await?;
+        self.refresh_asks().await?;
         Ok(())
     }
 
@@ -841,6 +1853,9 @@ impl App {
     }
 
     async fn refresh_projects(&mut self) -> Result<()> {
+        if let Response::Profiles(profiles) = self.req(Command::ListProfiles).await? {
+            self.profiles = profiles;
+        }
         if let Response::Projects(ps) = self.req(Command::ListProjects).await? {
             self.projects = ps;
             if self.proj_sel >= self.projects.len() {
@@ -853,6 +1868,62 @@ impl App {
             self.expanded.retain(|id| live.contains(id));
             if self.expanded.is_empty() {
                 self.expanded.extend(live);
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_arsenal(&mut self) -> Result<()> {
+        if let Response::ArsenalPresets(presets) = self.req(Command::ListArsenalPresets).await? {
+            self.arsenal_presets = presets;
+        }
+        Ok(())
+    }
+
+    async fn refresh_memory_presets(&mut self) -> Result<()> {
+        if let Response::MemoryPresets(presets) = self.req(Command::ListMemoryPresets).await? {
+            self.memory_presets = presets;
+        }
+        Ok(())
+    }
+
+    async fn refresh_global_settings(&mut self) -> Result<()> {
+        if let Response::GlobalSettings(settings) = self.req(Command::GetGlobalSettings).await? {
+            self.global_settings = Some(settings);
+        }
+        Ok(())
+    }
+
+    async fn refresh_asks(&mut self) -> Result<()> {
+        let Some(project_id) = self.selected_project_id() else {
+            self.ask_answers.clear();
+            return Ok(());
+        };
+        if let Response::AskAnswers(answers) = self
+            .req(Command::ListAskAnswers {
+                project_id,
+                limit: 20,
+            })
+            .await?
+        {
+            self.ask_answers = answers;
+        }
+        Ok(())
+    }
+
+    async fn refresh_last_auto_ticks(&mut self) -> Result<()> {
+        self.last_auto_tick.clear();
+        for pid in self.project_ids() {
+            if let Response::SchedulerRuns(runs) = self
+                .req(Command::RecentSchedulerRunsByProject {
+                    project_id: pid,
+                    limit: 8,
+                })
+                .await?
+            {
+                if let Some(run) = runs.iter().find(|r| r.source == SchedulerRunSource::Auto) {
+                    self.last_auto_tick.insert(pid, run.fired_at);
+                }
             }
         }
         Ok(())
@@ -880,9 +1951,20 @@ impl App {
             })
             .await?
         {
-            // Stable, readable order: oldest first (creation order == id order).
-            is.sort_by_key(|i| i.id);
-            kids.issues = is;
+            let mut active = Vec::new();
+            let mut archived = Vec::new();
+            for issue in is.drain(..) {
+                if issue.status.is_archive_status() {
+                    archived.push(issue);
+                } else {
+                    active.push(issue);
+                }
+            }
+            // Status view order: surface attention first, then lifecycle order.
+            crate::ui::vm::sort_issues_for_status_view(&mut active);
+            archived.sort_by_key(|issue| std::cmp::Reverse(issue.updated_at));
+            kids.issues = active;
+            kids.archived_issues = archived;
         }
         self.children.insert(project_id, kids);
         Ok(())
@@ -890,12 +1972,19 @@ impl App {
 
     /// Refresh just the active project's children (used after local mutations).
     async fn refresh_issues(&mut self) -> Result<()> {
+        let selected_issue = match self.selected_tree_item() {
+            Some(TreeItem::Issue { project_id, id }) => Some((project_id, id)),
+            _ => None,
+        };
         if let Some(pid) = self.selected_project_id() {
             self.refresh_project_children(pid).await?;
         }
         let len = self.issues().len();
         if self.issue_sel >= len {
             self.issue_sel = len.saturating_sub(1);
+        }
+        if let Some((project_id, issue_id)) = selected_issue {
+            self.preserve_tree_issue_selection(project_id, issue_id);
         }
         Ok(())
     }
@@ -1004,35 +2093,61 @@ impl App {
         let Some(iid) = self.selected_issue_id() else {
             self.log_tail.clear();
             self.log_tail_path = None;
+            self.issue_log_scroll = 0;
             return Ok(());
         };
         if let Response::AgentRuns(runs) = self
             .req(Command::ListAgentRunsByIssue { issue_id: iid })
             .await?
         {
+            self.detail.runs = runs.clone();
             if let Some(run) = runs.iter().rev().find(|r| r.log_path.is_some()) {
                 match self
                     .req(Command::TailAgentRunLog {
                         agent_run_id: run.id,
-                        max_bytes: 8 * 1024,
+                        max_bytes: 128 * 1024,
                     })
                     .await
                 {
                     Ok(Response::LogTail { path, text }) => {
+                        if self.log_tail_path.as_deref() != Some(path.as_str()) {
+                            self.issue_log_scroll = 0;
+                        }
                         self.log_tail = text;
                         self.log_tail_path = Some(path);
                     }
                     _ => {
                         self.log_tail.clear();
+                        if self.log_tail_path != run.log_path {
+                            self.issue_log_scroll = 0;
+                        }
                         self.log_tail_path = run.log_path.clone();
                     }
                 }
             } else {
                 self.log_tail.clear();
                 self.log_tail_path = None;
+                self.issue_log_scroll = 0;
             }
         }
         Ok(())
+    }
+
+    fn scroll_issue_log(&mut self, delta: isize) {
+        let max = self.log_tail.lines().count().saturating_sub(1);
+        self.issue_log_scroll = self.issue_log_scroll.saturating_add_signed(delta).min(max);
+    }
+
+    fn jump_issue_log_top(&mut self) {
+        self.issue_log_scroll = self.log_tail.lines().count().saturating_sub(1);
+    }
+
+    fn jump_issue_log_bottom(&mut self) {
+        self.issue_log_scroll = 0;
+    }
+
+    fn scroll_config(&mut self, delta: isize) {
+        self.config_scroll = self.config_scroll.saturating_add_signed(delta).min(10_000);
     }
 
     // --- action handling ----------------------------------------------------
@@ -1040,47 +2155,217 @@ impl App {
     /// Apply one decoded action. Returns `true` when the app should quit.
     async fn apply(&mut self, action: Action) -> Result<bool> {
         self.status.clear();
+        self.status_until = None;
+        if !matches!(action, Action::DeleteSelected) {
+            self.pending_project_delete = None;
+        }
         match action {
             Action::Quit => return Ok(true),
-            Action::Down => self.move_sel(1).await?,
-            Action::Up => self.move_sel(-1).await?,
-            Action::Drill => self.drill().await?,
+            Action::QuitWithDaemon => {
+                self.confirm_quit = true;
+            }
+            Action::Down => {
+                if self.view == View::Issue {
+                    self.scroll_issue_log(-1);
+                } else if self.view == View::Config {
+                    self.move_settings_row(1);
+                } else if self.move_mode {
+                    self.move_project_order(1).await?;
+                } else if self.focus == Focus::ProjectKanban {
+                    self.move_kanban_card(1);
+                } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
+                    if self.issue_section_sel == 3 {
+                        self.scroll_issue_log(-1);
+                    } else {
+                        self.move_issue_section(1);
+                    }
+                } else {
+                    self.move_sel(1).await?;
+                }
+            }
+            Action::Up => {
+                if self.view == View::Issue {
+                    self.scroll_issue_log(1);
+                } else if self.view == View::Config {
+                    self.move_settings_row(-1);
+                } else if self.move_mode {
+                    self.move_project_order(-1).await?;
+                } else if self.focus == Focus::ProjectKanban {
+                    self.move_kanban_card(-1);
+                } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
+                    if self.issue_section_sel == 3 {
+                        self.scroll_issue_log(1);
+                    } else {
+                        self.move_issue_section(-1);
+                    }
+                } else {
+                    self.move_sel(-1).await?;
+                }
+            }
+            Action::Left => {
+                if self.move_mode {
+                    self.move_project_profile(-1).await?;
+                } else if self.focus == Focus::ProjectKanban {
+                    self.move_kanban_lane(-1);
+                } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
+                    self.move_issue_section(-1);
+                }
+            }
+            Action::Right => {
+                if self.move_mode {
+                    self.move_project_profile(1).await?;
+                } else if self.focus == Focus::ProjectKanban {
+                    self.move_kanban_lane(1);
+                } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
+                    self.move_issue_section(1);
+                }
+            }
+            Action::PageDown => {
+                if self.view == View::Issue {
+                    self.scroll_issue_log(-10);
+                } else if self.view == View::Config {
+                    self.scroll_config(10);
+                } else if self.focus == Focus::IssueDetail && self.issue_section_sel == 3 {
+                    self.scroll_issue_log(-10);
+                }
+            }
+            Action::PageUp => {
+                if self.view == View::Issue {
+                    self.scroll_issue_log(10);
+                } else if self.view == View::Config {
+                    self.scroll_config(-10);
+                } else if self.focus == Focus::IssueDetail && self.issue_section_sel == 3 {
+                    self.scroll_issue_log(10);
+                }
+            }
+            Action::Top => {
+                if self.view == View::Issue {
+                    self.jump_issue_log_top();
+                } else if self.view == View::Config {
+                    self.jump_settings_top();
+                } else if self.focus == Focus::IssueDetail && self.issue_section_sel == 3 {
+                    self.jump_issue_log_top();
+                }
+            }
+            Action::Bottom => {
+                if self.view == View::Issue {
+                    self.jump_issue_log_bottom();
+                } else if self.view == View::Config {
+                    self.jump_settings_bottom();
+                } else if self.focus == Focus::IssueDetail && self.issue_section_sel == 3 {
+                    self.jump_issue_log_bottom();
+                }
+            }
+            Action::Drill => {
+                if !self.capabilities().has(CapabilityAction::Drill) {
+                    self.status = "nothing to open here".into();
+                    return Ok(false);
+                }
+                if self.view == View::Config {
+                    self.edit_selected_setting();
+                } else {
+                    self.drill().await?;
+                }
+            }
             Action::NextView => self.set_view(self.view.step(1)).await?,
             Action::PrevView => self.set_view(self.view.step(-1)).await?,
             Action::Back => {
-                if self.view == View::Issue {
+                if self.view == View::Overview && self.focus == Focus::IssueDetail {
+                    if self.issue_return_focus == Focus::ProjectKanban {
+                        if let Some(tree_sel) = self.issue_return_tree_sel.take() {
+                            self.tree_sel = tree_sel;
+                            self.sync_active_project();
+                        }
+                    }
+                    self.focus = self.issue_return_focus;
+                    self.move_mode = false;
+                } else if self.view == View::Overview && self.focus == Focus::ProjectKanban {
+                    self.focus = Focus::Left;
+                    self.move_mode = false;
+                } else if matches!(self.view, View::Config | View::Issue) {
                     self.set_view(View::Overview).await?;
                 }
             }
-            Action::Refresh => self.refresh_all().await?,
-            Action::NewProject => self.form = Some(Form::project()),
-            Action::EditConfig => {
-                if let Some(project) = self.projects.get(self.proj_sel) {
-                    self.form = Some(Form::project_config(project));
+            Action::NewProject => {
+                if !self.capabilities().has(CapabilityAction::NewProject) {
+                    self.status = "project registration is available from the main list".into();
+                    return Ok(false);
+                }
+                self.form = Some(self.new_project_form());
+            }
+            Action::Ask => {
+                if !self.capabilities().has(CapabilityAction::Ask) {
+                    self.status = "select a project context before asking".into();
+                    return Ok(false);
+                }
+                if self.selected_project_id().is_some() {
+                    self.form = Some(Form::ask());
                 } else {
                     self.status = "select or create a project first".into();
                 }
             }
-            Action::EditSelected => match self.selected_tree_item() {
-                Some(TreeItem::Backlog { .. }) => {
-                    if let Some(item) = self.selected_backlog() {
-                        if item.consumed_issue_id.is_some() {
-                            self.status = "consumed backlog cannot be edited".into();
-                        } else {
-                            self.form = Some(Form::backlog_edit(item));
+            Action::EditSelected => {
+                if !self.capabilities().has(CapabilityAction::Edit) {
+                    self.status = "nothing editable here".into();
+                    return Ok(false);
+                }
+                if self.view == View::Config {
+                    self.edit_selected_setting();
+                } else {
+                    match self.selected_context_item() {
+                        Some(TreeItem::Project(_)) => {
+                            if let Some(project) = self.projects.get(self.proj_sel) {
+                                self.form = Some(self.project_config_form(project));
+                            } else {
+                                self.status = "select or create a project first".into();
+                            }
+                        }
+                        Some(TreeItem::Backlog { .. }) => {
+                            if let Some(item) = self.selected_backlog() {
+                                if item.consumed_issue_id.is_some() {
+                                    self.status = "consumed backlog cannot be edited".into();
+                                } else {
+                                    self.form = Some(Form::backlog_edit(item));
+                                }
+                            }
+                        }
+                        Some(TreeItem::Routine { .. }) => {
+                            if let Some(routine) = self.selected_routine() {
+                                self.form = Some(Form::routine_edit(routine));
+                            }
+                        }
+                        _ => {
+                            self.status = "select project, backlog item, or routine to edit".into()
                         }
                     }
                 }
-                Some(TreeItem::Routine { .. }) => {
-                    if let Some(routine) = self.selected_routine() {
-                        self.form = Some(Form::routine_edit(routine));
-                    }
+            }
+            Action::NewContext => {
+                if !self.capabilities().has(CapabilityAction::NewContext) {
+                    self.status = match self.selected_issue() {
+                        Some(issue) => {
+                            format!(
+                                "issue cannot receive queue messages in {}",
+                                issue.status.as_str()
+                            )
+                        }
+                        None => "nothing can be created here".into(),
+                    };
+                    return Ok(false);
                 }
-                _ => self.status = "select a backlog item or routine to edit".into(),
-            },
-            Action::NewBacklog => {
-                if matches!(
-                    self.selected_tree_item(),
+                if self.view == View::Config {
+                    self.form = Some(Form::arsenal_preset(None));
+                    return Ok(false);
+                }
+                let context = self.selected_context_item();
+                if matches!(context, Some(TreeItem::Issue { .. })) {
+                    if self.selected_issue_id().is_some() {
+                        self.form = Some(Form::steering());
+                    } else {
+                        self.status = "select an issue first".into();
+                    }
+                } else if matches!(
+                    context,
                     Some(TreeItem::RoutinesRoot(_) | TreeItem::Routine { .. })
                 ) {
                     if self.selected_project_id().is_some() {
@@ -1094,88 +2379,130 @@ impl App {
                     self.status = "select or create a project first".into();
                 }
             }
-            Action::NewIssue => {
-                if self.selected_project_id().is_some() {
-                    self.form = Some(Form::issue());
+            Action::Settings => self.set_view(View::Config).await?,
+            Action::MoveMode => {
+                if !self.capabilities().has(CapabilityAction::MoveMode) {
+                    self.status = "select a project first".into();
+                    return Ok(false);
+                }
+                if matches!(self.selected_tree_item(), Some(TreeItem::Project(_))) {
+                    self.move_mode = !self.move_mode;
+                    self.focus = Focus::Left;
+                    self.status = if self.move_mode {
+                        "move mode: j/k reorder, h/l move profile, m exits".into()
+                    } else {
+                        "move mode off".into()
+                    };
                 } else {
-                    self.status = "select or create a project first".into();
+                    self.status = "select a project first".into();
                 }
             }
-            Action::NewSubtask => {
-                if self.selected_issue_id().is_some() {
-                    self.form = Some(Form::subtask(self.detail.subtasks.len() as i64 + 1));
-                } else {
-                    self.status = "select an issue first".into();
+            Action::ToggleApproveOrRoutine => {
+                if !self.capabilities().has(CapabilityAction::Toggle) {
+                    self.status = "nothing toggleable here".into();
+                    return Ok(false);
                 }
-            }
-            Action::NewSteering => {
-                if self.selected_issue_id().is_some() {
-                    self.form = Some(Form::steering());
-                } else {
-                    self.status = "select an issue first".into();
-                }
-            }
-            Action::Approve => {
-                if let Some(id) = self.selected_backlog_id() {
-                    self.req_ok(Command::ApproveBacklog { item_id: id }, "approve")
-                        .await;
-                    self.refresh_backlog().await?;
-                }
-            }
-            Action::Dismiss => {
-                if let Some(id) = self.selected_backlog_id() {
-                    self.req_ok(Command::DismissBacklog { item_id: id }, "dismiss")
-                        .await;
-                    self.refresh_backlog().await?;
-                }
-            }
-            Action::Triage => {
-                if let Some(pid) = self.selected_project_id() {
-                    match self.req(Command::Triage { project_id: pid }).await {
-                        Ok(Response::Triaged { created_issue_ids }) => {
-                            self.status =
-                                format!("triaged: {} new issue(s)", created_issue_ids.len());
-                        }
-                        Ok(Response::Err { message }) => {
-                            self.status = format!("triage failed: {message}")
-                        }
-                        Ok(_) => {}
-                        Err(e) => self.status = format!("triage failed: {e}"),
+                match self.selected_context_item() {
+                    Some(TreeItem::Backlog { id, .. }) => {
+                        self.req_ok(Command::ApproveBacklog { item_id: id }, "approve")
+                            .await;
+                        self.refresh_backlog().await?;
                     }
-                    self.refresh_backlog().await?;
-                    self.refresh_issues().await?;
+                    Some(TreeItem::Routine { .. }) => {
+                        self.toggle_selected_routine().await?;
+                    }
+                    _ => self.status = "select backlog item or routine first".into(),
                 }
             }
-            Action::Execute => self.execute_selected().await?,
-            Action::ToggleRoutine => self.toggle_selected_routine().await?,
+            Action::DeleteSelected => {
+                if !self.capabilities().has(CapabilityAction::Delete) {
+                    self.status = "nothing removable here".into();
+                    return Ok(false);
+                }
+                match self.selected_context_item() {
+                    Some(TreeItem::Backlog { id, .. }) => {
+                        self.req_ok(Command::DismissBacklog { item_id: id }, "dismiss")
+                            .await;
+                        self.refresh_backlog().await?;
+                    }
+                    Some(TreeItem::Issue { id, .. }) => {
+                        let (cmd, label) = self.issue_delete_command(id);
+                        self.req_ok(cmd, label).await;
+                        self.refresh_issues().await?;
+                        self.refresh_backlog().await?;
+                    }
+                    Some(TreeItem::Project(_)) => {
+                        if let Some(project) = self.projects.get(self.proj_sel).cloned() {
+                            if self.pending_project_delete == Some(project.id) {
+                                self.req_ok(
+                                    Command::RemoveProject {
+                                        project_id: project.id,
+                                        shallow: true,
+                                    },
+                                    "unregister project",
+                                )
+                                .await;
+                                self.pending_project_delete = None;
+                                self.refresh_all().await?;
+                            } else {
+                                self.pending_project_delete = Some(project.id);
+                                self.status = format!(
+                                    "press d again to shallow unregister {} (running work/worktrees are not cleaned)",
+                                    project.name
+                                );
+                            }
+                        }
+                    }
+                    Some(TreeItem::Routine { id, .. }) => {
+                        self.req_ok(Command::RemoveRoutine { routine_id: id }, "delete routine")
+                            .await;
+                        self.refresh_routines().await?;
+                    }
+                    _ => self.status = "select backlog, issue, routine, or project first".into(),
+                }
+            }
+            Action::Execute => {
+                if !self.capabilities().has(CapabilityAction::Execute) {
+                    self.status = "nothing runnable here".into();
+                    return Ok(false);
+                }
+                self.execute_selected().await?;
+            }
         }
         Ok(false)
     }
 
+    fn issue_delete_command(&self, issue_id: i64) -> (Command, &'static str) {
+        let status = self.issue_by_id(issue_id).map(|issue| issue.status);
+        match status {
+            Some(IssueStatus::Done | IssueStatus::Abandoned) => {
+                (Command::CleanupIssueWorktree { issue_id }, "archive issue")
+            }
+            Some(IssueStatus::Failed) => {
+                (Command::CleanupIssueWorktree { issue_id }, "cleanup issue")
+            }
+            _ => (Command::AbandonIssue { issue_id }, "abandon issue"),
+        }
+    }
+
     async fn execute_selected(&mut self) -> Result<()> {
-        match self.selected_tree_item() {
+        match self.selected_context_item() {
             Some(TreeItem::Project(project_id)) => {
-                self.req_ok(Command::RunSchedulerOnce { project_id }, "scheduler tick")
+                self.execute_control(Command::ExecuteProject { project_id })
                     .await;
             }
             Some(TreeItem::Backlog { id: item_id, .. }) => {
-                match self.req(Command::RunBacklogNow { item_id }).await {
-                    Ok(Response::RanIssue { issue_id }) => {
-                        self.status = format!("running issue #{issue_id}");
-                    }
-                    Ok(Response::Err { message }) => self.status = format!("run failed: {message}"),
-                    Ok(_) => self.status = "run failed: unexpected response".into(),
-                    Err(e) => self.status = format!("run failed: {e}"),
-                }
+                self.run_now(Command::RunBacklogNow { item_id }).await;
             }
             Some(TreeItem::Issue { id: issue_id, .. }) => {
-                match self.req(Command::RunIssueNow { issue_id }).await {
-                    Ok(Response::RanIssue { issue_id }) => {
-                        self.status = format!("running issue #{issue_id}");
-                    }
-                    Ok(Response::Err { message }) => self.status = format!("run failed: {message}"),
-                    Ok(_) => self.status = "run failed: unexpected response".into(),
-                    Err(e) => self.status = format!("run failed: {e}"),
+                if self
+                    .selected_issue()
+                    .is_some_and(|issue| issue.status == IssueStatus::Failed)
+                {
+                    self.execute_control(Command::RetryIssue { issue_id }).await;
+                } else {
+                    self.execute_control(Command::ExecuteIssue { issue_id })
+                        .await;
                 }
             }
             Some(TreeItem::Routine { id: routine_id, .. }) => {
@@ -1186,6 +2513,37 @@ impl App {
         }
         self.refresh_all().await?;
         Ok(())
+    }
+
+    async fn execute_control(&mut self, cmd: Command) {
+        match self.req(cmd).await {
+            Ok(Response::Ok) => self.status = "scheduler tick ok".into(),
+            Ok(Response::RanIssue { issue_id }) => {
+                self.status = format!("running issue #{issue_id}");
+            }
+            Ok(Response::ApprovedMerge { issue_ids }) => {
+                let joined = issue_ids
+                    .iter()
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.status = format!("approved merge for {joined}");
+            }
+            Ok(Response::Err { message }) => self.status = format!("execute failed: {message}"),
+            Ok(_) => self.status = "execute failed: unexpected response".into(),
+            Err(e) => self.status = format!("execute failed: {e}"),
+        }
+    }
+
+    async fn run_now(&mut self, cmd: Command) {
+        match self.req(cmd).await {
+            Ok(Response::RanIssue { issue_id }) => {
+                self.status = format!("running issue #{issue_id}");
+            }
+            Ok(Response::Err { message }) => self.status = format!("run failed: {message}"),
+            Ok(_) => self.status = "run failed: unexpected response".into(),
+            Err(e) => self.status = format!("run failed: {e}"),
+        }
     }
 
     async fn toggle_selected_routine(&mut self) -> Result<()> {
@@ -1218,76 +2576,81 @@ impl App {
             KeyCode::Esc => {
                 self.form = None;
                 self.status = "cancelled".into();
+                self.status_until = Some(Instant::now() + Duration::from_millis(1500));
             }
             KeyCode::Enter => self.advance_or_submit_form().await?,
-            // Tab on the repository field with a suggestion fills the top match;
-            // otherwise (and for Down) it advances to the next field.
-            KeyCode::Tab if !self.repo_suggestions().is_empty() => {
-                if let Some(top) = self.repo_suggestions().into_iter().next() {
-                    if let Some(form) = self.form.as_mut() {
-                        if let Some(field) = form.fields.get_mut(form.current) {
-                            field.set_value(top);
-                        }
-                    }
-                }
+            KeyCode::Tab if self.accept_completion() => {}
+            KeyCode::Down if self.move_completion(1) => {}
+            KeyCode::Up if self.move_completion(-1) => {}
+            KeyCode::Left if self.cycle_current_select(-1) => {}
+            KeyCode::Right if self.cycle_current_select(1) => {}
+            KeyCode::Char(' ') if self.cycle_current_select(1) => {}
+            KeyCode::Char(c)
+                if matches!(
+                    self.form
+                        .as_ref()
+                        .and_then(Form::current_field)
+                        .map(|field| &field.kind),
+                    Some(FieldKind::Select { .. })
+                ) =>
+            {
+                self.select_option_by_prefix(c);
             }
             KeyCode::Tab | KeyCode::Down => {
                 if let Some(form) = self.form.as_mut() {
-                    form.current = (form.current + 1).min(form.fields.len().saturating_sub(1));
+                    form.move_field(1);
                 }
             }
             KeyCode::BackTab | KeyCode::Up => {
                 if let Some(form) = self.form.as_mut() {
-                    form.current = form.current.saturating_sub(1);
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(form) = self.form.as_mut() {
-                    if let Some(field) = form.fields.get_mut(form.current) {
-                        field.backspace();
-                    }
-                }
-            }
-            KeyCode::Delete => {
-                if let Some(form) = self.form.as_mut() {
-                    if let Some(field) = form.fields.get_mut(form.current) {
-                        field.delete();
-                    }
+                    form.move_field(-1);
                 }
             }
             KeyCode::Left => {
                 if let Some(form) = self.form.as_mut() {
-                    if let Some(field) = form.fields.get_mut(form.current) {
-                        field.move_left();
-                    }
+                    form.cursor = form.cursor.saturating_sub(1);
                 }
             }
             KeyCode::Right => {
                 if let Some(form) = self.form.as_mut() {
-                    if let Some(field) = form.fields.get_mut(form.current) {
-                        field.move_right();
-                    }
+                    form.cursor = (form.cursor + 1).min(form.current_len());
                 }
             }
             KeyCode::Home => {
                 if let Some(form) = self.form.as_mut() {
-                    if let Some(field) = form.fields.get_mut(form.current) {
-                        field.move_home();
-                    }
+                    form.cursor = 0;
                 }
             }
             KeyCode::End => {
                 if let Some(form) = self.form.as_mut() {
-                    if let Some(field) = form.fields.get_mut(form.current) {
-                        field.move_end();
-                    }
+                    form.cursor = form.current_len();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = self.form.as_mut() {
+                    form.backspace();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(form) = self.form.as_mut() {
+                    form.delete();
                 }
             }
             KeyCode::Char(c) => {
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-                    if let Some(form) = self.form.as_mut() {
-                        if let Some(field) = form.fields.get_mut(form.current) {
-                            field.insert_char(c);
+                    let editable = self
+                        .form
+                        .as_ref()
+                        .and_then(Form::current_field)
+                        .is_some_and(|field| {
+                            !matches!(
+                                field.kind,
+                                FieldKind::Select { .. } | FieldKind::Combo { free_text: false }
+                            )
+                        });
+                    if editable {
+                        if let Some(form) = self.form.as_mut() {
+                            form.insert_char(c);
                         }
                     }
                 }
@@ -1295,6 +2658,51 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn select_option_by_prefix(&mut self, c: char) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let Some(field) = form.current_field() else {
+            return;
+        };
+        let options = match &field.kind {
+            FieldKind::Select { options } => *options,
+            _ => return,
+        };
+        let needle = c.to_ascii_lowercase();
+        let Some(option) = options
+            .iter()
+            .find(|option| option.starts_with(needle))
+            .copied()
+        else {
+            return;
+        };
+        form.set_current_value(option.to_string());
+    }
+
+    /// Handle a key while the quit-confirm popup is open. Returns Ok(true) when
+    /// the TUI should exit. `y`/Enter confirms (stop daemon, then quit);
+    /// `n`/Esc cancels; Ctrl-C quits the TUI without stopping the daemon.
+    pub async fn handle_confirm_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.confirm_quit = false;
+            return Ok(true); // hard quit, daemon left running
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                // Best-effort graceful daemon shutdown, then quit regardless.
+                let _ = self.req(Command::Shutdown).await;
+                self.confirm_quit = false;
+                Ok(true)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.confirm_quit = false;
+                Ok(false)
+            }
+            _ => Ok(false), // ignore other keys; popup stays open
+        }
     }
 
     async fn advance_or_submit_form(&mut self) -> Result<()> {
@@ -1305,7 +2713,7 @@ impl App {
             .unwrap_or(false);
         if !should_submit {
             if let Some(form) = self.form.as_mut() {
-                form.current += 1;
+                form.move_field(1);
             }
             return Ok(());
         }
@@ -1323,17 +2731,11 @@ impl App {
 
         match form.kind {
             FormKind::Project => {
-                let cmd = Command::AddProject {
-                    name: form.get("name"),
-                    repo_path: form.get("repo_path"),
-                    default_branch: form.get("branch"),
-                    main_agent_cmd: form.get("main_cmd"),
-                    plan_agent_cmd: form.get("plan_cmd"),
-                    work_agent_cmd: form.get("work_cmd"),
-                    review_agent_cmd: form.opt("review_cmd"),
-                    completion_policy: None,
-                    plan_gate_timeout_min: None,
-                    completion_soft_timeout_min: None,
+                let preset = self.find_arsenal_preset(&form.get("arsenal"));
+                let Some(cmd) =
+                    add_project_command_from_form(&form, preset.as_ref(), &mut self.status)
+                else {
+                    return Ok(());
                 };
                 self.submit_create(cmd, "project").await?;
                 self.refresh_projects().await?;
@@ -1358,13 +2760,9 @@ impl App {
                     self.status = "select a project first".into();
                     return Ok(());
                 };
-                let Some(completion_policy) = parse_choice(
-                    &form,
-                    "completion",
-                    "manual, soft, or auto",
-                    CompletionPolicy::from_str,
-                    &mut self.status,
-                ) else {
+                let Some(completion_policy) = CompletionPolicy::from_str(&form.get("completion"))
+                else {
+                    self.status = "completion must be manual, soft, or auto".into();
                     return Ok(());
                 };
                 let Some(plan_gate_timeout_min) = parse_i64(&form, "plan_gate", &mut self.status)
@@ -1372,7 +2770,7 @@ impl App {
                     return Ok(());
                 };
                 let Some(completion_soft_timeout_min) =
-                    parse_i64(&form, "complete_gate", &mut self.status)
+                    parse_i64(&form, "merge_delay", &mut self.status)
                 else {
                     return Ok(());
                 };
@@ -1399,22 +2797,27 @@ impl App {
                 else {
                     return Ok(());
                 };
-                let Some(schedule_interval_min) =
-                    parse_opt_i64(&form, "schedule_min", &mut self.status)
+                let Some(schedule_cron) = parse_cadence(&form, "schedule_cron", &mut self.status)
                 else {
                     return Ok(());
                 };
-                let Some(merge_mode) = parse_choice(
-                    &form,
-                    "merge_mode",
-                    "local or pr",
-                    MergeMode::from_str,
-                    &mut self.status,
-                ) else {
+                let Some(merge_mode) = MergeMode::from_str(&form.get("merge_mode")) else {
+                    self.status = "merge_mode must be local or pr".into();
                     return Ok(());
                 };
-                let Some(deepsleep_interval_days) =
-                    parse_i64(&form, "deepsleep_days", &mut self.status)
+                let Some(deepsleep_cron) = parse_cadence(&form, "deepsleep_cron", &mut self.status)
+                else {
+                    return Ok(());
+                };
+                let existing_deepsleep_interval_days = self
+                    .projects
+                    .iter()
+                    .find(|project| project.id == project_id)
+                    .map(|project| project.deepsleep_interval_days)
+                    .unwrap_or(7);
+                let preset = self.find_arsenal_preset(&form.get("arsenal"));
+                let Some(agent_config) =
+                    project_agent_config_from_form(&form, preset.as_ref(), &mut self.status)
                 else {
                     return Ok(());
                 };
@@ -1424,10 +2827,11 @@ impl App {
                         name: form.get("name"),
                         repo_path: form.get("repo_path"),
                         default_branch: form.get("branch"),
-                        main_agent_cmd: form.get("main_cmd"),
-                        plan_agent_cmd: form.get("plan_cmd"),
-                        work_agent_cmd: form.get("work_cmd"),
-                        review_agent_cmd: form.opt("review_cmd"),
+                        arsenal_preset_name: agent_config.arsenal_preset_name,
+                        main_agent_cmd: agent_config.main,
+                        plan_agent_cmd: agent_config.plan,
+                        work_agent_cmd: agent_config.work,
+                        review_agent_cmd: agent_config.review,
                         completion_policy,
                         plan_gate_timeout_min,
                         completion_soft_timeout_min,
@@ -1436,16 +2840,66 @@ impl App {
                         review_max_rounds,
                         conflict_max_attempts,
                         max_concurrency,
-                        schedule_interval_min,
+                        schedule_interval_min: None,
+                        schedule_cron,
                         merge_mode,
                         skill_path: form.opt("skill_path"),
-                        deepsleep_interval_days,
+                        deepsleep_interval_days: match deepsleep_cron.as_deref() {
+                            Some(cron) => {
+                                cron_days_hint(cron).unwrap_or(existing_deepsleep_interval_days)
+                            }
+                            None => 0,
+                        },
+                        deepsleep_cron,
                     },
                     "project update",
                 )
                 .await;
                 self.form = None;
                 self.refresh_projects().await?;
+            }
+            FormKind::ArsenalPreset => {
+                self.req_ok(
+                    Command::UpsertArsenalPreset {
+                        name: form.get("name"),
+                        main_agent_cmd: form.get("main_cmd"),
+                        plan_agent_cmd: form.get("plan_cmd"),
+                        work_agent_cmd: form.get("work_cmd"),
+                        review_agent_cmd: form.opt("review_cmd"),
+                    },
+                    "arsenal preset",
+                )
+                .await;
+                self.form = None;
+                self.refresh_arsenal().await?;
+            }
+            FormKind::GlobalSettings => {
+                if self
+                    .memory_presets
+                    .iter()
+                    .all(|preset| preset.name != form.get("memory_preset"))
+                {
+                    self.status = format!("unknown Memory preset {}", form.get("memory_preset"));
+                    return Ok(());
+                }
+                if form.get("pipeline_ux_guidance").chars().count() > PIPELINE_UX_GUIDANCE_MAX_CHARS
+                {
+                    self.status = format!(
+                        "pipeline UX guidance must be at most {} characters",
+                        PIPELINE_UX_GUIDANCE_MAX_CHARS
+                    );
+                    return Ok(());
+                }
+                self.req_ok(
+                    Command::UpdateGlobalSettings {
+                        memory_preset_name: form.get("memory_preset"),
+                        pipeline_ux_guidance: form.get("pipeline_ux_guidance"),
+                    },
+                    "global settings",
+                )
+                .await;
+                self.form = None;
+                self.refresh_global_settings().await?;
             }
             FormKind::Backlog => {
                 let Some(project_id) = self.selected_project_id() else {
@@ -1480,7 +2934,7 @@ impl App {
                     self.status = "select a project first".into();
                     return Ok(());
                 };
-                let Some(routine_type) = parse_routine_type(&form, &mut self.status) else {
+                let Some(output_route) = parse_output_route(&form, &mut self.status) else {
                     return Ok(());
                 };
                 let Some(enabled) = parse_bool(&form, "enabled", &mut self.status) else {
@@ -1490,7 +2944,7 @@ impl App {
                     Command::CreateRoutine {
                         project_id,
                         name: form.get("name"),
-                        routine_type,
+                        output_route,
                         prompt: form.get("prompt"),
                         cron: form.get("cron"),
                         writable_paths: form.opt("writable_paths"),
@@ -1502,7 +2956,7 @@ impl App {
                 self.refresh_routines().await?;
             }
             FormKind::RoutineEdit(routine_id) => {
-                let Some(routine_type) = parse_routine_type(&form, &mut self.status) else {
+                let Some(output_route) = parse_output_route(&form, &mut self.status) else {
                     return Ok(());
                 };
                 let Some(enabled) = parse_bool(&form, "enabled", &mut self.status) else {
@@ -1512,7 +2966,7 @@ impl App {
                     Command::UpdateRoutine {
                         routine_id,
                         name: form.get("name"),
-                        routine_type,
+                        output_route,
                         prompt: form.get("prompt"),
                         cron: form.get("cron"),
                         writable_paths: form.opt("writable_paths"),
@@ -1524,42 +2978,31 @@ impl App {
                 self.form = None;
                 self.refresh_routines().await?;
             }
-            FormKind::Issue => {
+            FormKind::Ask => {
                 let Some(project_id) = self.selected_project_id() else {
                     self.status = "select a project first".into();
                     return Ok(());
                 };
+                let mode = match form.get("mode").as_str() {
+                    "recall" => AskMode::Recall,
+                    "seek" => AskMode::Seek,
+                    _ => {
+                        self.status = "mode must be recall or seek".into();
+                        return Ok(());
+                    }
+                };
                 self.submit_create(
-                    Command::AddIssue {
+                    Command::AskProject {
                         project_id,
-                        title: form.get("title"),
-                        description: form.opt("description"),
+                        mode,
+                        question: form.get("question"),
                     },
-                    "issue",
+                    "answer",
                 )
                 .await?;
-                self.refresh_issues().await?;
+                self.refresh_asks().await?;
             }
-            FormKind::Subtask => {
-                let Some(issue_id) = self.selected_issue_id() else {
-                    self.status = "select an issue first".into();
-                    return Ok(());
-                };
-                let Some(ord) = parse_i64(&form, "ord", &mut self.status) else {
-                    return Ok(());
-                };
-                self.submit_create(
-                    Command::AddSubtask {
-                        issue_id,
-                        ord,
-                        text: form.get("text"),
-                    },
-                    "subtask",
-                )
-                .await?;
-                self.refresh_detail().await?;
-            }
-            FormKind::Steering => {
+            FormKind::QueueMessage => {
                 let Some(issue_id) = self.selected_issue_id() else {
                     self.status = "select an issue first".into();
                     return Ok(());
@@ -1570,7 +3013,7 @@ impl App {
                         source: auwsx_core::steering::SteeringSource::Human,
                         note: form.get("note"),
                     },
-                    "steering",
+                    "queue message",
                 )
                 .await?;
                 self.refresh_detail().await?;
@@ -1598,10 +3041,28 @@ impl App {
 
     async fn set_view(&mut self, v: View) -> Result<()> {
         self.view = v;
+        if v == View::Config {
+            self.config_scroll = 0;
+            self.settings_sel = self
+                .settings_sel
+                .min(self.settings_rows().len().saturating_sub(1));
+        }
+        self.focus = match v {
+            View::Overview => Focus::Left,
+            View::Config => Focus::Settings,
+            View::Issue => Focus::IssueDetail,
+            _ => Focus::Left,
+        };
         // Entering a view freshens exactly what it shows.
         match v {
             View::Issue => self.refresh_detail().await?,
             View::Backlog => self.refresh_backlog().await?,
+            View::Config => {
+                self.refresh_arsenal().await?;
+                self.refresh_memory_presets().await?;
+                self.refresh_global_settings().await?;
+            }
+            View::Ask => self.refresh_asks().await?,
             _ => {}
         }
         Ok(())
@@ -1613,6 +3074,7 @@ impl App {
         // The detail pane and per-project activity track whichever project the
         // cursor now sits in.
         self.sync_active_project();
+        self.refresh_asks().await?;
         if let Some(TreeItem::Issue { id, .. }) = self.selected_tree_item() {
             if let Some(idx) = self.issues().iter().position(|i| i.id == id) {
                 self.issue_sel = idx;
@@ -1624,6 +3086,169 @@ impl App {
         Ok(())
     }
 
+    fn move_kanban_lane(&mut self, delta: isize) {
+        step(
+            &mut self.kanban_lane_sel,
+            delta,
+            ui::vm::KanbanLane::ALL.len(),
+        );
+        self.clamp_kanban();
+    }
+
+    fn move_kanban_card(&mut self, delta: isize) {
+        let len = self.kanban_items_for_lane(self.kanban_lane_sel).len();
+        step(&mut self.kanban_card_sel, delta, len);
+    }
+
+    fn move_issue_section(&mut self, delta: isize) {
+        step(&mut self.issue_section_sel, delta, 4);
+    }
+
+    fn enter_issue_detail(&mut self, return_focus: Focus, return_tree_sel: Option<usize>) {
+        self.issue_return_focus = return_focus;
+        self.issue_return_tree_sel = return_tree_sel;
+        self.focus = Focus::IssueDetail;
+    }
+
+    fn enter_selected_issue_detail_from_left(&mut self) -> bool {
+        if self.selected_issue_id().is_none() {
+            return false;
+        }
+        self.enter_issue_detail(Focus::Left, None);
+        true
+    }
+
+    async fn move_project_order(&mut self, delta: isize) -> Result<()> {
+        let Some(project) = self.projects.get(self.proj_sel).cloned() else {
+            return Ok(());
+        };
+        self.req_ok(
+            Command::MoveProjectInProfile {
+                project_id: project.id,
+                delta,
+            },
+            "move project",
+        )
+        .await;
+        self.refresh_projects().await?;
+        self.select_tree_project(project.id);
+        Ok(())
+    }
+
+    async fn move_project_profile(&mut self, delta: isize) -> Result<()> {
+        let Some(project) = self.projects.get(self.proj_sel).cloned() else {
+            return Ok(());
+        };
+        if self.profiles.is_empty() {
+            self.status = "no profiles loaded".into();
+            return Ok(());
+        }
+        let current = self
+            .profiles
+            .iter()
+            .position(|profile| profile.id == project.profile_id)
+            .unwrap_or(0);
+        let mut next = current;
+        step(&mut next, delta, self.profiles.len());
+        if next == current {
+            return Ok(());
+        }
+        let target = self.profiles[next].clone();
+        self.req_ok(
+            Command::MoveProjectToProfile {
+                project_id: project.id,
+                profile_id: target.id,
+            },
+            "move project",
+        )
+        .await;
+        self.refresh_projects().await?;
+        self.select_tree_project(project.id);
+        self.status = format!("moved {} to {}", project.name, target.name);
+        Ok(())
+    }
+
+    fn select_tree_project(&mut self, project_id: i64) {
+        if let Some(idx) = self
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(&row.item, TreeItem::Project(id) if *id == project_id))
+        {
+            self.tree_sel = idx;
+        }
+        self.sync_active_project();
+    }
+
+    fn select_tree_backlog(&mut self, backlog_id: i64) {
+        if let Some(idx) = self
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(&row.item, TreeItem::Backlog { id, .. } if *id == backlog_id))
+        {
+            self.tree_sel = idx;
+        }
+        self.sync_active_project();
+    }
+
+    fn select_tree_issue(&mut self, issue_id: i64) {
+        if let Some(idx) = self
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(&row.item, TreeItem::Issue { id, .. } if *id == issue_id))
+        {
+            self.tree_sel = idx;
+        }
+        self.sync_active_project();
+    }
+
+    fn preserve_tree_issue_selection(&mut self, project_id: i64, issue_id: i64) -> bool {
+        let Some(kids) = self.children.get(&project_id) else {
+            return false;
+        };
+        let is_active = kids.issues.iter().position(|issue| issue.id == issue_id);
+        let is_archived = kids
+            .archived_issues
+            .iter()
+            .position(|issue| issue.id == issue_id);
+        if is_active.is_none() && is_archived.is_none() {
+            return false;
+        }
+
+        self.expanded.insert(project_id);
+        if let Some(idx) = is_active {
+            self.issue_sel = idx;
+        }
+        if is_archived.is_some() {
+            if let Some(idx) = self
+                .tree_rows()
+                .iter()
+                .position(|row| row.item == TreeItem::Project(project_id))
+            {
+                self.tree_sel = idx;
+                self.sync_active_project();
+                return true;
+            }
+        }
+        if let Some(idx) = self.tree_rows().iter().position(|row| {
+            matches!(
+                &row.item,
+                TreeItem::Issue {
+                    project_id: pid,
+                    id
+                } if *pid == project_id && *id == issue_id
+            )
+        }) {
+            self.tree_sel = idx;
+            self.sync_active_project();
+            return true;
+        }
+        false
+    }
+
+    fn selected_issue_matches(&self, issue_id: i64) -> bool {
+        self.selected_issue_id() == Some(issue_id)
+    }
+
     fn clamp_tree(&mut self) {
         let len = self.tree_rows().len();
         step(&mut self.tree_sel, 0, len);
@@ -1633,9 +3258,24 @@ impl App {
         if self.view != View::Overview {
             return Ok(());
         }
+        if self.focus == Focus::ProjectKanban {
+            self.open_selected_kanban_item().await?;
+            return Ok(());
+        }
         match self.selected_tree_item() {
-            // Enter on a project header toggles its children.
+            // Enter on a project header moves focus to the right-side kanban.
             Some(TreeItem::Project(pid)) => {
+                self.expanded.insert(pid);
+                self.clamp_tree();
+                self.sync_active_project();
+                self.focus = Focus::ProjectKanban;
+                self.clamp_kanban();
+            }
+            Some(
+                TreeItem::RoutinesRoot(pid)
+                | TreeItem::BacklogRoot(pid)
+                | TreeItem::IssuesRoot(pid),
+            ) => {
                 if self.expanded.contains(&pid) {
                     self.expanded.remove(&pid);
                 } else {
@@ -1644,13 +3284,33 @@ impl App {
                 self.clamp_tree();
                 self.sync_active_project();
             }
-            // Enter on an issue opens the detail view.
+            // Enter on an issue keeps the main screen and moves focus to the detail pane.
             Some(TreeItem::Issue { .. }) => {
-                if self.selected_issue_id().is_some() {
-                    self.set_view(View::Issue).await?;
+                if self.enter_selected_issue_detail_from_left() {
+                    self.refresh_detail().await?;
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn open_selected_kanban_item(&mut self) -> Result<()> {
+        match self.selected_kanban_item() {
+            Some(ui::vm::KanbanItem::Backlog(id)) => {
+                self.select_tree_backlog(id);
+                self.focus = Focus::Left;
+            }
+            Some(ui::vm::KanbanItem::Issue(id)) => {
+                let return_tree_sel = Some(self.tree_sel);
+                self.select_tree_issue(id);
+                if let Some(idx) = self.issues().iter().position(|issue| issue.id == id) {
+                    self.issue_sel = idx;
+                }
+                self.enter_issue_detail(Focus::ProjectKanban, return_tree_sel);
+                self.refresh_detail().await?;
+            }
+            None => self.status = "kanban lane is empty".into(),
         }
         Ok(())
     }
@@ -1669,6 +3329,7 @@ impl App {
         self.push_log(format_event(&ev));
         match ev {
             Event::IssueStatus { .. }
+            | Event::IssueRemoved { .. }
             | Event::FindingAdded { .. }
             | Event::SteeringAdded { .. } => {
                 self.refresh_issues().await?;
@@ -1679,6 +3340,11 @@ impl App {
                 self.refresh_backlog().await?;
                 self.refresh_activity().await?;
             }
+            Event::AskAnswered { project_id, .. } => {
+                if Some(project_id) == self.selected_project_id() {
+                    self.refresh_asks().await?;
+                }
+            }
             Event::SchedulerTick { project_id } => {
                 self.refresh_project_children(project_id).await?;
                 if Some(project_id) == self.selected_project_id() {
@@ -1688,6 +3354,11 @@ impl App {
             Event::MainJobStatus { .. } | Event::RoutineFired { .. } => {
                 self.refresh_routines().await?;
                 self.refresh_activity().await?;
+            }
+            Event::IssueLog { issue_id, .. } => {
+                if self.selected_issue_matches(issue_id) {
+                    self.refresh_issue_runs_and_tail().await?;
+                }
             }
             _ => {}
         }
@@ -1711,6 +3382,13 @@ fn format_event(ev: &Event) -> String {
         Event::IssueStatus { issue_id, status } => {
             format!("issue #{issue_id} → {}", status.as_str())
         }
+        Event::IssueRemoved { issue_id, .. } => format!("issue #{issue_id} removed"),
+        Event::AskAnswered {
+            answer_id,
+            project_id,
+        } => {
+            format!("ask answer #{answer_id} on project #{project_id}")
+        }
         Event::IssueLog {
             issue_id, phase, ..
         } => format!("issue #{issue_id} log ({phase})"),
@@ -1730,7 +3408,7 @@ fn format_event(ev: &Event) -> String {
             steering_id,
             issue_id,
         } => {
-            format!("steering #{steering_id} on issue #{issue_id}")
+            format!("queue message #{steering_id} on issue #{issue_id}")
         }
         Event::MainJobStatus {
             main_job_id,
@@ -1833,7 +3511,11 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
         tokio::select! {
             maybe_key = key_rx.recv() => {
                 let Some(key) = maybe_key else { break }; // reader thread gone
-                if let Some(action) = input::map_key(app.view, key) {
+                if app.confirm_quit {
+                    if app.handle_confirm_key(key).await? {
+                        break;
+                    }
+                } else if let Some(action) = input::map_key(app.view, key) {
                     if app.form.is_some() {
                         app.handle_form_key(key).await?;
                     } else if app.apply(action).await? {
@@ -1855,7 +3537,7 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
                 app.scanned_repos = repos;
                 repo_scan = None; // consumed; never poll the finished handle again
             }
-            _ = tick.tick() => { /* periodic redraw for time-based fields */ }
+            _ = tick.tick() => app.clear_expired_status(),
         }
     }
     Ok(())
@@ -1889,22 +3571,324 @@ mod tests {
 
     #[test]
     fn view_step_forward_one() {
-        assert_eq!(View::Overview.step(1), View::Issue);
+        assert_eq!(View::Overview.step(1), View::Backlog);
     }
 
     #[test]
     fn view_step_wraps_forward() {
-        assert_eq!(View::Config.step(1), View::Overview);
+        assert_eq!(View::Ask.step(1), View::Overview);
     }
 
     #[test]
     fn view_step_wraps_backward() {
-        assert_eq!(View::Overview.step(-1), View::Config);
+        assert_eq!(View::Overview.step(-1), View::Ask);
     }
 
     #[test]
     fn view_step_forward_two() {
         assert_eq!(View::Backlog.step(2), View::Config);
+    }
+
+    #[tokio::test]
+    async fn given_issue_selected_when_drill_then_focuses_detail_without_fullscreen(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Issue { id: 7, .. }))
+            .expect("issue row exists");
+        app.sync_active_project();
+
+        assert!(app.enter_selected_issue_detail_from_left());
+
+        assert_eq!(app.view, View::Overview);
+        assert_eq!(app.focus, Focus::IssueDetail);
+        assert_eq!(app.issue_return_focus, Focus::Left);
+        Ok(())
+    }
+
+    #[test]
+    fn given_issue_tree_row_when_rendered_then_status_is_compact_without_big_state_label() {
+        let mut app = test_app();
+        let mut issue = issue_fixture();
+        issue.status = auwsx_core::state::IssueStatus::PlanBlocked;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+
+        let label = app
+            .tree_rows()
+            .into_iter()
+            .find(|row| matches!(row.item, TreeItem::Issue { id: 7, .. }))
+            .expect("issue row exists")
+            .label;
+
+        assert!(label.starts_with("! PLAN #7"));
+        for duplicate in ["Need Att", "Active", "Idle", "Done"] {
+            assert!(
+                !label.contains(duplicate),
+                "{duplicate} leaked into {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_issue_tree_row_with_description_when_rendered_then_description_is_visible() {
+        let mut app = test_app();
+        let mut issue = issue_fixture();
+        issue.title = "cursor".to_string();
+        issue.description = Some("left/right movement in input fields".to_string());
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+
+        let label = app
+            .tree_rows()
+            .into_iter()
+            .find(|row| matches!(row.item, TreeItem::Issue { id: 7, .. }))
+            .expect("issue row exists")
+            .label;
+
+        assert_eq!(
+            label,
+            "◉ PLAN #7   cursor - left/right movement in input fields"
+        );
+    }
+
+    #[test]
+    fn given_project_row_selected_when_issue_sel_points_elsewhere_then_no_issue_is_selected() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| row.item == TreeItem::Project(1))
+            .expect("project row exists");
+        app.issue_sel = 0;
+
+        assert_eq!(app.selected_issue_id(), None);
+        assert!(app.selected_issue().is_none());
+    }
+
+    #[test]
+    fn given_full_issue_view_when_no_issue_row_selected_then_issue_sel_remains_legacy_selection() {
+        let mut app = test_app();
+        app.view = View::Issue;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = 0;
+        app.issue_sel = 0;
+
+        assert_eq!(app.selected_issue_id(), Some(7));
+        assert_eq!(app.selected_issue().map(|issue| issue.id), Some(7));
+    }
+
+    #[test]
+    fn given_archived_issue_when_tree_rendered_then_hidden_behind_archive_section() {
+        let mut app = test_app();
+        let mut active = issue_fixture();
+        active.id = 7;
+        active.status = auwsx_core::state::IssueStatus::Working;
+        let mut archived = issue_fixture();
+        archived.id = 8;
+        archived.status = auwsx_core::state::IssueStatus::Done;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![active],
+                archived_issues: vec![archived],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+
+        let rows = app.tree_rows();
+
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row.item, TreeItem::Issue { id: 7, .. })));
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row.item, TreeItem::Issue { id: 8, .. })));
+    }
+
+    #[test]
+    fn given_only_archived_issue_when_tree_rendered_then_left_nav_has_no_archive_rows() {
+        let mut app = test_app();
+        let mut archived = issue_fixture();
+        archived.id = 8;
+        archived.status = auwsx_core::state::IssueStatus::Done;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                archived_issues: vec![archived],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+
+        let rows = app.tree_rows();
+
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row.item, TreeItem::Issue { id: 8, .. })));
+        assert!(rows.iter().any(|row| row.item == TreeItem::Project(1)));
+    }
+
+    #[test]
+    fn given_selected_issue_becomes_archived_when_refresh_preserves_selection_then_project_is_selected(
+    ) {
+        let mut app = test_app();
+        let mut archived = issue_fixture();
+        archived.id = 8;
+        archived.status = auwsx_core::state::IssueStatus::Done;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                archived_issues: vec![archived],
+                ..ProjectChildren::default()
+            },
+        );
+
+        assert!(app.preserve_tree_issue_selection(1, 8));
+
+        assert!(app.expanded.contains(&1));
+        assert_eq!(app.selected_tree_item(), Some(TreeItem::Project(1)));
+    }
+
+    #[test]
+    fn given_done_issue_when_delete_action_requested_then_archives_not_abandons() {
+        let mut app = test_app();
+        let mut issue = issue_fixture();
+        issue.status = auwsx_core::state::IssueStatus::Done;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.select_tree_issue(7);
+
+        let (cmd, label) = app.issue_delete_command(7);
+
+        assert_eq!(label, "archive issue");
+        assert_eq!(app.selected_issue_delete_hint(), "d archive");
+        assert!(matches!(cmd, Command::CleanupIssueWorktree { issue_id: 7 }));
+    }
+
+    #[test]
+    fn given_archived_issue_selected_when_delete_action_requested_then_keeps_archive_semantics() {
+        let mut app = test_app();
+        let mut issue = issue_fixture();
+        issue.status = auwsx_core::state::IssueStatus::Done;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                archived_issues: vec![issue],
+                ..ProjectChildren::default()
+            },
+        );
+        app.focus = Focus::IssueDetail;
+        app.detail.issue = app.archived_issues().first().cloned();
+
+        let (cmd, label) = app.issue_delete_command(7);
+
+        assert_eq!(label, "archive issue");
+        assert_eq!(app.selected_issue_delete_hint(), "d archive");
+        assert!(matches!(cmd, Command::CleanupIssueWorktree { issue_id: 7 }));
+    }
+
+    #[test]
+    fn given_selection_differs_from_target_when_delete_action_requested_then_target_status_wins() {
+        let mut app = test_app();
+        let mut active = issue_fixture();
+        active.id = 7;
+        active.status = auwsx_core::state::IssueStatus::Working;
+        let mut archived = issue_fixture();
+        archived.id = 8;
+        archived.status = auwsx_core::state::IssueStatus::Done;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![active],
+                archived_issues: vec![archived],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.select_tree_issue(7);
+
+        let (cmd, label) = app.issue_delete_command(8);
+
+        assert_eq!(label, "archive issue");
+        assert!(matches!(cmd, Command::CleanupIssueWorktree { issue_id: 8 }));
+    }
+
+    #[test]
+    fn given_working_issue_when_delete_action_requested_then_abandons() {
+        let mut app = test_app();
+        let mut issue = issue_fixture();
+        issue.status = auwsx_core::state::IssueStatus::Working;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.select_tree_issue(7);
+
+        let (cmd, label) = app.issue_delete_command(7);
+
+        assert_eq!(label, "abandon issue");
+        assert_eq!(app.selected_issue_delete_hint(), "d abandon");
+        assert!(matches!(cmd, Command::AbandonIssue { issue_id: 7 }));
     }
 
     #[test]
@@ -1942,113 +3926,91 @@ mod tests {
         assert_eq!(sel, 0);
     }
 
-    // --- project config validation ---------------------------------------
+    #[test]
+    fn given_issue_log_when_scroll_up_then_moves_older() {
+        let mut app = test_app();
+        app.log_tail = "one\ntwo\nthree\n".to_string();
 
-    fn test_project() -> Project {
-        Project {
-            id: 42,
-            name: "demo".into(),
-            repo_path: "/repo".into(),
-            default_branch: "main".into(),
-            main_agent_cmd: "main-agent".into(),
-            plan_agent_cmd: "plan-agent".into(),
-            work_agent_cmd: "work-agent".into(),
-            review_agent_cmd: Some("review-agent".into()),
-            completion_policy: CompletionPolicy::Manual,
-            completion_soft_timeout_min: 30,
-            plan_gate_timeout_min: 10,
-            iteration_timeout_min: 60,
-            main_job_timeout_min: 120,
-            review_max_rounds: 2,
-            conflict_max_attempts: 3,
-            max_concurrency: 4,
-            schedule_interval_min: Some(15),
-            merge_mode: MergeMode::Local,
-            skill_path: Some("skills".into()),
-            deepsleep_interval_days: 7,
-            last_deepsleep_at: None,
-            created_at: 1,
-        }
+        app.scroll_issue_log(1);
+
+        assert_eq!(app.issue_log_scroll, 1);
     }
 
-    fn optional_test_field(key: &'static str, label: &'static str, value: &str) -> FormField {
-        FormField {
-            key,
-            label,
-            value: value.into(),
-            cursor: value.chars().count(),
-            optional: true,
-        }
+    #[test]
+    fn given_issue_log_at_oldest_when_scroll_older_then_clamps() {
+        let mut app = test_app();
+        app.log_tail = "one\ntwo\nthree\n".to_string();
+
+        app.scroll_issue_log(10);
+
+        assert_eq!(app.issue_log_scroll, 2);
     }
 
-    fn project_config_form_with(key: &'static str, value: &str) -> Form {
-        let mut form = Form {
-            kind: FormKind::ProjectConfig,
-            title: "Project config",
-            fields: vec![
-                test_field("name", "Name", "demo"),
-                test_field("repo_path", "Repository", "/repo"),
-                test_field("branch", "Default branch", "main"),
-                test_field("main_cmd", "Main command", "main-agent"),
-                test_field("plan_cmd", "Plan command", "plan-agent"),
-                test_field("work_cmd", "Work command", "work-agent"),
-                optional_test_field("review_cmd", "Review command", "review-agent"),
-                test_field("completion", "Completion policy", "manual"),
-                test_field("plan_gate", "Plan gate timeout", "10"),
-                test_field("complete_gate", "Completion timeout", "30"),
-                test_field("iter_timeout", "Iteration timeout", "60"),
-                test_field("main_job_timeout", "Main job timeout", "120"),
-                test_field("review_rounds", "Review rounds", "2"),
-                test_field("conflict_attempts", "Conflict attempts", "3"),
-                test_field("concurrency", "Concurrency", "4"),
-                optional_test_field("schedule_min", "Schedule interval", "15"),
-                test_field("merge_mode", "Merge mode", "local"),
-                optional_test_field("skill_path", "Skills path", "skills"),
-                test_field("deepsleep_days", "Deepsleep interval", "7"),
-            ],
-            current: 0,
-        };
-        form.fields
-            .iter_mut()
-            .find(|field| field.key == key)
-            .expect("test field exists")
-            .value = value.into();
-        form
+    #[test]
+    fn given_issue_log_scrolled_when_scroll_down_then_moves_newer() {
+        let mut app = test_app();
+        app.log_tail = "one\ntwo\nthree\n".to_string();
+        app.issue_log_scroll = 2;
+
+        app.scroll_issue_log(-1);
+
+        assert_eq!(app.issue_log_scroll, 1);
     }
 
-    async fn submitted_project_config_with(key: &'static str, value: &str) -> App {
-        let mut app = App::new(std::path::PathBuf::from(
-            "target/nonexistent-auwsx-test.sock",
-        ));
-        app.projects = vec![test_project()];
-        app.form = Some(project_config_form_with(key, value));
-        app.submit_form().await.unwrap();
-        app
+    #[test]
+    fn given_issue_log_when_jump_top_and_bottom_then_offsets_match() {
+        let mut app = test_app();
+        app.log_tail = "one\ntwo\nthree\n".to_string();
+
+        app.jump_issue_log_top();
+        assert_eq!(app.issue_log_scroll, 2);
+
+        app.jump_issue_log_bottom();
+        assert_eq!(app.issue_log_scroll, 0);
     }
 
-    #[tokio::test]
-    async fn given_invalid_completion_policy_when_submitting_project_config_then_status_uses_label()
-    {
-        let app = submitted_project_config_with("completion", "sometimes").await;
-
-        assert_eq!(
-            app.status,
-            "Completion policy must be manual, soft, or auto"
+    #[test]
+    fn given_issue_selected_when_issue_log_event_matches_then_live_tail_should_refresh() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
         );
+        app.expanded.insert(1);
+        app.select_tree_issue(7);
+
+        assert!(app.selected_issue_matches(7));
+        assert!(!app.selected_issue_matches(8));
     }
 
     #[tokio::test]
-    async fn given_invalid_merge_mode_when_submitting_project_config_then_status_uses_label() {
-        let app = submitted_project_config_with("merge_mode", "squash").await;
+    async fn given_issue_detail_entered_from_left_when_returning_then_focus_goes_left(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
 
-        assert_eq!(app.status, "Merge mode must be local or pr");
+        app.enter_issue_detail(Focus::Left, None);
+        app.apply(Action::Back).await?;
+
+        assert_eq!(app.focus, Focus::Left);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn given_invalid_project_config_choice_when_submitting_then_form_stays_open() {
-        let app = submitted_project_config_with("completion", "sometimes").await;
+    async fn given_issue_detail_entered_from_kanban_when_returning_then_focus_goes_kanban(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
 
-        assert!(app.form.is_some());
+        app.tree_sel = 7;
+        app.enter_issue_detail(Focus::ProjectKanban, Some(3));
+        app.apply(Action::Back).await?;
+
+        assert_eq!(app.focus, Focus::ProjectKanban);
+        assert_eq!(app.tree_sel, 3);
+        Ok(())
     }
 
     // --- App::repo_suggestions -------------------------------------------
@@ -2057,27 +4019,104 @@ mod tests {
         App::new(std::path::PathBuf::from("/tmp/test.sock"))
     }
 
+    #[test]
+    fn given_expanded_project_when_tree_label_then_counts_hidden() {
+        let label = project_tree_label("p", "manual", &ProjectChildren::default(), true);
+
+        assert_eq!(label, "p  manual");
+    }
+
+    #[test]
+    fn given_collapsed_project_when_tree_label_then_letter_counts_shown() {
+        let label = project_tree_label("p", "manual", &ProjectChildren::default(), false);
+
+        assert_eq!(label, "p  manual  R0 B0 I0");
+    }
+
     fn repo_field(value: &str) -> FormField {
-        FormField::new("repo_path", "Repository", value, false)
+        field("repo_path", value, false)
     }
 
-    fn form_app_with_field(field: FormField) -> App {
-        let mut app = test_app();
-        app.form = Some(Form {
-            kind: FormKind::Backlog,
-            title: "t",
-            fields: vec![field],
-            current: 0,
-        });
-        app
+    fn arsenal_preset(name: &str, review: Option<&str>) -> ArsenalPreset {
+        ArsenalPreset {
+            id: 1,
+            name: name.to_string(),
+            main_agent_cmd: format!("{name}-main {{prompt}}"),
+            plan_agent_cmd: format!("{name}-plan {{prompt}}"),
+            work_agent_cmd: format!("{name}-work {{prompt}}"),
+            review_agent_cmd: review.map(str::to_string),
+            builtin: false,
+            created_at: 1,
+            updated_at: 1,
+        }
     }
 
-    fn form_field(app: &App) -> &FormField {
-        &app.form.as_ref().unwrap().fields[0]
+    fn project_fixture() -> Project {
+        Project {
+            id: 1,
+            profile_id: 1,
+            profile_order: 1,
+            name: "p".to_string(),
+            repo_path: "/repo".to_string(),
+            default_branch: "main".to_string(),
+            arsenal_preset_name: None,
+            main_agent_cmd: "manual-main".to_string(),
+            plan_agent_cmd: "manual-plan".to_string(),
+            work_agent_cmd: "manual-work".to_string(),
+            review_agent_cmd: Some("manual-review".to_string()),
+            main_agent_cmd_override: Some("manual-main".to_string()),
+            plan_agent_cmd_override: Some("manual-plan".to_string()),
+            work_agent_cmd_override: Some("manual-work".to_string()),
+            review_agent_cmd_override: Some("manual-review".to_string()),
+            completion_policy: CompletionPolicy::Manual,
+            completion_soft_timeout_min: 60,
+            plan_gate_timeout_min: 10,
+            iteration_timeout_min: 30,
+            main_job_timeout_min: 60,
+            review_max_rounds: 5,
+            conflict_max_attempts: 3,
+            max_concurrency: 1,
+            schedule_interval_min: None,
+            schedule_cron: None,
+            merge_mode: MergeMode::Local,
+            skill_path: None,
+            deepsleep_interval_days: 30,
+            deepsleep_cron: Some("0 0 */30 * *".to_string()),
+            last_deepsleep_at: None,
+            created_at: 1,
+        }
     }
 
-    fn test_field(key: &'static str, label: &'static str, value: &str) -> FormField {
-        FormField::new(key, label, value, false)
+    fn issue_fixture() -> Issue {
+        Issue {
+            id: 7,
+            project_id: 1,
+            title: "issue".to_string(),
+            description: None,
+            agent_summary: None,
+            progress_report: None,
+            result_report: None,
+            status: auwsx_core::state::IssueStatus::Planning,
+            branch: None,
+            worktree_path: None,
+            agent_session: None,
+            review_round: 0,
+            conflict_attempts: 0,
+            wait_until: None,
+            absorbed_into_id: None,
+            has_pending_steering: false,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn focus(form: &mut Form, label: &str) {
+        form.current = form
+            .fields
+            .iter()
+            .position(|field| field.label == label)
+            .expect("field exists");
+        form.cursor = form.current_len();
     }
 
     #[test]
@@ -2095,6 +4134,8 @@ mod tests {
             title: "t",
             fields: vec![repo_field("foo")],
             current: 0,
+            cursor: 3,
+            completion_sel: 0,
         });
         assert!(app.repo_suggestions().is_empty());
     }
@@ -2106,8 +4147,10 @@ mod tests {
         app.form = Some(Form {
             kind: FormKind::Project,
             title: "t",
-            fields: vec![test_field("name", "Name", "foo")],
+            fields: vec![field("name", "foo", false)],
             current: 0,
+            cursor: 3,
+            completion_sel: 0,
         });
         assert!(app.repo_suggestions().is_empty());
     }
@@ -2121,6 +4164,8 @@ mod tests {
             title: "t",
             fields: vec![repo_field("foo")],
             current: 0,
+            cursor: 3,
+            completion_sel: 0,
         });
         assert!(!app.repo_suggestions().is_empty());
     }
@@ -2134,6 +4179,8 @@ mod tests {
             title: "t",
             fields: vec![repo_field("zzzz")],
             current: 0,
+            cursor: 4,
+            completion_sel: 0,
         });
         assert!(app.repo_suggestions().is_empty());
     }
@@ -2146,49 +4193,12 @@ mod tests {
         app.form = Some(Form {
             kind: FormKind::Project,
             title: "t",
-            fields: vec![test_field("name", "Name", "x"), repo_field("foo")],
+            fields: vec![field("name", "x", false), repo_field("foo")],
             current: 1,
+            cursor: 3,
+            completion_sel: 0,
         });
         assert!(!app.repo_suggestions().is_empty());
-    }
-
-    #[test]
-    fn given_repo_field_label_differs_when_repo_suggestions_then_uses_field_key() {
-        let mut app = test_app();
-        app.scanned_repos = vec!["~/foo".to_string()];
-        app.form = Some(Form {
-            kind: FormKind::Project,
-            title: "t",
-            fields: vec![test_field("repo_path", "Source directory", "foo")],
-            current: 0,
-        });
-        assert_eq!(app.repo_suggestions(), vec!["~/foo".to_string()]);
-    }
-
-    #[test]
-    fn given_project_config_form_on_repo_field_when_repo_suggestions_then_returns_matches() {
-        let mut app = test_app();
-        app.scanned_repos = vec!["~/foo".to_string()];
-        app.form = Some(Form {
-            kind: FormKind::ProjectConfig,
-            title: "t",
-            fields: vec![repo_field("foo")],
-            current: 0,
-        });
-        assert_eq!(app.repo_suggestions(), vec!["~/foo".to_string()]);
-    }
-
-    #[test]
-    fn given_project_form_with_unfocused_repo_field_when_repo_suggestions_then_empty() {
-        let mut app = test_app();
-        app.scanned_repos = vec!["~/foo".to_string()];
-        app.form = Some(Form {
-            kind: FormKind::Project,
-            title: "t",
-            fields: vec![repo_field("foo"), test_field("name", "Name", "")],
-            current: 1,
-        });
-        assert!(app.repo_suggestions().is_empty());
     }
 
     #[test]
@@ -2200,85 +4210,395 @@ mod tests {
             title: "t",
             fields: vec![repo_field("foo")],
             current: 0,
+            cursor: 3,
+            completion_sel: 0,
         });
         assert_eq!(app.repo_suggestions().len(), 8);
     }
 
-    #[tokio::test]
-    async fn given_cursor_in_middle_when_char_typed_then_inserts_at_cursor() {
-        let mut field = FormField::new("text", "text", "ab", false);
-        field.cursor = 1;
-        let mut app = form_app_with_field(field);
+    // --- App::arsenal_suggestions -----------------------------------------
 
-        app.handle_form_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE))
-            .await
-            .unwrap();
-
-        let field = form_field(&app);
-        assert_eq!(field.value, "aXb");
-        assert_eq!(field.cursor, 2);
+    #[test]
+    fn given_project_form_default_when_created_then_arsenal_field_is_blank() {
+        let form = Form::project();
+        let arsenal = form
+            .fields
+            .iter()
+            .find(|field| field.label == "arsenal")
+            .expect("arsenal field exists");
+        assert_eq!(arsenal.value, "");
     }
 
     #[tokio::test]
-    async fn given_cursor_after_middle_char_when_backspace_then_removes_left_char() {
-        let mut field = FormField::new("text", "text", "abc", false);
-        field.cursor = 2;
-        let mut app = form_app_with_field(field);
+    async fn given_form_cursor_moved_left_when_char_typed_then_inserts_at_cursor(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.form = Some(Form::backlog_edit(&BacklogItem {
+            id: 1,
+            project_id: 1,
+            text: "abcd".to_string(),
+            source: Source::Human,
+            approval: auwsx_core::backlog::Approval::Approved,
+            origin_routine_id: None,
+            consumed_issue_id: None,
+            created_at: 1,
+            resolved_at: None,
+        }));
+
+        app.handle_form_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await?;
+        app.handle_form_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT))
+            .await?;
+
+        let form = app.form.expect("form remains open");
+        assert_eq!(form.get("text"), "abcXd");
+        assert_eq!(form.cursor, 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_form_cursor_when_backspace_and_delete_then_remove_around_cursor(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        let mut form = Form::backlog();
+        form.set_current_value("abcd".to_string());
+        form.cursor = 2;
+        app.form = Some(form);
 
         app.handle_form_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-            .await
-            .unwrap();
+            .await?;
+        app.handle_form_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))
+            .await?;
 
-        let field = form_field(&app);
-        assert_eq!(field.value, "ac");
-        assert_eq!(field.cursor, 1);
+        let form = app.form.expect("form remains open");
+        assert_eq!(form.get("text"), "ad");
+        assert_eq!(form.cursor, 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn given_cursor_before_middle_char_when_delete_then_removes_right_char() {
-        let mut field = FormField::new("text", "text", "abc", false);
-        field.cursor = 1;
-        let mut app = form_app_with_field(field);
+    async fn given_non_free_combo_when_char_typed_then_value_is_unchanged() -> anyhow::Result<()> {
+        let mut app = test_app();
+        let mut form = Form::global_settings(None);
+        focus(&mut form, "memory_preset");
+        let before = form.get("memory_preset").to_string();
+        app.form = Some(form);
 
-        app.handle_form_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))
-            .await
-            .unwrap();
+        app.handle_form_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await?;
 
-        let field = form_field(&app);
-        assert_eq!(field.value, "ac");
-        assert_eq!(field.cursor, 1);
+        let form = app.form.expect("form remains open");
+        assert_eq!(form.get("memory_preset"), before);
+        Ok(())
     }
 
     #[test]
-    fn given_stale_cursor_when_inserting_utf8_then_clamps_to_char_end() {
-        let mut field = FormField::new("text", "text", "éa", false);
-        field.cursor = 99;
+    fn given_status_deadline_in_past_when_clear_expired_status_then_status_is_empty() {
+        let mut app = test_app();
+        app.status = "cancelled".to_string();
+        app.status_until = Some(Instant::now() - Duration::from_millis(1));
 
-        field.insert_char('中');
+        app.clear_expired_status();
 
-        assert_eq!(field.value, "éa中");
-        assert_eq!(field.cursor, 3);
+        assert_eq!(app.status, "");
     }
 
     #[tokio::test]
-    async fn given_repo_completion_when_tab_then_cursor_moves_to_suggestion_end() {
+    async fn given_settings_view_when_moving_down_then_selected_row_changes() -> anyhow::Result<()>
+    {
         let mut app = test_app();
-        app.scanned_repos = vec!["~/foo".to_string()];
-        let mut field = repo_field("foo");
-        field.cursor = 1;
+        app.view = View::Config;
+        app.arsenal_presets = vec![arsenal_preset("codex", None)];
+
+        app.apply(Action::Down).await?;
+
+        assert_eq!(app.selected_settings_row(), SettingsRow::ArsenalOverview);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_settings_arsenal_row_when_edit_then_opens_arsenal_form() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.view = View::Config;
+        app.arsenal_presets = vec![arsenal_preset("codex", None)];
+        app.settings_sel = app
+            .settings_rows()
+            .iter()
+            .position(|row| matches!(row, SettingsRow::ArsenalPreset(_)))
+            .expect("arsenal preset row");
+
+        app.apply(Action::EditSelected).await?;
+
+        let form = app.form.expect("arsenal form");
+        assert_eq!(form.kind, FormKind::ArsenalPreset);
+        assert_eq!(form.get("name"), "codex");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_settings_memory_row_when_edit_then_opens_global_settings_form(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.view = View::Config;
+        app.memory_presets = vec![MemoryPreset {
+            id: 1,
+            name: "portable-markdown".to_string(),
+            retrieve_kind: "portable".to_string(),
+            retrieve_cmd: None,
+            save_kind: "portable".to_string(),
+            save_cmd: None,
+            dream_kind: "portable".to_string(),
+            dream_cmd: None,
+            deepsleep_kind: "portable".to_string(),
+            deepsleep_cmd: None,
+            builtin: true,
+            created_at: 0,
+            updated_at: 0,
+        }];
+        app.settings_sel = app
+            .settings_rows()
+            .iter()
+            .position(|row| matches!(row, SettingsRow::MemoryPreset(_)))
+            .expect("memory preset row");
+
+        app.apply(Action::EditSelected).await?;
+
+        let form = app.form.expect("global settings form");
+        assert_eq!(form.kind, FormKind::GlobalSettings);
+        assert_eq!(form.get("memory_preset"), "portable-markdown");
+        Ok(())
+    }
+
+    #[test]
+    fn given_project_form_with_arsenal_preset_when_building_add_command_then_manual_overrides_survive(
+    ) {
+        let mut form = Form::project();
+        form.set("name", "manual");
+        form.set("repo_path", "/repo");
+        form.set("arsenal", "codex");
+        form.set("main_cmd", "manual-main");
+        form.set("plan_cmd", "manual-plan");
+        form.set("work_cmd", "manual-work");
+        form.set("review_cmd", "manual-review");
+        let mut status = String::new();
+        let preset = arsenal_preset("codex", Some("codex-review {prompt}"));
+
+        let cmd = add_project_command_from_form(&form, Some(&preset), &mut status)
+            .expect("valid project command");
+
+        match cmd {
+            Command::AddProject {
+                main_agent_cmd,
+                plan_agent_cmd,
+                work_agent_cmd,
+                review_agent_cmd,
+                ..
+            } => assert_eq!(
+                (
+                    main_agent_cmd.as_str(),
+                    plan_agent_cmd.as_str(),
+                    work_agent_cmd.as_str(),
+                    review_agent_cmd.as_deref()
+                ),
+                (
+                    "manual-main",
+                    "manual-plan",
+                    "manual-work",
+                    Some("manual-review")
+                )
+            ),
+            other => panic!("expected AddProject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_project_form_with_arsenal_preset_and_blank_commands_then_sends_preset_ref() {
+        let mut form = Form::project();
+        form.set("name", "preset");
+        form.set("repo_path", "/repo");
+        form.set("arsenal", "codex");
+        form.set("main_cmd", "");
+        form.set("plan_cmd", "");
+        form.set("work_cmd", "");
+        form.set("review_cmd", "");
+        let mut status = String::new();
+        let preset = arsenal_preset("codex", Some("codex-review {prompt}"));
+
+        let cmd = add_project_command_from_form(&form, Some(&preset), &mut status)
+            .expect("valid project command");
+
+        match cmd {
+            Command::AddProject {
+                arsenal_preset_name,
+                main_agent_cmd,
+                plan_agent_cmd,
+                work_agent_cmd,
+                review_agent_cmd,
+                ..
+            } => assert_eq!(
+                (
+                    arsenal_preset_name.as_deref(),
+                    main_agent_cmd.as_str(),
+                    plan_agent_cmd.as_str(),
+                    work_agent_cmd.as_str(),
+                    review_agent_cmd.as_deref()
+                ),
+                (Some("codex"), "", "", "", None)
+            ),
+            other => panic!("expected AddProject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_project_arsenal_ref_when_open_config_then_arsenal_is_primary_choice() {
+        let mut app = test_app();
+        let preset = arsenal_preset("codex", Some("codex-review {prompt}"));
+        let mut project = project_fixture();
+        project.arsenal_preset_name = Some("codex".to_string());
+        project.main_agent_cmd = preset.main_agent_cmd.clone();
+        project.plan_agent_cmd = preset.plan_agent_cmd.clone();
+        project.work_agent_cmd = preset.work_agent_cmd.clone();
+        project.review_agent_cmd = preset.review_agent_cmd.clone();
+        project.main_agent_cmd_override = None;
+        project.plan_agent_cmd_override = None;
+        project.work_agent_cmd_override = None;
+        project.review_agent_cmd_override = None;
+        app.arsenal_presets = vec![preset];
+
+        let form = app.project_config_form(&project);
+
+        assert_eq!(form.get("arsenal"), "codex");
+        assert_eq!(form.get("main_cmd"), "");
+        assert_eq!(form.get("plan_cmd"), "");
+        assert_eq!(form.get("work_cmd"), "");
+        assert_eq!(form.get("review_cmd"), "");
+    }
+
+    #[test]
+    fn given_project_arsenal_ref_with_override_when_open_config_then_override_is_visible() {
+        let mut app = test_app();
+        let preset = arsenal_preset("codex", Some("codex-review {prompt}"));
+        let mut project = project_fixture();
+        project.arsenal_preset_name = Some("codex".to_string());
+        project.main_agent_cmd = "manual-main {prompt}".to_string();
+        project.plan_agent_cmd = preset.plan_agent_cmd.clone();
+        project.work_agent_cmd = preset.work_agent_cmd.clone();
+        project.review_agent_cmd = preset.review_agent_cmd.clone();
+        project.main_agent_cmd_override = Some("manual-main {prompt}".to_string());
+        project.plan_agent_cmd_override = None;
+        project.work_agent_cmd_override = None;
+        project.review_agent_cmd_override = None;
+        app.arsenal_presets = vec![preset];
+
+        let form = app.project_config_form(&project);
+
+        assert_eq!(form.get("arsenal"), "codex");
+        assert_eq!(form.get("main_cmd"), "manual-main {prompt}");
+        assert_eq!(form.get("plan_cmd"), "");
+        assert_eq!(form.get("work_cmd"), "");
+        assert_eq!(form.get("review_cmd"), "");
+    }
+
+    #[test]
+    fn given_no_form_when_arsenal_suggestions_then_empty() {
+        let app = test_app();
+        assert!(app.arsenal_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_non_project_form_when_arsenal_suggestions_then_empty() {
+        let mut app = test_app();
+        app.arsenal_presets = vec![arsenal_preset("codex", None)];
+        app.form = Some(Form {
+            kind: FormKind::Backlog,
+            title: "t",
+            fields: vec![field("arsenal", "co", true)],
+            current: 0,
+            cursor: 2,
+            completion_sel: 0,
+        });
+        assert!(app.arsenal_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_project_form_on_non_arsenal_field_when_arsenal_suggestions_then_empty() {
+        let mut app = test_app();
+        app.arsenal_presets = vec![arsenal_preset("codex", None)];
         app.form = Some(Form {
             kind: FormKind::Project,
             title: "t",
-            fields: vec![field],
+            fields: vec![field("name", "co", false)],
             current: 0,
+            cursor: 2,
+            completion_sel: 0,
         });
+        assert!(app.arsenal_suggestions().is_empty());
+    }
+
+    #[test]
+    fn given_project_form_arsenal_query_when_arsenal_suggestions_then_case_insensitive_match() {
+        let mut app = test_app();
+        app.arsenal_presets = vec![
+            arsenal_preset("Codex", None),
+            arsenal_preset("claude", None),
+        ];
+        let mut form = Form::project();
+        focus(&mut form, "arsenal");
+        form.set("arsenal", "cod");
+        app.form = Some(form);
+        assert_eq!(app.arsenal_suggestions(), vec!["Codex".to_string()]);
+    }
+
+    #[test]
+    fn given_project_config_form_with_many_matches_when_arsenal_suggestions_then_capped_at_eight() {
+        let mut app = test_app();
+        app.arsenal_presets = (0..20)
+            .map(|i| arsenal_preset(&format!("codex-{i}"), None))
+            .collect();
+        let mut form = Form::project_config(&project_fixture());
+        focus(&mut form, "arsenal");
+        form.set("arsenal", "codex");
+        app.form = Some(form);
+        assert_eq!(app.arsenal_suggestions().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn given_arsenal_field_when_tab_accepts_preset_then_commands_are_blank_overrides(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.arsenal_presets = vec![arsenal_preset("codex", Some("codex-review {prompt}"))];
+        let mut form = Form::project();
+        focus(&mut form, "arsenal");
+        form.set("arsenal", "cod");
+        app.form = Some(form);
 
         app.handle_form_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .await
-            .unwrap();
+            .await?;
 
-        let field = form_field(&app);
-        assert_eq!(field.value, "~/foo");
-        assert_eq!(field.cursor, 5);
+        let form = app.form.expect("form remains open");
+        assert_eq!(form.get("arsenal"), "codex");
+        assert_eq!(form.get("main_cmd"), "");
+        assert_eq!(form.get("plan_cmd"), "");
+        assert_eq!(form.get("work_cmd"), "");
+        assert_eq!(form.get("review_cmd"), "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_accepted_preset_without_review_when_tab_accepts_then_review_field_is_blank(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.arsenal_presets = vec![arsenal_preset("codex", None)];
+        let mut form = Form::project();
+        focus(&mut form, "arsenal");
+        form.set("arsenal", "cod");
+        app.form = Some(form);
+
+        app.handle_form_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await?;
+
+        let form = app.form.expect("form remains open");
+        assert_eq!(form.get("review_cmd"), "");
+        Ok(())
     }
 }

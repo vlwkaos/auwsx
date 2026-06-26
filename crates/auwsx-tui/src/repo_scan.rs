@@ -1,5 +1,5 @@
 //! Background git-repo discovery for the New-project form, mirroring wsx's
-//! `repo_scan.rs` + fuzzy completion (`/Users/eliot/ws-ps/wsx/crates/wsx/src/{repo_scan,ui/input}.rs`).
+//! `repo_scan.rs` + fuzzy completion, adapted from the sibling wsx implementation.
 //!
 //! A blocking walk from `$HOME` (bounded depth, skipping heavy dirs) collects
 //! the absolute path of every directory containing a `.git`. The walk stops

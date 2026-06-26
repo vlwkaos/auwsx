@@ -7,6 +7,8 @@
 
 use anyhow::{bail, Context, Result};
 use auwsx_core::backlog::{Approval, Source};
+use auwsx_core::control_outbox;
+use auwsx_core::db::ask_answers::AskMode;
 use auwsx_core::db::findings::Severity;
 use auwsx_core::db::projects::CompletionPolicy;
 use auwsx_core::events;
@@ -14,16 +16,22 @@ use auwsx_core::ipc::{self, Command, Response};
 use auwsx_core::state::IssueStatus;
 use auwsx_core::steering::SteeringSource;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
 
 /// What the parsed argv asks `auwsx` to do.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum CliAction {
     /// Run the daemon (IPC server) in the foreground.
     Daemon,
     /// Send one command to the running daemon and print the reply.
     Request(Command),
+    /// Local git maintenance that must also work after the DB has been reset.
+    PruneWorktrees { repo_path: String },
     /// Print usage.
     Help,
     /// No recognized subcommand — caller falls through to the TUI.
@@ -34,33 +42,48 @@ const USAGE: &str = "\
 auwsx — autonomous workspace orchestrator
 
 USAGE:
-  auwsx                         launch the TUI (default; not yet implemented)
+  auwsx                         launch the TUI and auto-start the daemon
   auwsx daemon                  run the daemon (IPC server) in the foreground
   auwsx daemon stop             ask the running daemon to shut down
   auwsx ping                    check the daemon is up
+  auwsx settings                print global settings without launching the TUI
+  auwsx worktree prune <repo_path>  remove orphaned auwsx issue worktrees
+  auwsx scheduler run <project_id>  execute one scheduler pass now
+
+  auwsx arsenal ls
+  auwsx arsenal set <name> --main <cmd> --plan <cmd> --work <cmd> [--review <cmd>]
+  auwsx ask <project_id> [--mode recall|seek] <question...>
+  auwsx ask ls <project_id>
+  auwsx memory retrieve <project_id> <query...>
+  auwsx memory save <project_id> --kind <kind> (--file <path> | <text...>)
+  auwsx memory consolidate <project_id> --mode dream|deepsleep
+  auwsx memory preset ls
+  auwsx memory preset set <name> \\
+        --retrieve-kind portable|command|auwsx_skill [--retrieve-cmd <cmd>] \\
+        --save-kind portable|command|auwsx_skill [--save-cmd <cmd>] \\
+        --dream-kind portable|command|auwsx_skill [--dream-cmd <cmd>] \\
+        --deepsleep-kind portable|command|auwsx_skill [--deepsleep-cmd <cmd>]
 
   auwsx project add <name> <repo_path> --branch <b> \\
-        --main <cmd> --plan <cmd> --work <cmd> [--review <cmd>] \\
+        (--arsenal <preset> | --main <cmd> --plan <cmd> --work <cmd>) [--review <cmd>] \\
         [--completion-policy manual|soft|auto] \\
-        [--plan-gate-timeout <min>] [--completion-timeout <min>]
+        [--plan-gate-timeout <min>] [--merge-delay <min>] [--schedule <cron|30m|1h|1d>]
   auwsx project ls
   auwsx project get <project_id>           show one project incl. resolved policy
+  auwsx project merge <project_id>         approve all READY_TO_MERGE issues
 
   auwsx backlog add <project_id> <text...> [--source human|agent|routine|inbox]
   auwsx backlog ls <project_id> [--approval pending|approved|dismissed]
   auwsx backlog approve <item_id>
   auwsx backlog dismiss <item_id>
-  auwsx triage <project_id>
 
-  auwsx issue add <project_id> <title...> [--desc <text>]
   auwsx issue ls <project_id> [--status <STATUS>]
   auwsx issue get <issue_id>
   auwsx issue status <issue_id> <STATUS> [--force]
-  auwsx issue absorb <issue_id> <into_issue_id>
-
-  auwsx subtask add <issue_id> <ord> <text...>
-  auwsx subtask ls <issue_id>
-  auwsx subtask done <subtask_id>
+  auwsx issue retry <issue_id>             retry a FAILED issue
+  auwsx issue merge <issue_id>             approve one READY_TO_MERGE issue
+  auwsx issue abandon <issue_id>
+  auwsx issue cleanup <issue_id>       remove this issue's worktree only
 
   auwsx finding add <issue_id> <round> <severity> <title...> \\
         [--lens <l>] [--detail <d>] [--file <ref>]
@@ -69,9 +92,9 @@ USAGE:
   auwsx finding reject <finding_id> <rationale...>
   auwsx finding dismiss <finding_id>
 
-  auwsx steering add <issue_id> <source> <note...>     (source: human|consolidation)
-  auwsx steering ls <issue_id>
-  auwsx steering consume <issue_id>
+  auwsx queue add <issue_id> <source> <note...>     (source: human|consolidation)
+  auwsx queue ls <issue_id>
+  auwsx queue consume <issue_id>
 ";
 
 /// Parse argv (without the program name) into a [`CliAction`]. Pure: no IO.
@@ -82,11 +105,17 @@ pub fn parse(args: &[String]) -> Result<CliAction> {
     match sub {
         "help" | "--help" | "-h" => Ok(CliAction::Help),
         "ping" => Ok(CliAction::Request(Command::Ping)),
+        "settings" | "config" => Ok(CliAction::Request(Command::GetGlobalSettings)),
         "daemon" => match args.get(1).map(String::as_str) {
             None => Ok(CliAction::Daemon),
             Some("stop") => Ok(CliAction::Request(Command::Shutdown)),
             Some(other) => bail!("unknown `daemon` subcommand: {other}"),
         },
+        "arsenal" => parse_arsenal(&args[1..]),
+        "worktree" => parse_worktree(&args[1..]),
+        "scheduler" => parse_scheduler(&args[1..]),
+        "ask" => parse_ask(&args[1..]),
+        "memory" => parse_memory(&args[1..]),
         "project" => parse_project(&args[1..]),
         "backlog" => parse_backlog(&args[1..]),
         "triage" => {
@@ -98,36 +127,185 @@ pub fn parse(args: &[String]) -> Result<CliAction> {
         "issue" => parse_issue(&args[1..]),
         "subtask" => parse_subtask(&args[1..]),
         "finding" => parse_finding(&args[1..]),
-        "steering" => parse_steering(&args[1..]),
+        "queue" | "steering" => parse_queue(&args[1..]),
         // Unknown leading token: let the caller decide (TUI fallback).
         _ => Ok(CliAction::Tui),
     }
+}
+
+fn parse_scheduler(args: &[String]) -> Result<CliAction> {
+    let (verb, rest) = split_verb(args, "scheduler")?;
+    let p = Parsed::new(rest);
+    match verb {
+        "run" | "once" => Ok(CliAction::Request(Command::RunSchedulerOnce {
+            project_id: p.int(0, "project_id")?,
+        })),
+        other => bail!("unknown `scheduler` subcommand: {other}"),
+    }
+}
+
+fn parse_worktree(args: &[String]) -> Result<CliAction> {
+    let (verb, rest) = split_verb(args, "worktree")?;
+    let p = Parsed::new(rest);
+    match verb {
+        "prune" => Ok(CliAction::PruneWorktrees {
+            repo_path: p.pos(0, "repo_path")?,
+        }),
+        other => bail!("unknown `worktree` subcommand: {other}"),
+    }
+}
+
+fn parse_ask(args: &[String]) -> Result<CliAction> {
+    if matches!(args.first().map(String::as_str), Some("ls" | "list")) {
+        let p = Parsed::new(&args[1..]);
+        return Ok(CliAction::Request(Command::ListAskAnswers {
+            project_id: p.int(0, "project_id")?,
+            limit: 20,
+        }));
+    }
+    let p = Parsed::new(args);
+    let mode = match p.flag("mode").as_deref().unwrap_or("recall") {
+        "recall" => AskMode::Recall,
+        "seek" => AskMode::Seek,
+        other => bail!("invalid ask --mode {other:?}"),
+    };
+    Ok(CliAction::Request(Command::AskProject {
+        project_id: p.int(0, "project_id")?,
+        mode,
+        question: p.rest_from(1, "question")?,
+    }))
+}
+
+fn parse_memory(args: &[String]) -> Result<CliAction> {
+    let (verb, rest) = split_verb(args, "memory")?;
+    let p = Parsed::new(rest);
+    let cmd = match verb {
+        "preset" => return parse_memory_preset(rest),
+        "retrieve" | "recall" => Command::MemoryRetrieve {
+            project_id: p.int(0, "project_id")?,
+            query: p.rest_from(1, "query")?,
+        },
+        "save" => {
+            let project_id = p.int(0, "project_id")?;
+            let kind = p.flag("kind").unwrap_or_else(|| "note".to_string());
+            let content = if let Some(path) = p.flag("file") {
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading memory save file {path}"))?
+            } else {
+                p.rest_from(1, "text")?
+            };
+            Command::MemorySave {
+                project_id,
+                kind,
+                content,
+            }
+        }
+        "consolidate" => Command::MemoryConsolidate {
+            project_id: p.int(0, "project_id")?,
+            mode: p.flag("mode").unwrap_or_else(|| "deepsleep".to_string()),
+        },
+        other => bail!("unknown `memory` subcommand: {other}"),
+    };
+    Ok(CliAction::Request(cmd))
+}
+
+fn parse_memory_preset(args: &[String]) -> Result<CliAction> {
+    let (verb, rest) = split_verb(args, "memory preset")?;
+    let p = Parsed::new(rest);
+    let cmd = match verb {
+        "ls" | "list" => Command::ListMemoryPresets,
+        "set" => {
+            p.exact_positionals(1, "memory preset set")?;
+            Command::UpsertMemoryPreset {
+                name: p.pos(0, "name")?,
+                retrieve_kind: p.req_flag("retrieve-kind")?,
+                retrieve_cmd: p.flag("retrieve-cmd"),
+                save_kind: p.req_flag("save-kind")?,
+                save_cmd: p.flag("save-cmd"),
+                dream_kind: p.req_flag("dream-kind")?,
+                dream_cmd: p.flag("dream-cmd"),
+                deepsleep_kind: p.req_flag("deepsleep-kind")?,
+                deepsleep_cmd: p.flag("deepsleep-cmd"),
+            }
+        }
+        other => bail!("unknown `memory preset` subcommand: {other}"),
+    };
+    Ok(CliAction::Request(cmd))
+}
+
+fn parse_arsenal(args: &[String]) -> Result<CliAction> {
+    let (verb, rest) = split_verb(args, "arsenal")?;
+    let p = Parsed::new(rest);
+    let cmd = match verb {
+        "ls" | "list" => Command::ListArsenalPresets,
+        "set" => {
+            p.exact_positionals(1, "arsenal set")?;
+            Command::UpsertArsenalPreset {
+                name: p.pos(0, "name")?,
+                main_agent_cmd: p.req_flag("main")?,
+                plan_agent_cmd: p.req_flag("plan")?,
+                work_agent_cmd: p.req_flag("work")?,
+                review_agent_cmd: p.flag("review"),
+            }
+        }
+        other => bail!("unknown `arsenal` subcommand: {other}"),
+    };
+    Ok(CliAction::Request(cmd))
 }
 
 fn parse_project(args: &[String]) -> Result<CliAction> {
     let (verb, rest) = split_verb(args, "project")?;
     let p = Parsed::new(rest);
     let cmd = match verb {
-        "add" => Command::AddProject {
-            name: p.pos(0, "name")?,
-            repo_path: p.pos(1, "repo_path")?,
-            default_branch: p.flag("branch").unwrap_or_else(|| "main".to_string()),
-            main_agent_cmd: p.req_flag("main")?,
-            plan_agent_cmd: p.req_flag("plan")?,
-            work_agent_cmd: p.req_flag("work")?,
-            review_agent_cmd: p.flag("review"),
-            completion_policy: match p.flag("completion-policy") {
-                Some(s) => Some(
-                    CompletionPolicy::from_str(&s)
-                        .with_context(|| format!("invalid --completion-policy {s:?}"))?,
-                ),
+        "add" => {
+            p.exact_positionals(2, "project add")?;
+            let arsenal_preset_name = p.flag("arsenal");
+            let has_arsenal = arsenal_preset_name.is_some();
+            let schedule_cron = match p.flag("schedule-cron").or_else(|| p.flag("schedule")) {
+                Some(raw) => auwsx_core::schedule::normalize_cadence_input(&raw)
+                    .with_context(|| format!("invalid --schedule {raw:?}"))?,
                 None => None,
-            },
-            plan_gate_timeout_min: p.opt_int("plan-gate-timeout")?,
-            completion_soft_timeout_min: p.opt_int("completion-timeout")?,
-        },
+            };
+            Command::AddProject {
+                name: p.pos(0, "name")?,
+                repo_path: p.pos(1, "repo_path")?,
+                default_branch: p.flag("branch").unwrap_or_else(|| "main".to_string()),
+                arsenal_preset_name,
+                main_agent_cmd: if has_arsenal {
+                    p.flag("main").unwrap_or_default()
+                } else {
+                    p.req_flag("main")?
+                },
+                plan_agent_cmd: if has_arsenal {
+                    p.flag("plan").unwrap_or_default()
+                } else {
+                    p.req_flag("plan")?
+                },
+                work_agent_cmd: if has_arsenal {
+                    p.flag("work").unwrap_or_default()
+                } else {
+                    p.req_flag("work")?
+                },
+                review_agent_cmd: p.flag("review"),
+                completion_policy: match p.flag("completion-policy") {
+                    Some(s) => Some(
+                        CompletionPolicy::from_str(&s)
+                            .with_context(|| format!("invalid --completion-policy {s:?}"))?,
+                    ),
+                    None => None,
+                },
+                plan_gate_timeout_min: p.opt_int("plan-gate-timeout")?,
+                completion_soft_timeout_min: p
+                    .opt_int_any(&["merge-delay", "completion-timeout"])?,
+                schedule_interval_min: p.opt_int("schedule-min")?,
+                schedule_cron,
+            }
+        }
         "ls" | "list" => Command::ListProjects,
         "get" => Command::GetProject {
+            project_id: p.int(0, "project_id")?,
+        },
+        "merge" => Command::ApproveProjectMerge {
             project_id: p.int(0, "project_id")?,
         },
         other => bail!("unknown `project` subcommand: {other}"),
@@ -173,11 +351,7 @@ fn parse_issue(args: &[String]) -> Result<CliAction> {
     let (verb, rest) = split_verb(args, "issue")?;
     let p = Parsed::new(rest);
     let cmd = match verb {
-        "add" => Command::AddIssue {
-            project_id: p.int(0, "project_id")?,
-            title: p.rest_from(1, "title")?,
-            description: p.flag("desc"),
-        },
+        "add" => bail!("issues are agent-derived; add backlog instead"),
         "ls" | "list" => Command::ListIssues {
             project_id: p.int(0, "project_id")?,
             status: match p.flag("status") {
@@ -198,9 +372,24 @@ fn parse_issue(args: &[String]) -> Result<CliAction> {
             },
             force: p.has("force"),
         },
+        "retry" => Command::RetryIssue {
+            issue_id: p.int(0, "issue_id")?,
+        },
+        "merge" => Command::ApproveIssueMerge {
+            issue_id: p.int(0, "issue_id")?,
+        },
         "absorb" => Command::AbsorbIssue {
             issue_id: p.int(0, "issue_id")?,
             into_issue_id: p.int(1, "into_issue_id")?,
+        },
+        "abandon" => Command::AbandonIssue {
+            issue_id: p.int(0, "issue_id")?,
+        },
+        "cleanup" => Command::CleanupIssueWorktree {
+            issue_id: p.int(0, "issue_id")?,
+        },
+        "remove" | "rm" => Command::RemoveIssue {
+            issue_id: p.int(0, "issue_id")?,
         },
         other => bail!("unknown `issue` subcommand: {other}"),
     };
@@ -211,11 +400,16 @@ fn parse_subtask(args: &[String]) -> Result<CliAction> {
     let (verb, rest) = split_verb(args, "subtask")?;
     let p = Parsed::new(rest);
     let cmd = match verb {
-        "add" => Command::AddSubtask {
-            issue_id: p.int(0, "issue_id")?,
-            ord: p.int(1, "ord")?,
-            text: p.rest_from(2, "text")?,
-        },
+        "add" => {
+            if std::env::var_os(control_outbox::OUTBOX_ENV).is_none() {
+                bail!("subtasks are agent-derived and must be added by issue agents");
+            }
+            Command::AddSubtask {
+                issue_id: p.int(0, "issue_id")?,
+                ord: p.int(1, "ord")?,
+                text: p.rest_from(2, "text")?,
+            }
+        }
         "ls" | "list" => Command::ListSubtasks {
             issue_id: p.int(0, "issue_id")?,
         },
@@ -263,8 +457,8 @@ fn parse_finding(args: &[String]) -> Result<CliAction> {
     Ok(CliAction::Request(cmd))
 }
 
-fn parse_steering(args: &[String]) -> Result<CliAction> {
-    let (verb, rest) = split_verb(args, "steering")?;
+fn parse_queue(args: &[String]) -> Result<CliAction> {
+    let (verb, rest) = split_verb(args, "queue")?;
     let p = Parsed::new(rest);
     let cmd = match verb {
         "add" => Command::AddSteering {
@@ -282,7 +476,7 @@ fn parse_steering(args: &[String]) -> Result<CliAction> {
         "consume" => Command::ConsumeSteering {
             issue_id: p.int(0, "issue_id")?,
         },
-        other => bail!("unknown `steering` subcommand: {other}"),
+        other => bail!("unknown `queue` subcommand: {other}"),
     };
     Ok(CliAction::Request(cmd))
 }
@@ -354,6 +548,16 @@ impl Parsed {
             .with_context(|| format!("<{name}> must be an integer, got {raw:?}"))
     }
 
+    fn exact_positionals(&self, expected: usize, context: &str) -> Result<()> {
+        if self.positionals.len() != expected {
+            bail!(
+                "`{context}` expects {expected} positional argument(s), got {}. Quote multi-word option values.",
+                self.positionals.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Parse an optional `--key <int>` flag. Absent ⇒ `None`; present-but-not-an
     /// integer ⇒ `Err` (so `--plan-gate-timeout abc` is rejected, not silently
     /// dropped).
@@ -365,6 +569,15 @@ impl Parsed {
                 .map(Some)
                 .with_context(|| format!("--{key} must be an integer, got {raw:?}")),
         }
+    }
+
+    fn opt_int_any(&self, keys: &[&str]) -> Result<Option<i64>> {
+        for key in keys {
+            if self.flag(key).is_some() {
+                return self.opt_int(key);
+            }
+        }
+        Ok(None)
     }
 
     /// Join positionals from `idx` to the end into one space-separated string.
@@ -433,6 +646,13 @@ pub async fn run_daemon() -> Result<()> {
         socket.clone(),
         Duration::from_secs(tick_secs),
     ));
+    let recovered = scheduler
+        .recover_interrupted_work(chrono::Utc::now().timestamp_millis())
+        .await
+        .context("recovering interrupted work")?;
+    if recovered > 0 {
+        eprintln!("recovered {recovered} interrupted work record(s) from previous daemon exit");
+    }
     let sched_stop = Arc::new(Notify::new());
     let sched_stop_run = sched_stop.clone();
     let scheduler_run = scheduler.clone();
@@ -454,7 +674,17 @@ pub async fn run_daemon() -> Result<()> {
 /// Send one command to the daemon and print the reply. Exits the process with
 /// status 1 (after printing to stderr) on a `Response::Err`.
 pub async fn run_request(cmd: Command) -> Result<()> {
+    if let Some(resp) = auwsx_core::control_outbox::handle_local_command(&cmd)? {
+        if print_response(resp) {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let socket = ipc::default_socket_path();
+    if !matches!(cmd, Command::Shutdown) {
+        ensure_daemon(&socket).await?;
+    }
     let resp = ipc::request(&socket, &cmd).await.with_context(|| {
         format!(
             "talking to daemon at {} (is `auwsx daemon` running?)",
@@ -465,6 +695,82 @@ pub async fn run_request(cmd: Command) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Prune auwsx-managed issue worktrees that no longer match DB state.
+///
+/// This is intentionally local rather than daemon-owned: after a DB reset there
+/// may be no project rows left, but git's worktree registry can still contain
+/// `auwsx/issue-*` entries that would block future issue ids.
+pub async fn run_prune_worktrees(repo_path: String) -> Result<()> {
+    use auwsx_core::db::issues;
+    use auwsx_core::db::projects;
+    use auwsx_core::db::Db;
+    use auwsx_core::worktree::prune_orphaned_issue_worktrees;
+
+    let repo = PathBuf::from(repo_path);
+    let db = Db::open().await.context("opening database")?;
+    let mut known = HashMap::new();
+    for project in projects::list(db.pool()).await? {
+        if !same_path(Path::new(&project.repo_path), &repo) {
+            continue;
+        }
+        for issue in issues::list_by_project(db.pool(), project.id).await? {
+            if let Some(path) = issue.worktree_path {
+                known.insert(issue.id, PathBuf::from(path));
+            }
+        }
+    }
+    let removed = prune_orphaned_issue_worktrees(&repo, &known).await?;
+    if removed.is_empty() {
+        println!("no orphaned auwsx issue worktrees");
+    } else {
+        for handle in &removed {
+            println!("removed {}\t{}", handle.branch, handle.path.display());
+        }
+    }
+    Ok(())
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(l), Ok(r)) => l == r,
+        _ => left == right,
+    }
+}
+
+pub async fn ensure_daemon(socket: &std::path::Path) -> Result<()> {
+    if ipc::request(socket, &Command::Ping).await.is_ok() {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe()?;
+    let mut child = std::process::Command::new(exe)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting auwsx daemon")?;
+
+    let mut last_err = None;
+    for _ in 0..50 {
+        match ipc::request(socket, &Command::Ping).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if let Some(status) = child.try_wait().context("checking auwsx daemon startup")? {
+                    anyhow::bail!("daemon exited before becoming ready with status {status}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    match last_err {
+        Some(e) => Err(e).context("daemon did not become ready"),
+        None => anyhow::bail!("daemon did not become ready"),
+    }
 }
 
 /// Print a response in a compact human form. Returns true if it was an error
@@ -484,6 +790,62 @@ fn print_response(resp: Response) -> bool {
                 println!("triage: created issues {created_issue_ids:?}");
             }
         }
+        Response::AskAnswers(answers) => {
+            for answer in answers {
+                println!(
+                    "{}\t{}\t{}\nQ: {}\nA: {}\n",
+                    answer.id,
+                    answer.mode.as_str(),
+                    answer.created_at,
+                    answer.question,
+                    answer.answer
+                );
+            }
+        }
+        Response::ArsenalPresets(presets) => {
+            for p in presets {
+                let kind = if p.builtin { "builtin" } else { "custom" };
+                println!(
+                    "{}\t{}\tmain={}\tplan={}\twork={}\treview={}",
+                    p.name,
+                    kind,
+                    p.main_agent_cmd,
+                    p.plan_agent_cmd,
+                    p.work_agent_cmd,
+                    p.review_agent_cmd
+                        .as_deref()
+                        .unwrap_or("(falls back to work)")
+                );
+            }
+        }
+        Response::MemoryPresets(presets) => {
+            for p in presets {
+                let scope = if p.builtin { "builtin" } else { "custom" };
+                println!(
+                    "{}\t{}\tretrieve={} {}\tsave={} {}\tdream={} {}\tdeepsleep={} {}",
+                    p.name,
+                    scope,
+                    p.retrieve_kind,
+                    p.retrieve_cmd.as_deref().unwrap_or(""),
+                    p.save_kind,
+                    p.save_cmd.as_deref().unwrap_or(""),
+                    p.dream_kind,
+                    p.dream_cmd.as_deref().unwrap_or(""),
+                    p.deepsleep_kind,
+                    p.deepsleep_cmd.as_deref().unwrap_or("")
+                );
+            }
+        }
+        Response::Profiles(profiles) => {
+            for p in profiles {
+                println!("{}\t{}\t{}", p.id, p.ord, p.name);
+            }
+        }
+        Response::GlobalSettings(settings) => {
+            println!("memory_preset: {}", settings.memory_preset_name);
+            println!("pipeline_ux_guidance:");
+            println!("{}", printable_multiline(&settings.pipeline_ux_guidance));
+        }
         Response::Projects(ps) => {
             for p in ps {
                 println!(
@@ -497,6 +859,10 @@ fn print_response(resp: Response) -> bool {
             println!("name:   {}", p.name);
             println!("repo:   {}", p.repo_path);
             println!("branch: {}", p.default_branch);
+            println!(
+                "arsenal: {}",
+                p.arsenal_preset_name.as_deref().unwrap_or("(custom)")
+            );
             println!(
                 "agents: main={} plan={} work={}",
                 p.main_agent_cmd, p.plan_agent_cmd, p.work_agent_cmd
@@ -574,7 +940,7 @@ fn print_response(resp: Response) -> bool {
             println!("id:      {}", r.id);
             println!("name:    {}", r.name);
             println!("enabled: {}", r.enabled);
-            println!("type:    {}", r.routine_type.as_str());
+            println!("output:  {}", r.output_route.as_str());
             println!("cron:    {}", r.cron);
             println!("prompt:  {}", r.prompt);
         }
@@ -617,10 +983,26 @@ fn print_response(resp: Response) -> bool {
             println!("==> {path}");
             print!("{text}");
         }
+        Response::MemoryText { text } => println!("{}", printable_multiline(&text)),
         Response::RanIssue { issue_id } => println!("running issue {issue_id}"),
+        Response::ApprovedMerge { issue_ids } => {
+            let joined = issue_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("approved merge issues {joined}");
+        }
         Response::Event(ev) => println!("event: {ev:?}"),
     }
     false
+}
+
+fn printable_multiline(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !c.is_control())
+        .collect()
 }
 
 /// Print top-level usage.
@@ -631,6 +1013,9 @@ pub fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static CONTROL_OUTBOX_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
@@ -671,6 +1056,155 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_settings_when_parsed_then_request_global_settings() {
+        assert_eq!(
+            parse(&argv(&["settings"])).unwrap(),
+            CliAction::Request(Command::GetGlobalSettings)
+        );
+    }
+
+    #[test]
+    fn given_config_alias_when_parsed_then_request_global_settings() {
+        assert_eq!(
+            parse(&argv(&["config"])).unwrap(),
+            CliAction::Request(Command::GetGlobalSettings)
+        );
+    }
+
+    #[test]
+    fn given_worktree_prune_when_parsed_then_local_prune() {
+        assert_eq!(
+            parse(&argv(&["worktree", "prune", "/repo"])).unwrap(),
+            CliAction::PruneWorktrees {
+                repo_path: "/repo".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn given_worktree_bogus_subcommand_when_parsed_then_err() {
+        assert!(parse(&argv(&["worktree", "bogus", "/repo"])).is_err());
+    }
+
+    // --- scheduler ----------------------------------------------------------
+
+    #[test]
+    fn given_scheduler_run_when_parsed_then_run_scheduler_once() {
+        assert_eq!(
+            parse(&argv(&["scheduler", "run", "7"])).unwrap(),
+            CliAction::Request(Command::RunSchedulerOnce { project_id: 7 })
+        );
+    }
+
+    #[test]
+    fn given_scheduler_once_when_parsed_then_run_scheduler_once() {
+        assert_eq!(
+            parse(&argv(&["scheduler", "once", "7"])).unwrap(),
+            CliAction::Request(Command::RunSchedulerOnce { project_id: 7 })
+        );
+    }
+
+    #[test]
+    fn given_scheduler_bogus_subcommand_when_parsed_then_err() {
+        assert!(parse(&argv(&["scheduler", "bogus", "7"])).is_err());
+    }
+
+    // --- memory ------------------------------------------------------------
+
+    #[test]
+    fn given_memory_retrieve_when_parsed_then_request_memory_retrieve() {
+        assert_eq!(
+            parse(&argv(&["memory", "retrieve", "7", "merge", "policy"])).unwrap(),
+            CliAction::Request(Command::MemoryRetrieve {
+                project_id: 7,
+                query: "merge policy".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn given_memory_save_text_when_parsed_then_request_memory_save() {
+        assert_eq!(
+            parse(&argv(&[
+                "memory", "save", "7", "--kind", "result", "merged", "safely"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::MemorySave {
+                project_id: 7,
+                kind: "result".to_string(),
+                content: "merged safely".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn given_memory_save_without_content_when_parsed_then_err() {
+        assert!(parse(&argv(&["memory", "save", "7", "--kind", "result"])).is_err());
+    }
+
+    #[test]
+    fn given_memory_consolidate_when_parsed_then_request_memory_consolidate() {
+        assert_eq!(
+            parse(&argv(&[
+                "memory",
+                "consolidate",
+                "7",
+                "--mode",
+                "deepsleep"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::MemoryConsolidate {
+                project_id: 7,
+                mode: "deepsleep".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn given_memory_preset_ls_when_parsed_then_list_memory_presets() {
+        assert_eq!(
+            parse(&argv(&["memory", "preset", "ls"])).unwrap(),
+            CliAction::Request(Command::ListMemoryPresets)
+        );
+    }
+
+    #[test]
+    fn given_memory_preset_set_when_parsed_then_upsert_memory_preset() {
+        assert_eq!(
+            parse(&argv(&[
+                "memory",
+                "preset",
+                "set",
+                "custom",
+                "--retrieve-kind",
+                "command",
+                "--retrieve-cmd",
+                "mem-get {query}",
+                "--save-kind",
+                "command",
+                "--save-cmd",
+                "mem-save {content_file}",
+                "--dream-kind",
+                "portable",
+                "--deepsleep-kind",
+                "portable"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::UpsertMemoryPreset {
+                name: "custom".to_string(),
+                retrieve_kind: "command".to_string(),
+                retrieve_cmd: Some("mem-get {query}".to_string()),
+                save_kind: "command".to_string(),
+                save_cmd: Some("mem-save {content_file}".to_string()),
+                dream_kind: "portable".to_string(),
+                dream_cmd: None,
+                deepsleep_kind: "portable".to_string(),
+                deepsleep_cmd: None,
+            })
+        );
+    }
+
     // --- daemon -------------------------------------------------------------
 
     #[test]
@@ -691,6 +1225,146 @@ mod tests {
         assert!(parse(&argv(&["daemon", "bogus"])).is_err());
     }
 
+    // --- arsenal ------------------------------------------------------------
+
+    #[test]
+    fn given_arsenal_ls_when_parsed_then_list_arsenal_presets() {
+        assert_eq!(
+            parse(&argv(&["arsenal", "ls"])).unwrap(),
+            CliAction::Request(Command::ListArsenalPresets)
+        );
+    }
+
+    #[test]
+    fn given_arsenal_list_when_parsed_then_list_arsenal_presets() {
+        assert_eq!(
+            parse(&argv(&["arsenal", "list"])).unwrap(),
+            CliAction::Request(Command::ListArsenalPresets)
+        );
+    }
+
+    #[test]
+    fn given_arsenal_set_required_flags_when_parsed_then_upsert_without_review() {
+        assert_eq!(
+            parse(&argv(&[
+                "arsenal", "set", "local", "--main", "mc", "--plan", "pc", "--work", "wc"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::UpsertArsenalPreset {
+                name: "local".to_string(),
+                main_agent_cmd: "mc".to_string(),
+                plan_agent_cmd: "pc".to_string(),
+                work_agent_cmd: "wc".to_string(),
+                review_agent_cmd: None,
+            })
+        );
+    }
+
+    #[test]
+    fn given_arsenal_set_with_review_when_parsed_then_upsert_with_review() {
+        assert_eq!(
+            parse(&argv(&[
+                "arsenal", "set", "local", "--main", "mc", "--plan", "pc", "--work", "wc",
+                "--review", "rc"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::UpsertArsenalPreset {
+                name: "local".to_string(),
+                main_agent_cmd: "mc".to_string(),
+                plan_agent_cmd: "pc".to_string(),
+                work_agent_cmd: "wc".to_string(),
+                review_agent_cmd: Some("rc".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn given_arsenal_set_missing_name_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "arsenal", "set", "--main", "mc", "--plan", "pc", "--work", "wc"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_arsenal_set_missing_main_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "arsenal", "set", "local", "--plan", "pc", "--work", "wc"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_arsenal_set_missing_plan_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "arsenal", "set", "local", "--main", "mc", "--work", "wc"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_arsenal_set_missing_work_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "arsenal", "set", "local", "--main", "mc", "--plan", "pc"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_arsenal_set_extra_positional_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "arsenal", "set", "local", "extra", "--main", "mc", "--plan", "pc", "--work", "wc"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_arsenal_unknown_subcommand_when_parsed_then_err() {
+        assert!(parse(&argv(&["arsenal", "bogus"])).is_err());
+    }
+
+    // --- ask ---------------------------------------------------------------
+
+    #[test]
+    fn given_ask_default_when_parsed_then_recall_mode() {
+        assert_eq!(
+            parse(&argv(&["ask", "7", "what", "next"])).unwrap(),
+            CliAction::Request(Command::AskProject {
+                project_id: 7,
+                mode: AskMode::Recall,
+                question: "what next".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn given_ask_seek_mode_when_parsed_then_seek_mode() {
+        assert_eq!(
+            parse(&argv(&["ask", "7", "--mode", "seek", "what", "next"])).unwrap(),
+            CliAction::Request(Command::AskProject {
+                project_id: 7,
+                mode: AskMode::Seek,
+                question: "what next".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn given_ask_ls_when_parsed_then_list_answers() {
+        assert_eq!(
+            parse(&argv(&["ask", "ls", "7"])).unwrap(),
+            CliAction::Request(Command::ListAskAnswers {
+                project_id: 7,
+                limit: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn given_ask_bogus_mode_when_parsed_then_err() {
+        assert!(parse(&argv(&["ask", "7", "--mode", "bogus", "q"])).is_err());
+    }
+
     // --- project add --------------------------------------------------------
 
     #[test]
@@ -704,6 +1378,7 @@ mod tests {
                 name: "demo".to_string(),
                 repo_path: "/repo".to_string(),
                 default_branch: "main".to_string(),
+                arsenal_preset_name: None,
                 main_agent_cmd: "mc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
@@ -711,6 +1386,8 @@ mod tests {
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
+                schedule_interval_min: None,
+                schedule_cron: None,
             })
         );
     }
@@ -727,6 +1404,7 @@ mod tests {
                 name: "demo".to_string(),
                 repo_path: "/repo".to_string(),
                 default_branch: "dev".to_string(),
+                arsenal_preset_name: None,
                 main_agent_cmd: "mc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
@@ -734,6 +1412,8 @@ mod tests {
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
+                schedule_interval_min: None,
+                schedule_cron: None,
             })
         );
     }
@@ -741,6 +1421,45 @@ mod tests {
     #[test]
     fn given_project_add_missing_required_flags_when_parsed_then_err() {
         assert!(parse(&argv(&["project", "add", "demo", "/repo"])).is_err());
+    }
+
+    #[test]
+    fn given_project_add_with_arsenal_when_parsed_then_commands_are_overrides() {
+        assert_eq!(
+            parse(&argv(&[
+                "project",
+                "add",
+                "demo",
+                "/repo",
+                "--arsenal",
+                "codex"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::AddProject {
+                name: "demo".to_string(),
+                repo_path: "/repo".to_string(),
+                default_branch: "main".to_string(),
+                arsenal_preset_name: Some("codex".to_string()),
+                main_agent_cmd: String::new(),
+                plan_agent_cmd: String::new(),
+                work_agent_cmd: String::new(),
+                review_agent_cmd: None,
+                completion_policy: None,
+                plan_gate_timeout_min: None,
+                completion_soft_timeout_min: None,
+                schedule_interval_min: None,
+                schedule_cron: None,
+            })
+        );
+    }
+
+    #[test]
+    fn given_project_add_extra_positional_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project", "add", "demo", "/repo", "/script", "--main", "mc", "--plan", "pc", "--work",
+            "wc"
+        ]))
+        .is_err());
     }
 
     // --- project ls / list --------------------------------------------------
@@ -776,6 +1495,14 @@ mod tests {
         assert_eq!(
             parse(&argv(&["project", "get", "7"])).unwrap(),
             CliAction::Request(Command::GetProject { project_id: 7 })
+        );
+    }
+
+    #[test]
+    fn given_project_merge_when_parsed_then_approve_project_merge() {
+        assert_eq!(
+            parse(&argv(&["project", "merge", "7"])).unwrap(),
+            CliAction::Request(Command::ApproveProjectMerge { project_id: 7 })
         );
     }
 
@@ -884,15 +1611,10 @@ mod tests {
     // --- issue --------------------------------------------------------------
 
     #[test]
-    fn given_issue_add_multiword_with_desc_when_parsed_then_addissue() {
-        assert_eq!(
-            parse(&argv(&["issue", "add", "2", "my", "title", "--desc", "d"])).unwrap(),
-            CliAction::Request(Command::AddIssue {
-                project_id: 2,
-                title: "my title".to_string(),
-                description: Some("d".to_string()),
-            })
-        );
+    fn given_issue_add_when_parsed_then_err() {
+        let err = parse(&argv(&["issue", "add", "2", "my", "title", "--desc", "d"]))
+            .expect_err("manual issue add is not user-facing");
+        assert!(err.to_string().contains("agent-derived"));
     }
 
     #[test]
@@ -955,6 +1677,22 @@ mod tests {
     }
 
     #[test]
+    fn given_issue_retry_when_parsed_then_retryissue() {
+        assert_eq!(
+            parse(&argv(&["issue", "retry", "5"])).unwrap(),
+            CliAction::Request(Command::RetryIssue { issue_id: 5 })
+        );
+    }
+
+    #[test]
+    fn given_issue_merge_when_parsed_then_approve_issue_merge() {
+        assert_eq!(
+            parse(&argv(&["issue", "merge", "5"])).unwrap(),
+            CliAction::Request(Command::ApproveIssueMerge { issue_id: 5 })
+        );
+    }
+
+    #[test]
     fn given_issue_absorb_when_parsed_then_absorbissue() {
         assert_eq!(
             parse(&argv(&["issue", "absorb", "1", "2"])).unwrap(),
@@ -966,6 +1704,22 @@ mod tests {
     }
 
     #[test]
+    fn given_issue_remove_when_parsed_then_removeissue() {
+        assert_eq!(
+            parse(&argv(&["issue", "remove", "5"])).unwrap(),
+            CliAction::Request(Command::RemoveIssue { issue_id: 5 })
+        );
+    }
+
+    #[test]
+    fn given_issue_cleanup_when_parsed_then_cleanup_issue_worktree() {
+        assert_eq!(
+            parse(&argv(&["issue", "cleanup", "5"])).unwrap(),
+            CliAction::Request(Command::CleanupIssueWorktree { issue_id: 5 })
+        );
+    }
+
+    #[test]
     fn given_issue_status_invalid_status_when_parsed_then_err() {
         assert!(parse(&argv(&["issue", "status", "1", "bogus"])).is_err());
     }
@@ -973,9 +1727,23 @@ mod tests {
     // --- subtask ------------------------------------------------------------
 
     #[test]
-    fn given_subtask_add_multiword_when_parsed_then_addsubtask() {
+    fn given_subtask_add_when_parsed_then_err() {
+        let _guard = CONTROL_OUTBOX_ENV_LOCK.lock().unwrap();
+        std::env::remove_var(control_outbox::OUTBOX_ENV);
+        let err = parse(&argv(&["subtask", "add", "1", "0", "do", "the", "thing"]))
+            .expect_err("manual subtask add is not user-facing");
+        assert!(err.to_string().contains("agent-derived"));
+    }
+
+    #[test]
+    fn given_subtask_add_with_control_outbox_when_parsed_then_addsubtask() {
+        let _guard = CONTROL_OUTBOX_ENV_LOCK.lock().unwrap();
+        std::env::set_var(control_outbox::OUTBOX_ENV, "/tmp/auwsx-control.jsonl");
+        let parsed = parse(&argv(&["subtask", "add", "1", "0", "do", "the", "thing"]));
+        std::env::remove_var(control_outbox::OUTBOX_ENV);
+
         assert_eq!(
-            parse(&argv(&["subtask", "add", "1", "0", "do", "the", "thing"])).unwrap(),
+            parsed.unwrap(),
             CliAction::Request(Command::AddSubtask {
                 issue_id: 1,
                 ord: 0,
@@ -1088,12 +1856,12 @@ mod tests {
         );
     }
 
-    // --- steering -----------------------------------------------------------
+    // --- queue messages -----------------------------------------------------
 
     #[test]
-    fn given_steering_add_multiword_when_parsed_then_addsteering_human() {
+    fn given_queue_add_multiword_when_parsed_then_addsteering_human() {
         assert_eq!(
-            parse(&argv(&["steering", "add", "1", "human", "please", "retry"])).unwrap(),
+            parse(&argv(&["queue", "add", "1", "human", "please", "retry"])).unwrap(),
             CliAction::Request(Command::AddSteering {
                 issue_id: 1,
                 source: SteeringSource::Human,
@@ -1103,20 +1871,31 @@ mod tests {
     }
 
     #[test]
-    fn given_steering_add_invalid_source_when_parsed_then_err() {
-        assert!(parse(&argv(&["steering", "add", "1", "bogus", "note"])).is_err());
+    fn given_queue_add_invalid_source_when_parsed_then_err() {
+        assert!(parse(&argv(&["queue", "add", "1", "bogus", "note"])).is_err());
     }
 
     #[test]
-    fn given_steering_consume_when_parsed_then_consumesteering() {
+    fn given_queue_consume_when_parsed_then_consumesteering() {
         assert_eq!(
-            parse(&argv(&["steering", "consume", "1"])).unwrap(),
+            parse(&argv(&["queue", "consume", "1"])).unwrap(),
             CliAction::Request(Command::ConsumeSteering { issue_id: 1 })
         );
     }
 
     #[test]
-    fn given_steering_ls_when_parsed_then_liststeering_pending_only() {
+    fn given_queue_ls_when_parsed_then_liststeering_pending_only() {
+        assert_eq!(
+            parse(&argv(&["queue", "ls", "1"])).unwrap(),
+            CliAction::Request(Command::ListSteering {
+                issue_id: 1,
+                pending_only: true,
+            })
+        );
+    }
+
+    #[test]
+    fn given_legacy_steering_alias_when_parsed_then_queue_command() {
         assert_eq!(
             parse(&argv(&["steering", "ls", "1"])).unwrap(),
             CliAction::Request(Command::ListSteering {
@@ -1139,6 +1918,7 @@ mod tests {
                 name: "demo".to_string(),
                 repo_path: "/repo".to_string(),
                 default_branch: "main".to_string(),
+                arsenal_preset_name: None,
                 main_agent_cmd: "mc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
@@ -1146,8 +1926,123 @@ mod tests {
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
+                schedule_interval_min: None,
+                schedule_cron: None,
             })
         );
+    }
+
+    #[test]
+    fn given_schedule_shorthand_when_parsed_then_normalized_cron() {
+        let CliAction::Request(Command::AddProject { schedule_cron, .. }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--schedule",
+            "30m",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(schedule_cron, Some("*/30 * * * *".to_string()));
+    }
+
+    #[test]
+    fn given_non_cron_representable_shorthand_when_parsed_then_every_repeat() {
+        let CliAction::Request(Command::AddProject { schedule_cron, .. }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--schedule",
+            "90m",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(schedule_cron, Some("@every 90m".to_string()));
+    }
+
+    #[test]
+    fn given_schedule_cron_when_parsed_then_kept_as_cron() {
+        let CliAction::Request(Command::AddProject { schedule_cron, .. }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--schedule",
+            "15 9 * * 1-5",
+        ]))
+        .unwrap() else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(schedule_cron, Some("15 9 * * 1-5".to_string()));
+    }
+
+    #[test]
+    fn given_schedule_min_when_parsed_then_legacy_interval_is_set() {
+        let CliAction::Request(Command::AddProject {
+            schedule_interval_min,
+            schedule_cron,
+            ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--schedule-min",
+            "5",
+        ]))
+        .unwrap()
+        else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(schedule_interval_min, Some(5));
+        assert_eq!(schedule_cron, None);
+    }
+
+    #[test]
+    fn given_invalid_schedule_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--schedule",
+            "*/90 * * * *",
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -1434,6 +2329,32 @@ mod tests {
     }
 
     #[test]
+    fn given_merge_delay_thirty_when_parsed_then_completion_soft_timeout_some_thirty() {
+        let CliAction::Request(Command::AddProject {
+            completion_soft_timeout_min,
+            ..
+        }) = parse(&argv(&[
+            "project",
+            "add",
+            "demo",
+            "/repo",
+            "--main",
+            "mc",
+            "--plan",
+            "pc",
+            "--work",
+            "wc",
+            "--merge-delay",
+            "30",
+        ]))
+        .unwrap()
+        else {
+            panic!("expected AddProject")
+        };
+        assert_eq!(completion_soft_timeout_min, Some(30));
+    }
+
+    #[test]
     fn given_completion_timeout_non_integer_when_parsed_then_err() {
         assert!(parse(&argv(&[
             "project",
@@ -1504,6 +2425,7 @@ mod tests {
                 name: "demo".to_string(),
                 repo_path: "/repo".to_string(),
                 default_branch: "main".to_string(),
+                arsenal_preset_name: None,
                 main_agent_cmd: "mc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
@@ -1511,6 +2433,8 @@ mod tests {
                 completion_policy: Some(CompletionPolicy::Soft),
                 plan_gate_timeout_min: Some(0),
                 completion_soft_timeout_min: Some(45),
+                schedule_interval_min: None,
+                schedule_cron: None,
             })
         );
     }
@@ -1651,6 +2575,14 @@ mod tests {
         assert_eq!(
             (plan_gate_timeout_min, completion_soft_timeout_min),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn given_control_chars_when_printable_multiline_then_strips_except_tab_and_newline() {
+        assert_eq!(
+            printable_multiline("ok\u{1b}[31m\tline\nnext\u{7}"),
+            "ok[31m\tline\nnext"
         );
     }
 }

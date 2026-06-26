@@ -10,29 +10,32 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Quit,
-    /// Move the tree selection.
+    /// Shift+Q: stop the daemon, then quit (opens a confirm popup first).
+    QuitWithDaemon,
+    /// Move the active cursor: tree selection outside Issue view, log scroll in Issue view.
     Down,
     Up,
+    Left,
+    Right,
+    PageDown,
+    PageUp,
+    Top,
+    Bottom,
     Drill,
     Back,
     NextView,
     PrevView,
-    /// Re-query the daemon for console state.
-    Refresh,
     /// Open create/data-entry forms.
     NewProject,
-    NewBacklog,
-    NewIssue,
-    NewSubtask,
-    NewSteering,
+    NewContext,
     EditSelected,
-    EditConfig,
-    /// Backlog actions.
-    Approve,
-    Dismiss,
-    Triage,
+    Ask,
+    Settings,
+    MoveMode,
+    /// Context actions.
+    ToggleApproveOrRoutine,
+    DeleteSelected,
     Execute,
-    ToggleRoutine,
 }
 
 /// Map one key press to a console [`Action`]. The console is one tree/detail
@@ -48,21 +51,24 @@ pub fn map_key(_view: View, key: KeyEvent) -> Option<Action> {
 
     Some(match key.code {
         KeyCode::Char('q') => Action::Quit,
-        KeyCode::Char('r') => Action::Refresh,
-        KeyCode::Char('a') => Action::NewProject,
-        KeyCode::Char('n') => Action::NewBacklog,
-        KeyCode::Char('i') => Action::NewIssue,
-        KeyCode::Char('s') => Action::NewSubtask,
-        KeyCode::Char('f') => Action::NewSteering,
+        KeyCode::Char('Q') => Action::QuitWithDaemon,
+        KeyCode::Char('p') => Action::NewProject,
+        KeyCode::Char('n') => Action::NewContext,
+        KeyCode::Char('?') => Action::Ask,
         KeyCode::Char('e') => Action::EditSelected,
-        KeyCode::Char('c') => Action::EditConfig,
-        KeyCode::Char('A') => Action::Approve,
-        KeyCode::Char('x') => Action::Dismiss,
-        KeyCode::Char('T') => Action::Triage,
+        KeyCode::Char('S') => Action::Settings,
+        KeyCode::Char('m') => Action::MoveMode,
+        KeyCode::Char('a') => Action::ToggleApproveOrRoutine,
+        KeyCode::Char('d') => Action::DeleteSelected,
         KeyCode::Char('E') => Action::Execute,
-        KeyCode::Char(' ') => Action::ToggleRoutine,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
+        KeyCode::Left | KeyCode::Char('h') => Action::Left,
+        KeyCode::Right | KeyCode::Char('l') => Action::Right,
+        KeyCode::PageDown => Action::PageDown,
+        KeyCode::PageUp => Action::PageUp,
+        KeyCode::Home => Action::Top,
+        KeyCode::End => Action::Bottom,
         KeyCode::Tab => Action::NextView,
         KeyCode::BackTab => Action::PrevView,
         KeyCode::Enter => Action::Drill,
@@ -104,50 +110,26 @@ mod tests {
     }
 
     #[test]
-    fn given_r_when_mapped_then_refresh() {
+    fn given_p_when_mapped_then_new_project() {
         assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('r'))),
-            Some(Action::Refresh)
-        );
-    }
-
-    #[test]
-    fn given_a_when_mapped_then_new_project() {
-        assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('a'))),
+            map_key(View::Overview, key(KeyCode::Char('p'))),
             Some(Action::NewProject)
         );
     }
 
     #[test]
-    fn given_n_when_mapped_then_new_backlog() {
+    fn given_n_when_mapped_then_new_context() {
         assert_eq!(
             map_key(View::Overview, key(KeyCode::Char('n'))),
-            Some(Action::NewBacklog)
+            Some(Action::NewContext)
         );
     }
 
     #[test]
-    fn given_i_when_mapped_then_new_issue() {
+    fn given_question_mark_when_mapped_then_ask() {
         assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('i'))),
-            Some(Action::NewIssue)
-        );
-    }
-
-    #[test]
-    fn given_s_when_mapped_then_new_subtask() {
-        assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('s'))),
-            Some(Action::NewSubtask)
-        );
-    }
-
-    #[test]
-    fn given_f_when_mapped_then_new_steering() {
-        assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('f'))),
-            Some(Action::NewSteering)
+            map_key(View::Overview, key(KeyCode::Char('?'))),
+            Some(Action::Ask)
         );
     }
 
@@ -160,26 +142,34 @@ mod tests {
     }
 
     #[test]
-    fn given_capital_a_when_mapped_then_approve() {
+    fn given_a_when_mapped_then_toggle_approve_or_routine() {
         assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('A'))),
-            Some(Action::Approve)
+            map_key(View::Overview, key(KeyCode::Char('a'))),
+            Some(Action::ToggleApproveOrRoutine)
         );
     }
 
     #[test]
-    fn given_x_when_mapped_then_dismiss() {
+    fn given_d_when_mapped_then_delete_selected() {
         assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('x'))),
-            Some(Action::Dismiss)
+            map_key(View::Overview, key(KeyCode::Char('d'))),
+            Some(Action::DeleteSelected)
         );
     }
 
     #[test]
-    fn given_capital_t_when_mapped_then_triage() {
+    fn given_capital_s_when_mapped_then_settings() {
         assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('T'))),
-            Some(Action::Triage)
+            map_key(View::Overview, key(KeyCode::Char('S'))),
+            Some(Action::Settings)
+        );
+    }
+
+    #[test]
+    fn given_m_when_mapped_then_move_mode() {
+        assert_eq!(
+            map_key(View::Overview, key(KeyCode::Char('m'))),
+            Some(Action::MoveMode)
         );
     }
 
@@ -188,14 +178,6 @@ mod tests {
         assert_eq!(
             map_key(View::Overview, key(KeyCode::Char('E'))),
             Some(Action::Execute)
-        );
-    }
-
-    #[test]
-    fn given_space_when_mapped_then_toggle_routine() {
-        assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char(' '))),
-            Some(Action::ToggleRoutine)
         );
     }
 
@@ -229,6 +211,35 @@ mod tests {
     }
 
     #[test]
+    fn given_page_down_when_mapped_then_page_down() {
+        assert_eq!(
+            map_key(View::Issue, key(KeyCode::PageDown)),
+            Some(Action::PageDown)
+        );
+    }
+
+    #[test]
+    fn given_page_up_when_mapped_then_page_up() {
+        assert_eq!(
+            map_key(View::Issue, key(KeyCode::PageUp)),
+            Some(Action::PageUp)
+        );
+    }
+
+    #[test]
+    fn given_home_when_mapped_then_top() {
+        assert_eq!(map_key(View::Issue, key(KeyCode::Home)), Some(Action::Top));
+    }
+
+    #[test]
+    fn given_end_when_mapped_then_bottom() {
+        assert_eq!(
+            map_key(View::Issue, key(KeyCode::End)),
+            Some(Action::Bottom)
+        );
+    }
+
+    #[test]
     fn given_enter_when_mapped_then_drill() {
         assert_eq!(
             map_key(View::Overview, key(KeyCode::Enter)),
@@ -242,20 +253,6 @@ mod tests {
             map_key(View::Overview, key(KeyCode::Esc)),
             Some(Action::Back)
         );
-    }
-
-    #[test]
-    fn given_refresh_key_when_view_changes_then_same_action() {
-        let views = [
-            View::Overview,
-            View::Issue,
-            View::Backlog,
-            View::Logs,
-            View::Config,
-        ];
-        assert!(views
-            .into_iter()
-            .all(|view| map_key(view, key(KeyCode::Char('r'))) == Some(Action::Refresh)));
     }
 
     #[test]
@@ -285,18 +282,48 @@ mod tests {
     }
 
     #[test]
-    fn given_h_when_mapped_then_none() {
-        assert_eq!(map_key(View::Overview, key(KeyCode::Char('h'))), None);
+    fn given_h_when_mapped_then_left() {
+        assert_eq!(
+            map_key(View::Overview, key(KeyCode::Char('h'))),
+            Some(Action::Left)
+        );
     }
 
     #[test]
-    fn given_l_when_mapped_then_none() {
-        assert_eq!(map_key(View::Overview, key(KeyCode::Char('l'))), None);
+    fn given_l_when_mapped_then_right() {
+        assert_eq!(
+            map_key(View::Overview, key(KeyCode::Char('l'))),
+            Some(Action::Right)
+        );
     }
 
     #[test]
     fn given_uppercase_r_when_mapped_then_none() {
         assert_eq!(map_key(View::Overview, key(KeyCode::Char('R'))), None);
+    }
+
+    #[test]
+    fn given_removed_user_facing_keys_when_mapped_then_none() {
+        for code in [
+            KeyCode::Char('r'),
+            KeyCode::Char('i'),
+            KeyCode::Char('s'),
+            KeyCode::Char('f'),
+            KeyCode::Char('T'),
+            KeyCode::Char('A'),
+            KeyCode::Char('x'),
+            KeyCode::Char(' '),
+        ] {
+            assert_eq!(map_key(View::Overview, key(code)), None);
+        }
+    }
+
+    #[test]
+    fn given_capital_q_when_mapped_then_quit_with_daemon() {
+        assert_eq!(
+            map_key(View::Overview, key(KeyCode::Char('Q'))),
+            Some(Action::QuitWithDaemon)
+        );
     }
 
     #[test]
