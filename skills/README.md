@@ -12,20 +12,35 @@ corresponding `AgentRunner` impl substitutes any `/skill-name` mention in the
 prompt with the inlined SKILL.md body of the same name from this directory
 (via `skills::inline_for_agent`).
 
-## Skills to ship
+## Packaged Skills
 
-| Skill         | Required by                                                                 |
-|---------------|------------------------------------------------------------------------------|
-| `recall`      | iteration prompt (initial context load)                                      |
-| `backpressure`| QA phase after each iteration                                                |
-| `commit`      | COMPLETING phase                                                             |
-| `memo`        | post_merge knowledge propagation                                             |
-| `dream`       | post_merge + built-in routine + manual one-off                               |
-| `deepsleep`   | built-in weekly routine                                                      |
-| `gh-pr`       | COMPLETING + merge_mode = pr or auto-detect with GitHub remote               |
+| Skill | Required by |
+|-------|-------------|
+| `recall` | iteration prompt / session context loading |
+| `seek` | `recall` semantic lookup |
+| `backpressure` | requirement and quality loop |
+| `write-test` | `backpressure` test generation loop |
+| `write-test-audit` | `backpressure` test audit loop |
+| `simplify` | `backpressure` simplification loop |
+| `good-to-go` | pre-merge audit / human verification gate |
+| `commit` | commit workflow |
+| `no-repeat` | worker failure breadcrumb / repeat-mistake prevention |
+| `memo` | post-merge and session knowledge propagation |
+| `memory-retrieve` | provider-neutral memory lookup contract backed by the selected Memory preset |
+| `memory-save` | provider-neutral durable memory save contract backed by the selected Memory preset |
+| `memory-consolidate` | provider-neutral dream/deepsleep contract backed by the selected Memory preset |
+| `note` | `memo` personal-note handoff |
+| `dream` | session consolidation and recurring knowledge maintenance |
+| `docs-as-code` | `dream` knowledge-to-code annotation step |
+| `deepsleep` | built-in weekly routine and `dream` hygiene audit |
+| `sec` | `backpressure` security audit |
+| `keep-my-secret` | `sec` secret scanning handoff |
+| `codex` | `write-test` independent test-writing command |
+| `gh-pr` | PR creation for PR merge mode |
 
-## Population strategy
+## Packaging Rule
 
-For now, copies must be pulled in manually (or symlinked from `~/.claude/skills/`
-during dev). A future build step or `auwsx skills sync` subcommand will fetch
-them from the user's `~/.claude/skills/` directory at package time.
+Every skill listed in `auwsx_core::skills::BUNDLED_SKILLS` must exist at
+`skills/{name}/SKILL.md`. If a skill calls another skill as part of normal
+operation, include that dependency too. Optional external callers do not need to
+be bundled just because they can invoke one of these skills.
