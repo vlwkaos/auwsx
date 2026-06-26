@@ -20,6 +20,11 @@ build/
 # Local env
 .env
 .env.local
+*.pem
+*.key
+*.p12
+secrets/
+.secrets
 
 # Skills cache (skills/ is a bundle source; consumers install via auwsx-core::skills)
 skills/.cache/
