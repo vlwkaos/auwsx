@@ -1,4 +1,4 @@
-//! Backlog items + triage/consolidation. Plan Step 3.7.
+//! Backlog items + admission gate. Plan Step 3.7.
 //!
 //! A backlog item is a lightweight intent: `(project_id, text, source)`. It
 //! carries an admission gate:
@@ -8,12 +8,8 @@
 //!
 //! Human/inbox items are inserted `approved`; agent/routine items are inserted
 //! `pending` and wait for a human approve/dismiss in the overview. Only
-//! `approved` items flow into triage.
-//!
-//! Triage (a built-in main-job) auto-groups approved items into issues and
-//! promotes them — no human grouping gate (the gate is admission, above). Each
-//! provisional issue then runs the CONSOLIDATING phase (see `pipeline`), which
-//! decides delegate-as-steering vs. standalone before any worktree is created.
+//! `approved` items flow into routing, where the scheduler creates a `NEW`
+//! issue or appends a queue message to an attachable in-flight issue.
 
 use crate::db::issues;
 use crate::Result;
@@ -165,23 +161,29 @@ pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<BacklogItem>> {
     row.as_ref().map(BacklogItem::from_row).transpose()
 }
 
-/// All items for a project, newest first.
+/// Live, unpromoted items for a project, newest first.
 pub async fn list_by_project(pool: &SqlitePool, project_id: i64) -> Result<Vec<BacklogItem>> {
-    let rows = sqlx::query("SELECT * FROM backlog_items WHERE project_id = ? ORDER BY id DESC")
-        .bind(project_id)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT * FROM backlog_items
+         WHERE project_id = ? AND consumed_issue_id IS NULL
+         ORDER BY id DESC",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
     rows.iter().map(BacklogItem::from_row).collect()
 }
 
-/// Items in a given approval state (e.g. `Approved` is what flows to triage).
+/// Live, unpromoted items in a given approval state.
 pub async fn list_by_approval(
     pool: &SqlitePool,
     project_id: i64,
     approval: Approval,
 ) -> Result<Vec<BacklogItem>> {
     let rows = sqlx::query(
-        "SELECT * FROM backlog_items WHERE project_id = ? AND approval = ? ORDER BY id",
+        "SELECT * FROM backlog_items
+         WHERE project_id = ? AND approval = ? AND consumed_issue_id IS NULL
+         ORDER BY id",
     )
     .bind(project_id)
     .bind(approval.as_str())
@@ -264,6 +266,23 @@ pub async fn mark_consumed(pool: &SqlitePool, id: i64, issue_id: i64, now: i64) 
     ensure_found(n, id)
 }
 
+/// Resolve source backlog rows before deleting their consumed issue, so ON
+/// DELETE SET NULL does not make old promoted work appear as live backlog again.
+pub async fn dismiss_consumed_by_issue(pool: &SqlitePool, issue_id: i64, now: i64) -> Result<u64> {
+    let n = sqlx::query(
+        "UPDATE backlog_items
+         SET approval = ?, resolved_at = ?
+         WHERE consumed_issue_id = ?",
+    )
+    .bind(Approval::Dismissed.as_str())
+    .bind(now)
+    .bind(issue_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n)
+}
+
 /// Delete an item outright.
 pub async fn remove(pool: &SqlitePool, id: i64) -> Result<()> {
     let n = sqlx::query("DELETE FROM backlog_items WHERE id = ?")
@@ -282,12 +301,11 @@ fn ensure_found(rows_affected: u64, id: i64) -> Result<()> {
 }
 
 /// Promote every approved, not-yet-grouped backlog item in a project into its
-/// own issue (which enters `CONSOLIDATING`, where the pipeline later decides
-/// standalone-vs-delegate). Each promoted item is linked to its issue via
+/// own `NEW` issue. Each promoted item is linked to its issue via
 /// `consumed_issue_id`. Returns the created issue ids, in item order.
 ///
-/// v1 has no grouping heuristic — one item, one issue. Consolidation across
-/// similar issues happens later, per-issue, in the CONSOLIDATING phase.
+/// New scheduler routing should prefer `routing::route_approved_project`; this
+/// function remains as the simple one-item/one-issue compatibility path.
 pub async fn run_triage(pool: &SqlitePool, project_id: i64, now: i64) -> Result<Vec<i64>> {
     Ok(run_triage_detailed(pool, project_id, now)
         .await?

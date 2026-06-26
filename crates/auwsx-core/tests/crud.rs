@@ -10,8 +10,12 @@
 //! asserting the resolved_at/done_at value equals the `now` that was passed.
 
 use auwsx_core::backlog::{self, Approval, Source};
+use auwsx_core::db::arsenal::{self, NewArsenalPreset};
+use auwsx_core::db::ask_answers::{self, AskMode};
 use auwsx_core::db::findings::{self, FindingStatus, NewFinding, Severity};
+use auwsx_core::db::global_settings::{self, PIPELINE_UX_GUIDANCE_MAX_CHARS};
 use auwsx_core::db::issues::{self, INITIAL_STATUS};
+use auwsx_core::db::profiles;
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode, NewProject};
 use auwsx_core::db::subtasks;
 use auwsx_core::db::Db;
@@ -40,6 +44,7 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             name,
             repo_path: "/repo/path",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "claude {prompt}",
             plan_agent_cmd: "claude-plan {prompt}",
             work_agent_cmd: "claude-work {prompt}",
@@ -47,6 +52,8 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -77,6 +84,21 @@ async fn insert_routine(pool: &SqlitePool, project_id: i64) -> anyhow::Result<i6
 async fn insert_main_job(pool: &SqlitePool, project_id: i64) -> anyhow::Result<i64> {
     let routine_id = insert_routine(pool, project_id).await?;
     main_jobs::enqueue_routine(pool, project_id, routine_id, "report", "prompt", TS).await
+}
+
+async fn upsert_preset(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
+    arsenal::upsert(
+        pool,
+        NewArsenalPreset {
+            name,
+            main_agent_cmd: "main {prompt}",
+            plan_agent_cmd: "plan {prompt}",
+            work_agent_cmd: "work {prompt}",
+            review_agent_cmd: Some("review {prompt}"),
+        },
+        TS,
+    )
+    .await
 }
 
 /// Create an issue and force it into `status` (bypassing the legality matrix),
@@ -134,6 +156,7 @@ async fn given_review_agent_cmd_some_when_created_then_review_agent_cmd_roundtri
             name: "alpha",
             repo_path: "/r",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -141,12 +164,170 @@ async fn given_review_agent_cmd_some_when_created_then_review_agent_cmd_roundtri
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
     .await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
     assert_eq!(p.review_agent_cmd.as_deref(), Some("reviewer {prompt}"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_project_with_arsenal_and_blank_overrides_when_get_then_effective_commands_resolve(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    upsert_preset(db.pool(), "local").await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "alpha",
+            repo_path: "/r",
+            default_branch: "main",
+            arsenal_preset_name: Some("local"),
+            main_agent_cmd: "",
+            plan_agent_cmd: "",
+            work_agent_cmd: "",
+            review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
+        },
+        TS,
+    )
+    .await?;
+
+    let p = projects::get(db.pool(), id).await?.expect("project exists");
+
+    assert_eq!(p.arsenal_preset_name.as_deref(), Some("local"));
+    assert_eq!(p.main_agent_cmd, "main {prompt}");
+    assert_eq!(p.plan_agent_cmd, "plan {prompt}");
+    assert_eq!(p.work_agent_cmd, "work {prompt}");
+    assert_eq!(p.review_agent_cmd.as_deref(), Some("review {prompt}"));
+    assert_eq!(p.main_agent_cmd_override, None);
+    assert_eq!(p.plan_agent_cmd_override, None);
+    assert_eq!(p.work_agent_cmd_override, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_linked_project_when_arsenal_updates_then_effective_commands_follow(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    upsert_preset(db.pool(), "local").await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "alpha",
+            repo_path: "/r",
+            default_branch: "main",
+            arsenal_preset_name: Some("local"),
+            main_agent_cmd: "",
+            plan_agent_cmd: "",
+            work_agent_cmd: "",
+            review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
+        },
+        TS,
+    )
+    .await?;
+    arsenal::upsert(
+        db.pool(),
+        NewArsenalPreset {
+            name: "local",
+            main_agent_cmd: "main2 {prompt}",
+            plan_agent_cmd: "plan2 {prompt}",
+            work_agent_cmd: "work2 {prompt}",
+            review_agent_cmd: Some("review2 {prompt}"),
+        },
+        TS + 1,
+    )
+    .await?;
+
+    let p = projects::get(db.pool(), id).await?.expect("project exists");
+
+    assert_eq!(p.main_agent_cmd, "main2 {prompt}");
+    assert_eq!(p.plan_agent_cmd, "plan2 {prompt}");
+    assert_eq!(p.work_agent_cmd, "work2 {prompt}");
+    assert_eq!(p.review_agent_cmd.as_deref(), Some("review2 {prompt}"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_project_with_arsenal_and_manual_override_when_get_then_override_wins(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    upsert_preset(db.pool(), "local").await?;
+    let id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "alpha",
+            repo_path: "/r",
+            default_branch: "main",
+            arsenal_preset_name: Some("local"),
+            main_agent_cmd: "manual-main {prompt}",
+            plan_agent_cmd: "",
+            work_agent_cmd: "",
+            review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
+        },
+        TS,
+    )
+    .await?;
+
+    let p = projects::get(db.pool(), id).await?.expect("project exists");
+
+    assert_eq!(p.main_agent_cmd, "manual-main {prompt}");
+    assert_eq!(
+        p.main_agent_cmd_override.as_deref(),
+        Some("manual-main {prompt}")
+    );
+    assert_eq!(p.plan_agent_cmd, "plan {prompt}");
+    assert_eq!(p.plan_agent_cmd_override, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_unknown_arsenal_when_project_created_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let err = projects::create(
+        db.pool(),
+        NewProject {
+            name: "alpha",
+            repo_path: "/r",
+            default_branch: "main",
+            arsenal_preset_name: Some("missing"),
+            main_agent_cmd: "",
+            plan_agent_cmd: "",
+            work_agent_cmd: "",
+            review_agent_cmd: None,
+            completion_policy: None,
+            plan_gate_timeout_min: None,
+            completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
+        },
+        TS,
+    )
+    .await
+    .expect_err("unknown Arsenal preset must fail");
+
+    assert!(
+        err.to_string().contains("unknown Arsenal preset"),
+        "unexpected error: {err:#}"
+    );
     Ok(())
 }
 
@@ -219,11 +400,11 @@ async fn given_minimal_create_when_get_then_conflict_max_attempts_defaults_3() -
 }
 
 #[tokio::test]
-async fn given_minimal_create_when_get_then_max_concurrency_defaults_1() -> anyhow::Result<()> {
+async fn given_minimal_create_when_get_then_max_concurrency_defaults_3() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let id = insert_project(db.pool(), "p").await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
-    assert_eq!(p.max_concurrency, 1);
+    assert_eq!(p.max_concurrency, 3);
     Ok(())
 }
 
@@ -323,6 +504,115 @@ async fn given_three_projects_when_list_then_ordered_by_id_asc() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn given_projects_created_without_profile_when_get_then_default_profile_and_order_assigned(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let a = insert_project(db.pool(), "a").await?;
+    let b = insert_project(db.pool(), "b").await?;
+    let pa = projects::get(db.pool(), a)
+        .await?
+        .expect("project a exists");
+    let pb = projects::get(db.pool(), b)
+        .await?
+        .expect("project b exists");
+    assert_eq!(
+        (
+            pa.profile_id,
+            pa.profile_order,
+            pb.profile_id,
+            pb.profile_order
+        ),
+        (1, 1, 1, 2)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_project_moved_to_profile_when_get_then_appended_to_that_profile(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let moved = insert_project(db.pool(), "moved").await?;
+    let other_existing = insert_project(db.pool(), "other-existing").await?;
+    let profile_id = profiles::create(db.pool(), "custom", TS).await?;
+    projects::move_to_profile(db.pool(), other_existing, profile_id).await?;
+
+    projects::move_to_profile(db.pool(), moved, profile_id).await?;
+
+    let p = projects::get(db.pool(), moved)
+        .await?
+        .expect("project exists");
+    assert_eq!((p.profile_id, p.profile_order), (profile_id, 2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_missing_project_when_move_to_profile_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let profile_id = profiles::create(db.pool(), "custom", TS).await?;
+    let res = projects::move_to_profile(db.pool(), 999_999, profile_id).await;
+    assert!(res.is_err(), "moving a missing project must Err");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_missing_profile_when_move_project_to_profile_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "p").await?;
+    let res = projects::move_to_profile(db.pool(), project_id, 999_999).await;
+    assert!(res.is_err(), "moving to a missing profile must Err");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_project_moved_past_profile_start_when_list_then_clamped_within_profile(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    insert_project(db.pool(), "a").await?;
+    insert_project(db.pool(), "b").await?;
+    let c = insert_project(db.pool(), "c").await?;
+
+    projects::move_within_profile(db.pool(), c, -99).await?;
+
+    let names: Vec<String> = projects::list(db.pool())
+        .await?
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(names, vec!["c", "b", "a"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_projects_in_other_profile_when_moving_default_profile_then_other_profile_unchanged(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let a = insert_project(db.pool(), "a").await?;
+    let b = insert_project(db.pool(), "b").await?;
+    let x = insert_project(db.pool(), "x").await?;
+    let y = insert_project(db.pool(), "y").await?;
+    let profile_id = profiles::create(db.pool(), "custom", TS).await?;
+    projects::move_to_profile(db.pool(), x, profile_id).await?;
+    projects::move_to_profile(db.pool(), y, profile_id).await?;
+
+    projects::move_within_profile(db.pool(), b, -1).await?;
+
+    let rows = projects::list(db.pool()).await?;
+    let names: Vec<String> = rows.into_iter().map(|p| p.name).collect();
+    assert_eq!(names, vec!["b", "a", "x", "y"]);
+    let a_row = projects::get(db.pool(), a).await?.expect("a exists");
+    assert_eq!(a_row.profile_order, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_missing_project_when_move_within_profile_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let res = projects::move_within_profile(db.pool(), 999_999, 1).await;
+    assert!(res.is_err(), "moving a missing project must Err");
+    Ok(())
+}
+
+#[tokio::test]
 async fn given_existing_name_when_create_again_then_err() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     insert_project(db.pool(), "dup").await?;
@@ -387,7 +677,7 @@ async fn given_bogus_or_empty_when_completion_policy_from_str_then_none() -> any
 // ===========================================================================
 
 #[tokio::test]
-async fn given_new_issue_when_created_then_status_is_initial_consolidating() -> anyhow::Result<()> {
+async fn given_new_issue_when_created_then_status_is_initial_new() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
@@ -397,8 +687,8 @@ async fn given_new_issue_when_created_then_status_is_initial_consolidating() -> 
 }
 
 #[tokio::test]
-async fn given_initial_status_const_when_checked_then_equals_consolidating() -> anyhow::Result<()> {
-    assert_eq!(INITIAL_STATUS, IssueStatus::Consolidating);
+async fn given_initial_status_const_when_checked_then_equals_new() -> anyhow::Result<()> {
+    assert_eq!(INITIAL_STATUS, IssueStatus::New);
     Ok(())
 }
 
@@ -498,7 +788,7 @@ async fn given_issues_of_mixed_status_when_list_by_status_then_only_that_status(
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let planning = insert_issue_at(db.pool(), pid, IssueStatus::Planning).await?;
-    insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let ids: Vec<i64> = issues::list_by_status(db.pool(), pid, IssueStatus::Planning)
         .await?
         .into_iter()
@@ -512,7 +802,7 @@ async fn given_issues_of_mixed_status_when_list_by_status_then_only_that_status(
 async fn given_no_issues_in_status_when_list_by_status_then_empty() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let got = issues::list_by_status(db.pool(), pid, IssueStatus::Done).await?;
     assert!(got.is_empty());
     Ok(())
@@ -521,8 +811,7 @@ async fn given_no_issues_in_status_when_list_by_status_then_empty() -> anyhow::R
 // --- transition: legal, illegal, timestamp ---------------------------------
 
 #[tokio::test]
-async fn given_consolidating_when_transition_to_planning_then_status_planning() -> anyhow::Result<()>
-{
+async fn given_new_when_transition_to_planning_then_status_planning() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
@@ -544,13 +833,13 @@ async fn given_legal_transition_when_applied_then_updated_at_is_new_now() -> any
 }
 
 #[tokio::test]
-async fn given_consolidating_when_transition_to_done_then_err() -> anyhow::Result<()> {
-    // Structurally valid but semantically wrong: CONSOLIDATING -> DONE is illegal.
+async fn given_new_when_transition_to_done_then_err() -> anyhow::Result<()> {
+    // Structurally valid but semantically wrong: NEW -> DONE is illegal.
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
     let res = issues::transition(db.pool(), id, IssueStatus::Done, TS2).await;
-    assert!(res.is_err(), "CONSOLIDATING -> DONE must be rejected");
+    assert!(res.is_err(), "NEW -> DONE must be rejected");
     Ok(())
 }
 
@@ -559,9 +848,9 @@ async fn given_illegal_transition_when_attempted_then_status_unchanged() -> anyh
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
-    let _ = issues::transition(db.pool(), id, IssueStatus::Implementing, TS2).await;
+    let _ = issues::transition(db.pool(), id, IssueStatus::Working, TS2).await;
     let issue = issues::get(db.pool(), id).await?.expect("issue exists");
-    assert_eq!(issue.status, IssueStatus::Consolidating);
+    assert_eq!(issue.status, IssueStatus::New);
     Ok(())
 }
 
@@ -580,7 +869,7 @@ async fn given_illegal_edge_when_force_status_then_applied_anyway() -> anyhow::R
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
-    // CONSOLIDATING -> DONE is illegal for transition, but force bypasses the matrix.
+    // NEW -> DONE is illegal for transition, but force bypasses the matrix.
     issues::force_status(db.pool(), id, IssueStatus::Done, TS2).await?;
     let issue = issues::get(db.pool(), id).await?.expect("issue exists");
     assert_eq!(issue.status, IssueStatus::Done);
@@ -595,30 +884,36 @@ async fn given_missing_issue_when_force_status_then_err() -> anyhow::Result<()> 
     Ok(())
 }
 
-// --- mark_absorbed ---------------------------------------------------------
+// --- mark_absorbed compatibility guard ------------------------------------
 
 #[tokio::test]
-async fn given_consolidating_issue_when_mark_absorbed_then_status_absorbed() -> anyhow::Result<()> {
+async fn given_issue_when_mark_absorbed_then_err() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let donor = issues::create(db.pool(), pid, "donor", None, TS).await?;
-    let target = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
-    issues::mark_absorbed(db.pool(), donor, target, TS2).await?;
-    let issue = issues::get(db.pool(), donor).await?.expect("issue exists");
-    assert_eq!(issue.status, IssueStatus::Absorbed);
+    let target = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
+    let res = issues::mark_absorbed(db.pool(), donor, target, TS2).await;
+    assert!(
+        res.is_err(),
+        "direct issue absorption is no longer supported"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn given_consolidating_issue_when_mark_absorbed_then_absorbed_into_id_set(
-) -> anyhow::Result<()> {
+async fn given_issue_when_mark_absorbed_err_then_issue_is_unchanged() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let donor = issues::create(db.pool(), pid, "donor", None, TS).await?;
-    let target = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
-    issues::mark_absorbed(db.pool(), donor, target, TS2).await?;
+    let target = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
+    let res = issues::mark_absorbed(db.pool(), donor, target, TS2).await;
+    assert!(
+        res.is_err(),
+        "direct issue absorption is no longer supported"
+    );
     let issue = issues::get(db.pool(), donor).await?.expect("issue exists");
-    assert_eq!(issue.absorbed_into_id, Some(target));
+    assert_eq!(issue.status, IssueStatus::New);
+    assert_eq!(issue.absorbed_into_id, None);
     Ok(())
 }
 
@@ -639,15 +934,15 @@ async fn given_absorb_target_in_other_project_when_mark_absorbed_then_err() -> a
     let pid = insert_project(db.pool(), "p").await?;
     let other_pid = insert_project(db.pool(), "other").await?;
     let donor = issues::create(db.pool(), pid, "donor", None, TS).await?;
-    let target = insert_issue_at(db.pool(), other_pid, IssueStatus::Implementing).await?;
+    let target = insert_issue_at(db.pool(), other_pid, IssueStatus::Working).await?;
     let res = issues::mark_absorbed(db.pool(), donor, target, TS2).await;
     assert!(res.is_err(), "target must belong to the same project");
     Ok(())
 }
 
 #[tokio::test]
-async fn given_non_consolidating_issue_when_mark_absorbed_then_err() -> anyhow::Result<()> {
-    // ->ABSORBED is legal only from CONSOLIDATING; from PLANNING it must Err.
+async fn given_non_new_issue_when_mark_absorbed_then_err() -> anyhow::Result<()> {
+    // ->ABANDONED is legal only from NEW; from PLANNING it must Err.
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let donor = insert_issue_at(db.pool(), pid, IssueStatus::Planning).await?;
@@ -832,63 +1127,69 @@ async fn given_missing_issue_when_bump_conflict_attempts_then_err() -> anyhow::R
     Ok(())
 }
 
-// --- IssueStatus::accepts_steering set -------------------------------------
+// --- IssueStatus::accepts_queue_message set --------------------------------
 
 #[tokio::test]
-async fn given_working_phase_statuses_when_accepts_steering_then_true() -> anyhow::Result<()> {
+async fn given_queue_eligible_statuses_when_accepts_queue_message_then_true() -> anyhow::Result<()>
+{
     for v in [
-        IssueStatus::Implementing,
-        IssueStatus::Review,
-        IssueStatus::NeedsFix,
-        IssueStatus::Audit,
+        IssueStatus::Planning,
+        IssueStatus::Working,
+        IssueStatus::Reviewing,
+        IssueStatus::Fixing,
+        IssueStatus::Auditing,
+        IssueStatus::ReadyToMerge,
     ] {
-        assert!(v.accepts_steering(), "{v:?} should accept steering");
+        assert!(
+            v.accepts_queue_message(),
+            "{v:?} should accept queue messages"
+        );
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn given_non_working_phase_status_when_accepts_steering_then_false() -> anyhow::Result<()> {
-    // Planned is structurally a real status but not a working phase.
-    assert!(!IssueStatus::Planned.accepts_steering());
+async fn given_non_queue_eligible_status_when_accepts_queue_message_then_false(
+) -> anyhow::Result<()> {
+    assert!(!IssueStatus::PlanReady.accepts_queue_message());
     Ok(())
 }
 
 // --- is_legal_transition sample contract -----------------------------------
 
 #[tokio::test]
-async fn given_consolidating_to_planning_when_checked_then_legal() -> anyhow::Result<()> {
+async fn given_new_to_planning_when_checked_then_legal() -> anyhow::Result<()> {
+    assert!(is_legal_transition(IssueStatus::New, IssueStatus::Planning));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_new_to_working_when_checked_then_illegal() -> anyhow::Result<()> {
+    assert!(!is_legal_transition(IssueStatus::New, IssueStatus::Working));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_ready_to_merge_to_working_when_checked_then_legal() -> anyhow::Result<()> {
     assert!(is_legal_transition(
-        IssueStatus::Consolidating,
-        IssueStatus::Planning
+        IssueStatus::ReadyToMerge,
+        IssueStatus::Working
     ));
     Ok(())
 }
 
 #[tokio::test]
-async fn given_consolidating_to_implementing_when_checked_then_illegal() -> anyhow::Result<()> {
-    assert!(!is_legal_transition(
-        IssueStatus::Consolidating,
-        IssueStatus::Implementing
-    ));
-    Ok(())
-}
-
-#[tokio::test]
-async fn given_consolidating_to_absorbed_when_checked_then_legal() -> anyhow::Result<()> {
+async fn given_new_to_abandoned_when_checked_then_legal() -> anyhow::Result<()> {
     assert!(is_legal_transition(
-        IssueStatus::Consolidating,
-        IssueStatus::Absorbed
+        IssueStatus::New,
+        IssueStatus::Abandoned
     ));
     Ok(())
 }
 
 #[tokio::test]
-async fn given_consolidating_to_done_when_checked_then_illegal() -> anyhow::Result<()> {
-    assert!(!is_legal_transition(
-        IssueStatus::Consolidating,
-        IssueStatus::Done
-    ));
+async fn given_new_to_done_when_checked_then_illegal() -> anyhow::Result<()> {
+    assert!(!is_legal_transition(IssueStatus::New, IssueStatus::Done));
     Ok(())
 }
 
@@ -922,7 +1223,7 @@ fn new_finding(issue_id: i64) -> NewFinding<'static> {
 async fn given_new_finding_when_added_then_status_open() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     let f = findings::get(db.pool(), fid)
         .await?
@@ -935,7 +1236,7 @@ async fn given_new_finding_when_added_then_status_open() -> anyhow::Result<()> {
 async fn given_new_finding_when_added_then_resolved_at_none() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     let f = findings::get(db.pool(), fid)
         .await?
@@ -948,7 +1249,7 @@ async fn given_new_finding_when_added_then_resolved_at_none() -> anyhow::Result<
 async fn given_finding_with_optional_fields_when_get_then_roundtrip() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(
         db.pool(),
         NewFinding {
@@ -996,7 +1297,7 @@ async fn given_no_finding_with_id_when_get_then_none() -> anyhow::Result<()> {
 async fn given_no_findings_when_list_by_issue_then_empty() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     assert!(findings::list_by_issue(db.pool(), iid).await?.is_empty());
     Ok(())
 }
@@ -1005,7 +1306,7 @@ async fn given_no_findings_when_list_by_issue_then_empty() -> anyhow::Result<()>
 async fn given_three_findings_when_list_by_issue_then_oldest_id_first() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let a = findings::add(db.pool(), new_finding(iid), TS).await?;
     let b = findings::add(db.pool(), new_finding(iid), TS).await?;
     let c = findings::add(db.pool(), new_finding(iid), TS).await?;
@@ -1022,7 +1323,7 @@ async fn given_three_findings_when_list_by_issue_then_oldest_id_first() -> anyho
 async fn given_mixed_status_findings_when_list_open_then_only_open() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let open = findings::add(db.pool(), new_finding(iid), TS).await?;
     let accepted = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::accept(db.pool(), accepted, "will fix", TS2).await?;
@@ -1041,7 +1342,7 @@ async fn given_mixed_status_findings_when_list_open_then_only_open() -> anyhow::
 async fn given_open_finding_when_accept_then_status_accepted() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::accept(db.pool(), fid, "will fix", TS2).await?;
     let f = findings::get(db.pool(), fid)
@@ -1055,7 +1356,7 @@ async fn given_open_finding_when_accept_then_status_accepted() -> anyhow::Result
 async fn given_open_finding_when_accept_then_adjudication_is_rationale() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::accept(db.pool(), fid, "will fix", TS2).await?;
     let f = findings::get(db.pool(), fid)
@@ -1069,7 +1370,7 @@ async fn given_open_finding_when_accept_then_adjudication_is_rationale() -> anyh
 async fn given_open_finding_when_accept_then_resolved_at_is_now() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::accept(db.pool(), fid, "will fix", TS2).await?;
     let f = findings::get(db.pool(), fid)
@@ -1093,7 +1394,7 @@ async fn given_missing_finding_when_accept_then_err() -> anyhow::Result<()> {
 async fn given_open_finding_when_reject_then_status_rejected() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::reject(db.pool(), fid, "false positive", TS2).await?;
     let f = findings::get(db.pool(), fid)
@@ -1107,7 +1408,7 @@ async fn given_open_finding_when_reject_then_status_rejected() -> anyhow::Result
 async fn given_open_finding_when_reject_then_adjudication_is_rationale() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::reject(db.pool(), fid, "false positive", TS2).await?;
     let f = findings::get(db.pool(), fid)
@@ -1131,7 +1432,7 @@ async fn given_missing_finding_when_reject_then_err() -> anyhow::Result<()> {
 async fn given_open_finding_when_dismiss_then_status_dismissed() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::dismiss(db.pool(), fid, TS2).await?;
     let f = findings::get(db.pool(), fid)
@@ -1145,7 +1446,7 @@ async fn given_open_finding_when_dismiss_then_status_dismissed() -> anyhow::Resu
 async fn given_open_finding_when_dismiss_then_adjudication_stays_none() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::dismiss(db.pool(), fid, TS2).await?;
     let f = findings::get(db.pool(), fid)
@@ -1159,7 +1460,7 @@ async fn given_open_finding_when_dismiss_then_adjudication_stays_none() -> anyho
 async fn given_open_finding_when_dismiss_then_resolved_at_is_now() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Review).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Reviewing).await?;
     let fid = findings::add(db.pool(), new_finding(iid), TS).await?;
     findings::dismiss(db.pool(), fid, TS2).await?;
     let f = findings::get(db.pool(), fid)
@@ -1245,7 +1546,7 @@ async fn given_bogus_or_empty_when_finding_status_from_str_then_none() -> anyhow
 async fn given_new_subtask_when_added_then_done_false() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     subtasks::add(db.pool(), iid, 0, "step one", TS).await?;
     let st = &subtasks::list_by_issue(db.pool(), iid).await?[0];
     assert!(!st.done);
@@ -1256,7 +1557,7 @@ async fn given_new_subtask_when_added_then_done_false() -> anyhow::Result<()> {
 async fn given_new_subtask_when_added_then_done_at_none() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     subtasks::add(db.pool(), iid, 0, "step one", TS).await?;
     let st = &subtasks::list_by_issue(db.pool(), iid).await?[0];
     assert_eq!(st.done_at, None);
@@ -1267,7 +1568,7 @@ async fn given_new_subtask_when_added_then_done_at_none() -> anyhow::Result<()> 
 async fn given_new_subtask_when_added_then_text_roundtrips() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     subtasks::add(db.pool(), iid, 0, "step one", TS).await?;
     let st = &subtasks::list_by_issue(db.pool(), iid).await?[0];
     assert_eq!(st.text, "step one");
@@ -1278,7 +1579,7 @@ async fn given_new_subtask_when_added_then_text_roundtrips() -> anyhow::Result<(
 async fn given_no_subtasks_when_list_by_issue_then_empty() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     assert!(subtasks::list_by_issue(db.pool(), iid).await?.is_empty());
     Ok(())
 }
@@ -1288,7 +1589,7 @@ async fn given_subtasks_with_distinct_ord_when_list_then_ordered_by_ord_asc() ->
 {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     // Insert out of order; list must sort by ord.
     subtasks::add(db.pool(), iid, 2, "third", TS).await?;
     subtasks::add(db.pool(), iid, 0, "first", TS).await?;
@@ -1306,7 +1607,7 @@ async fn given_subtasks_with_distinct_ord_when_list_then_ordered_by_ord_asc() ->
 async fn given_equal_ord_subtasks_when_list_then_tiebreak_by_id_asc() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let a = subtasks::add(db.pool(), iid, 0, "a", TS).await?;
     let b = subtasks::add(db.pool(), iid, 0, "b", TS).await?;
     let ids: Vec<i64> = subtasks::list_by_issue(db.pool(), iid)
@@ -1322,7 +1623,7 @@ async fn given_equal_ord_subtasks_when_list_then_tiebreak_by_id_asc() -> anyhow:
 async fn given_subtask_when_mark_done_then_done_true() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = subtasks::add(db.pool(), iid, 0, "x", TS).await?;
     subtasks::mark_done(db.pool(), sid, TS2).await?;
     let st = &subtasks::list_by_issue(db.pool(), iid).await?[0];
@@ -1334,7 +1635,7 @@ async fn given_subtask_when_mark_done_then_done_true() -> anyhow::Result<()> {
 async fn given_subtask_when_mark_done_then_done_at_is_now() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = subtasks::add(db.pool(), iid, 0, "x", TS).await?;
     subtasks::mark_done(db.pool(), sid, TS2).await?;
     let st = &subtasks::list_by_issue(db.pool(), iid).await?[0];
@@ -1354,7 +1655,7 @@ async fn given_missing_subtask_when_mark_done_then_err() -> anyhow::Result<()> {
 async fn given_done_subtask_when_mark_undone_then_done_false() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = subtasks::add(db.pool(), iid, 0, "x", TS).await?;
     subtasks::mark_done(db.pool(), sid, TS2).await?;
     subtasks::mark_undone(db.pool(), sid).await?;
@@ -1367,7 +1668,7 @@ async fn given_done_subtask_when_mark_undone_then_done_false() -> anyhow::Result
 async fn given_done_subtask_when_mark_undone_then_done_at_cleared() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = subtasks::add(db.pool(), iid, 0, "x", TS).await?;
     subtasks::mark_done(db.pool(), sid, TS2).await?;
     subtasks::mark_undone(db.pool(), sid).await?;
@@ -1481,6 +1782,25 @@ async fn given_three_items_when_list_by_project_then_newest_id_first() -> anyhow
 }
 
 #[tokio::test]
+async fn given_consumed_item_when_list_by_project_then_excluded() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let pid = insert_project(db.pool(), "p").await?;
+    let issue_id = issues::create(db.pool(), pid, "promoted", None, TS).await?;
+    let consumed = backlog::add(db.pool(), pid, "consumed", Source::Human, None, TS).await?;
+    let live = backlog::add(db.pool(), pid, "live", Source::Human, None, TS).await?;
+    backlog::mark_consumed(db.pool(), consumed, issue_id, TS2).await?;
+
+    let ids: Vec<i64> = backlog::list_by_project(db.pool(), pid)
+        .await?
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+
+    assert_eq!(ids, vec![live]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn given_mixed_approval_items_when_list_by_approval_then_only_that_approval(
 ) -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
@@ -1493,6 +1813,25 @@ async fn given_mixed_approval_items_when_list_by_approval_then_only_that_approva
         .map(|i| i.id)
         .collect();
     assert_eq!(ids, vec![approved]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_consumed_item_when_list_by_approval_then_excluded() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let pid = insert_project(db.pool(), "p").await?;
+    let issue_id = issues::create(db.pool(), pid, "promoted", None, TS).await?;
+    let consumed = backlog::add(db.pool(), pid, "consumed", Source::Human, None, TS).await?;
+    let live = backlog::add(db.pool(), pid, "live", Source::Human, None, TS).await?;
+    backlog::mark_consumed(db.pool(), consumed, issue_id, TS2).await?;
+
+    let ids: Vec<i64> = backlog::list_by_approval(db.pool(), pid, Approval::Approved)
+        .await?
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+
+    assert_eq!(ids, vec![live]);
     Ok(())
 }
 
@@ -1709,7 +2048,7 @@ async fn given_working_phase_issue_when_steering_added_then_get_returns_note() -
 {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await?;
     let s = steering::get(db.pool(), sid)
         .await?
@@ -1719,10 +2058,31 @@ async fn given_working_phase_issue_when_steering_added_then_get_returns_note() -
 }
 
 #[tokio::test]
+async fn given_ready_to_merge_issue_when_steering_added_then_get_returns_note() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    let pid = insert_project(db.pool(), "p").await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::ReadyToMerge).await?;
+    let sid = steering::add(
+        db.pool(),
+        iid,
+        SteeringSource::Human,
+        "verify one more case before merge",
+        TS,
+    )
+    .await?;
+    let s = steering::get(db.pool(), sid)
+        .await?
+        .expect("steering exists");
+    assert_eq!(s.note, "verify one more case before merge");
+    Ok(())
+}
+
+#[tokio::test]
 async fn given_new_steering_when_added_then_not_consumed() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await?;
     let s = steering::get(db.pool(), sid)
         .await?
@@ -1736,7 +2096,7 @@ async fn given_steering_added_when_issue_read_then_has_pending_steering_true() -
 {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await?;
     let issue = issues::get(db.pool(), iid).await?.expect("issue exists");
     assert!(
@@ -1747,22 +2107,23 @@ async fn given_steering_added_when_issue_read_then_has_pending_steering_true() -
 }
 
 #[tokio::test]
-async fn given_planned_issue_when_steering_added_then_err() -> anyhow::Result<()> {
-    // Structurally valid but semantically wrong: PLANNED is not a working phase,
+async fn given_plan_ready_issue_when_steering_added_then_err() -> anyhow::Result<()> {
+    // Structurally valid but semantically wrong: PLAN_READY is not a working phase,
     // so the steering guard must reject it.
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Planned).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::PlanReady).await?;
     let res = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await;
-    assert!(res.is_err(), "steering into a PLANNED issue must Err");
+    assert!(res.is_err(), "steering into a PLAN_READY issue must Err");
     Ok(())
 }
 
 #[tokio::test]
-async fn given_planned_issue_when_steering_add_fails_then_flag_stays_false() -> anyhow::Result<()> {
+async fn given_plan_ready_issue_when_steering_add_fails_then_flag_stays_false() -> anyhow::Result<()>
+{
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Planned).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::PlanReady).await?;
     let _ = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await;
     let issue = issues::get(db.pool(), iid).await?.expect("issue exists");
     assert!(
@@ -1791,7 +2152,7 @@ async fn given_no_steering_with_id_when_get_then_none() -> anyhow::Result<()> {
 async fn given_no_steering_when_list_pending_then_empty() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     assert!(steering::list_pending(db.pool(), iid).await?.is_empty());
     Ok(())
 }
@@ -1801,7 +2162,7 @@ async fn given_multiple_pending_steering_when_list_pending_then_oldest_id_first(
 ) -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let a = steering::add(db.pool(), iid, SteeringSource::Human, "first", TS).await?;
     let b = steering::add(db.pool(), iid, SteeringSource::Human, "second", TS).await?;
     let ids: Vec<i64> = steering::list_pending(db.pool(), iid)
@@ -1817,7 +2178,7 @@ async fn given_multiple_pending_steering_when_list_pending_then_oldest_id_first(
 async fn given_pending_steering_when_consume_all_then_list_pending_empty() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     steering::add(db.pool(), iid, SteeringSource::Human, "a", TS).await?;
     steering::add(db.pool(), iid, SteeringSource::Human, "b", TS).await?;
     steering::consume_all(db.pool(), iid, TS2).await?;
@@ -1829,7 +2190,7 @@ async fn given_pending_steering_when_consume_all_then_list_pending_empty() -> an
 async fn given_consumed_steering_when_get_then_consumed_at_is_now() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "a", TS).await?;
     steering::consume_all(db.pool(), iid, TS2).await?;
     let s = steering::get(db.pool(), sid)
@@ -1843,7 +2204,7 @@ async fn given_consumed_steering_when_get_then_consumed_at_is_now() -> anyhow::R
 async fn given_consume_all_when_done_then_issue_flag_cleared() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     steering::add(db.pool(), iid, SteeringSource::Human, "a", TS).await?;
     steering::consume_all(db.pool(), iid, TS2).await?;
     let issue = issues::get(db.pool(), iid).await?.expect("issue exists");
@@ -1859,7 +2220,7 @@ async fn given_pending_steering_when_remove_pending_then_list_pending_empty() ->
 {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "a", TS).await?;
     steering::remove_pending(db.pool(), sid).await?;
     assert!(steering::list_pending(db.pool(), iid).await?.is_empty());
@@ -1870,7 +2231,7 @@ async fn given_pending_steering_when_remove_pending_then_list_pending_empty() ->
 async fn given_already_consumed_steering_when_remove_pending_then_err() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "a", TS).await?;
     steering::consume_all(db.pool(), iid, TS2).await?;
     let res = steering::remove_pending(db.pool(), sid).await;
@@ -1914,10 +2275,10 @@ async fn given_bogus_or_empty_when_steering_source_from_str_then_none() -> anyho
 
 #[tokio::test]
 async fn given_audit_issue_when_steering_added_then_get_returns_some() -> anyhow::Result<()> {
-    // AUDIT is a working phase, so the real DB guard must accept steering.
+    // AUDITING is a working phase, so the real DB guard must accept steering.
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Audit).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Auditing).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "recheck", TS).await?;
     assert!(steering::get(db.pool(), sid).await?.is_some());
     Ok(())
@@ -1940,7 +2301,7 @@ async fn given_consumed_steering_when_consume_all_again_then_consumed_at_not_res
     // A second consume_all at a later clock must not re-stamp an already-consumed note.
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
-    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Implementing).await?;
+    let iid = insert_issue_at(db.pool(), pid, IssueStatus::Working).await?;
     let sid = steering::add(db.pool(), iid, SteeringSource::Human, "a", TS).await?;
     steering::consume_all(db.pool(), iid, TS2).await?;
     steering::consume_all(db.pool(), iid, TS2 + 1).await?;
@@ -1978,6 +2339,7 @@ async fn given_completion_policy_some_auto_when_created_then_completion_policy_i
             name: "proj_auto_policy",
             repo_path: "/repo",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -1985,6 +2347,8 @@ async fn given_completion_policy_some_auto_when_created_then_completion_policy_i
             completion_policy: Some(CompletionPolicy::Auto),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2004,6 +2368,7 @@ async fn given_completion_policy_some_auto_when_created_then_plan_gate_sibling_s
             name: "proj_auto_sibling_plan",
             repo_path: "/repo",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -2011,6 +2376,8 @@ async fn given_completion_policy_some_auto_when_created_then_plan_gate_sibling_s
             completion_policy: Some(CompletionPolicy::Auto),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2030,6 +2397,7 @@ async fn given_completion_policy_some_auto_when_created_then_soft_timeout_siblin
             name: "proj_auto_sibling_soft",
             repo_path: "/repo",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -2037,6 +2405,8 @@ async fn given_completion_policy_some_auto_when_created_then_soft_timeout_siblin
             completion_policy: Some(CompletionPolicy::Auto),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2056,6 +2426,7 @@ async fn given_plan_gate_timeout_some_zero_when_created_then_plan_gate_is_0() ->
             name: "proj_plan_gate_zero",
             repo_path: "/repo",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -2063,6 +2434,8 @@ async fn given_plan_gate_timeout_some_zero_when_created_then_plan_gate_is_0() ->
             completion_policy: None,
             plan_gate_timeout_min: Some(0),
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2082,6 +2455,7 @@ async fn given_plan_gate_timeout_some_zero_when_created_then_completion_policy_s
             name: "proj_plan_gate_zero_sibling",
             repo_path: "/repo",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -2089,6 +2463,8 @@ async fn given_plan_gate_timeout_some_zero_when_created_then_completion_policy_s
             completion_policy: None,
             plan_gate_timeout_min: Some(0),
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2108,6 +2484,7 @@ async fn given_soft_timeout_30_and_policy_soft_when_created_then_soft_timeout_is
             name: "proj_soft_30",
             repo_path: "/repo",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -2115,6 +2492,8 @@ async fn given_soft_timeout_30_and_policy_soft_when_created_then_soft_timeout_is
             completion_policy: Some(CompletionPolicy::Soft),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: Some(30),
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2134,6 +2513,7 @@ async fn given_soft_timeout_30_and_policy_soft_when_created_then_completion_poli
             name: "proj_soft_30_policy",
             repo_path: "/repo",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -2141,6 +2521,8 @@ async fn given_soft_timeout_30_and_policy_soft_when_created_then_completion_poli
             completion_policy: Some(CompletionPolicy::Soft),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: Some(30),
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2160,6 +2542,7 @@ async fn given_all_three_overrides_when_created_then_each_persists_independently
             name: "proj_trio",
             repo_path: "/r",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -2167,6 +2550,8 @@ async fn given_all_three_overrides_when_created_then_each_persists_independently
             completion_policy: Some(CompletionPolicy::Soft),
             plan_gate_timeout_min: Some(0),
             completion_soft_timeout_min: Some(45),
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2195,6 +2580,7 @@ async fn given_negative_plan_gate_timeout_override_when_created_then_stored_verb
             name: "proj_neg",
             repo_path: "/r",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -2202,6 +2588,8 @@ async fn given_negative_plan_gate_timeout_override_when_created_then_stored_verb
             completion_policy: None,
             plan_gate_timeout_min: Some(-5),
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2224,6 +2612,7 @@ async fn given_soft_timeout_override_alone_when_created_then_persists_and_policy
             name: "proj_soft_alone",
             repo_path: "/r",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -2231,6 +2620,8 @@ async fn given_soft_timeout_override_alone_when_created_then_persists_and_policy
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: Some(45),
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -2244,6 +2635,214 @@ async fn given_soft_timeout_override_alone_when_created_then_persists_and_policy
         ),
         (CompletionPolicy::Manual, 10, 45)
     );
+    Ok(())
+}
+
+// ===========================================================================
+// arsenal
+// ===========================================================================
+
+#[tokio::test]
+async fn given_open_memory_db_when_list_arsenal_presets_then_builtin_names_are_seeded(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let presets = arsenal::list(db.pool()).await?;
+    let names: Vec<_> = presets.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["claude", "codex"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_missing_arsenal_name_when_get_by_name_then_none() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let preset = arsenal::get_by_name(db.pool(), "missing").await?;
+    assert!(preset.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_new_arsenal_preset_when_upserted_then_get_by_name_returns_it() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    let id = upsert_preset(db.pool(), "local").await?;
+    let preset = arsenal::get_by_name(db.pool(), "local")
+        .await?
+        .expect("preset exists");
+    assert_eq!(
+        (preset.id, preset.main_agent_cmd.as_str()),
+        (id, "main {prompt}")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_existing_custom_arsenal_preset_when_upserted_then_same_id_is_returned(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let first = upsert_preset(db.pool(), "local").await?;
+    let second = arsenal::upsert(
+        db.pool(),
+        NewArsenalPreset {
+            name: "local",
+            main_agent_cmd: "main2",
+            plan_agent_cmd: "plan2",
+            work_agent_cmd: "work2",
+            review_agent_cmd: None,
+        },
+        TS2,
+    )
+    .await?;
+    assert_eq!(second, first);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_existing_custom_arsenal_preset_when_upserted_then_command_is_updated(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    upsert_preset(db.pool(), "local").await?;
+    arsenal::upsert(
+        db.pool(),
+        NewArsenalPreset {
+            name: "local",
+            main_agent_cmd: "main2",
+            plan_agent_cmd: "plan2",
+            work_agent_cmd: "work2",
+            review_agent_cmd: None,
+        },
+        TS2,
+    )
+    .await?;
+    let preset = arsenal::get_by_name(db.pool(), "local")
+        .await?
+        .expect("preset exists");
+    assert_eq!(preset.main_agent_cmd, "main2");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_blank_trimmed_arsenal_name_when_upserted_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let err = arsenal::upsert(
+        db.pool(),
+        NewArsenalPreset {
+            name: "  ",
+            main_agent_cmd: "main",
+            plan_agent_cmd: "plan",
+            work_agent_cmd: "work",
+            review_agent_cmd: None,
+        },
+        TS,
+    )
+    .await
+    .expect_err("blank name must be rejected");
+    assert!(err.to_string().contains("name is required"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_blank_trimmed_main_command_when_upserted_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let err = arsenal::upsert(
+        db.pool(),
+        NewArsenalPreset {
+            name: "local",
+            main_agent_cmd: " ",
+            plan_agent_cmd: "plan",
+            work_agent_cmd: "work",
+            review_agent_cmd: None,
+        },
+        TS,
+    )
+    .await
+    .expect_err("blank main command must be rejected");
+    assert!(err.to_string().contains("commands are required"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_blank_trimmed_plan_command_when_upserted_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let err = arsenal::upsert(
+        db.pool(),
+        NewArsenalPreset {
+            name: "local",
+            main_agent_cmd: "main",
+            plan_agent_cmd: " ",
+            work_agent_cmd: "work",
+            review_agent_cmd: None,
+        },
+        TS,
+    )
+    .await
+    .expect_err("blank plan command must be rejected");
+    assert!(err.to_string().contains("commands are required"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_blank_trimmed_work_command_when_upserted_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let err = arsenal::upsert(
+        db.pool(),
+        NewArsenalPreset {
+            name: "local",
+            main_agent_cmd: "main",
+            plan_agent_cmd: "plan",
+            work_agent_cmd: " ",
+            review_agent_cmd: None,
+        },
+        TS,
+    )
+    .await
+    .expect_err("blank work command must be rejected");
+    assert!(err.to_string().contains("commands are required"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_builtin_arsenal_name_when_upserted_then_builtin_becomes_false() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    arsenal::upsert(
+        db.pool(),
+        NewArsenalPreset {
+            name: "codex",
+            main_agent_cmd: "custom-main",
+            plan_agent_cmd: "custom-plan",
+            work_agent_cmd: "custom-work",
+            review_agent_cmd: None,
+        },
+        TS2,
+    )
+    .await?;
+    let preset = arsenal::get_by_name(db.pool(), "codex")
+        .await?
+        .expect("preset exists");
+    assert!(!preset.builtin);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_builtin_arsenal_name_when_upserted_then_new_command_persists() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    arsenal::upsert(
+        db.pool(),
+        NewArsenalPreset {
+            name: "codex",
+            main_agent_cmd: "custom-main",
+            plan_agent_cmd: "custom-plan",
+            work_agent_cmd: "custom-work",
+            review_agent_cmd: None,
+        },
+        TS2,
+    )
+    .await?;
+    let preset = arsenal::get_by_name(db.pool(), "codex")
+        .await?
+        .expect("preset exists");
+    assert_eq!(preset.main_agent_cmd, "custom-main");
     Ok(())
 }
 
@@ -2264,6 +2863,70 @@ async fn given_routine_main_job_when_enqueued_then_recent_by_project_returns_que
     assert_eq!(jobs[0].id, job_id);
     assert_eq!(jobs[0].status, MainJobStatus::Queued);
     assert_eq!(jobs[0].queued_at, TS);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_ask_answers_when_list_by_project_then_newest_first() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "ask-project").await?;
+    let older = ask_answers::create(
+        db.pool(),
+        ask_answers::NewAskAnswer {
+            project_id,
+            mode: AskMode::Recall,
+            question: "what is next?",
+            answer: "older answer",
+            context_summary: Some("ctx"),
+            log_path: Some("target/auwsx-test/ask.log"),
+        },
+        TS,
+    )
+    .await?;
+    let newer = ask_answers::create(
+        db.pool(),
+        ask_answers::NewAskAnswer {
+            project_id,
+            mode: AskMode::Seek,
+            question: "what is blocked?",
+            answer: "newer answer",
+            context_summary: None,
+            log_path: None,
+        },
+        TS2,
+    )
+    .await?;
+
+    let answers = ask_answers::list_by_project(db.pool(), project_id, 10).await?;
+
+    assert_eq!(
+        answers.iter().map(|a| a.id).collect::<Vec<_>>(),
+        vec![newer, older]
+    );
+    assert_eq!(answers[0].mode, AskMode::Seek);
+    assert_eq!(answers[0].answer, "newer answer");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_ask_mode_variants_when_roundtripped_then_unchanged() -> anyhow::Result<()> {
+    for v in [AskMode::Recall, AskMode::Seek] {
+        assert_eq!(AskMode::parse(v.as_str()), Some(v), "{v:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_ask_mode_as_str_when_checked_then_matches_spec_ids() -> anyhow::Result<()> {
+    assert_eq!(AskMode::Recall.as_str(), "recall");
+    assert_eq!(AskMode::Seek.as_str(), "seek");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_bogus_or_empty_when_ask_mode_parse_then_none() -> anyhow::Result<()> {
+    assert_eq!(AskMode::parse("bogus"), None);
+    assert_eq!(AskMode::parse(""), None);
     Ok(())
 }
 
@@ -2315,6 +2978,78 @@ async fn given_non_terminal_status_when_finish_main_job_then_err() -> anyhow::Re
 
     assert!(
         err.to_string().contains("terminal"),
+        "unexpected error: {err:#}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_seeded_db_when_get_global_settings_then_returns_singleton() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+
+    let settings = global_settings::get(db.pool()).await?;
+
+    assert!(
+        settings.pipeline_ux_guidance.contains("operator console"),
+        "seeded guidance should preserve the auwsx UI standard"
+    );
+    assert!(
+        settings
+            .pipeline_ux_guidance
+            .contains("avoid duplicate paths"),
+        "seeded guidance should guard against duplicated interaction paths"
+    );
+    assert_eq!(settings.updated_at, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_global_guidance_with_outer_whitespace_when_updated_then_stores_trimmed(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+
+    global_settings::update_pipeline_ux_guidance(db.pool(), "  durable guidance\n", TS).await?;
+    let settings = global_settings::get(db.pool()).await?;
+
+    assert_eq!(settings.pipeline_ux_guidance, "durable guidance");
+    assert_eq!(settings.updated_at, TS);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_global_guidance_over_limit_when_updated_then_err_and_existing_value_survives(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    global_settings::update_pipeline_ux_guidance(db.pool(), "keep", TS).await?;
+    let too_long = "x".repeat(PIPELINE_UX_GUIDANCE_MAX_CHARS + 1);
+
+    let err = global_settings::update_pipeline_ux_guidance(db.pool(), &too_long, TS2)
+        .await
+        .expect_err("overlong guidance must be rejected before persistence");
+    let settings = global_settings::get(db.pool()).await?;
+
+    assert!(
+        err.to_string().contains("at most"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(settings.pipeline_ux_guidance, "keep");
+    assert_eq!(settings.updated_at, TS);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_missing_global_settings_singleton_when_updated_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    sqlx::query("DELETE FROM global_settings WHERE id = 1")
+        .execute(db.pool())
+        .await?;
+
+    let err = global_settings::update_pipeline_ux_guidance(db.pool(), "x", TS)
+        .await
+        .expect_err("missing singleton must not look like a successful update");
+
+    assert!(
+        err.to_string().contains("singleton missing"),
         "unexpected error: {err:#}"
     );
     Ok(())

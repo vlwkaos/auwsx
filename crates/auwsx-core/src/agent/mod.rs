@@ -76,12 +76,12 @@ pub struct AgentSpec<'a> {
     pub prompt: &'a str,
     /// Working directory for the child (the issue's worktree).
     pub cwd: &'a Path,
-    /// Combined stdout+stderr are captured here (truncated on open).
+    /// Combined stdout+stderr are captured here.
     pub log_path: &'a Path,
     /// Hard deadline; on expiry the child is killed and `Timeout` returned.
     pub timeout: Duration,
-    /// Extra environment for the child (e.g. `AUWSX_SOCK`, `AUWSX_ISSUE_ID`),
-    /// layered on top of the inherited environment.
+    /// Extra environment for the child. Issue workers receive an issue-local
+    /// control outbox, not unrestricted daemon socket access.
     pub env: &'a [(String, String)],
 }
 
@@ -114,6 +114,46 @@ pub fn build_argv(cmd_template: &str, prompt: &str) -> Result<(Vec<String>, bool
     Ok((argv, !substituted))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AgentTemplateVars<'a> {
+    pub daemon_socket: Option<&'a Path>,
+    pub control_dir: Option<&'a Path>,
+}
+
+impl<'a> AgentTemplateVars<'a> {
+    pub fn main_job(daemon_socket: &'a Path) -> Self {
+        Self {
+            daemon_socket: Some(daemon_socket),
+            control_dir: None,
+        }
+    }
+
+    pub fn issue(daemon_socket: &'a Path, control_dir: &'a Path) -> Self {
+        Self {
+            daemon_socket: Some(daemon_socket),
+            control_dir: Some(control_dir),
+        }
+    }
+}
+
+/// Expand auwsx-owned placeholders before argv splitting. These are not shell
+/// variables: templates are split directly and never run through a shell.
+pub fn expand_cmd_template(cmd_template: &str, vars: AgentTemplateVars<'_>) -> String {
+    let socket_dir = vars
+        .daemon_socket
+        .and_then(Path::parent)
+        .map(|path| path.to_string_lossy().to_string())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+    let control_dir = vars
+        .control_dir
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| socket_dir.clone());
+    cmd_template
+        .replace("{auwsx_socket_dir}", &socket_dir)
+        .replace("{auwsx_control_dir}", &control_dir)
+}
+
 /// Spawn the agent, capture output to `log_path`, and wait (bounded by
 /// `timeout`). A spawn failure is returned as an `Error` outcome (so the caller
 /// can record it to `agent_runs`), not a hard error; only set-up I/O failures
@@ -125,8 +165,11 @@ pub async fn run(spec: AgentSpec<'_>) -> Result<AgentOutcome> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating log dir {}", parent.display()))?;
     }
-    let log = std::fs::File::create(spec.log_path)
-        .with_context(|| format!("creating log file {}", spec.log_path.display()))?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(spec.log_path)
+        .with_context(|| format!("opening log file {}", spec.log_path.display()))?;
     let log_err = log
         .try_clone()
         .context("cloning log file handle for stderr")?;
@@ -228,7 +271,46 @@ pub fn subprocess_executor() -> std::sync::Arc<dyn AgentExecutor> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::path::Path;
+
     // build_argv is pure; its substitution/stdin contract plus the spawn
     // outcomes (exit/timeout/spawn-error) are exercised in tests/agent.rs
     // against real `sh`/`sleep` commands.
+
+    #[test]
+    fn given_socket_dir_placeholder_when_expanded_then_uses_parent_dir() {
+        let got = expand_cmd_template(
+            "codex exec --add-dir {auwsx_socket_dir} --json {prompt}",
+            AgentTemplateVars::main_job(Path::new("/x/y/auwsx.sock")),
+        );
+
+        assert_eq!(got, "codex exec --add-dir /x/y --json {prompt}");
+    }
+
+    #[test]
+    fn given_control_dir_placeholder_when_expanded_then_uses_issue_control_dir() {
+        let got = expand_cmd_template(
+            "codex exec --add-dir {auwsx_control_dir} --json {prompt}",
+            AgentTemplateVars::issue(
+                Path::new("/daemon/auwsx.sock"),
+                Path::new("/worktree/.auwsx/control"),
+            ),
+        );
+
+        assert_eq!(
+            got,
+            "codex exec --add-dir /worktree/.auwsx/control --json {prompt}"
+        );
+    }
+
+    #[test]
+    fn given_no_socket_parent_when_expanded_then_uses_current_dir() {
+        let got = expand_cmd_template(
+            "cmd {auwsx_socket_dir}",
+            AgentTemplateVars::main_job(Path::new("auwsx.sock")),
+        );
+
+        assert_eq!(got, "cmd .");
+    }
 }

@@ -10,9 +10,11 @@
 //! - [`main_jobs`]  — main-workspace lifecycle, queued ops (Plan Step 3.5)
 //! - [`main_job_runner`] — main-job agent execution + artifact recording
 //! - [`routines`]   — cron routines (incl. built-ins) (Plan Step 3.6)
-//! - [`backlog`]    — backlog_items CRUD + triage/consolidation (Plan Step 3.7)
+//! - [`backlog`]    — backlog_items CRUD + admission gate (Plan Step 3.7)
+//! - [`routing`]    — backlog routing into issues / queue messages
 //! - [`steering`]   — append-only steering into in-flight issues (Plan Step 3.8)
 //! - [`inbox`]      — file-watch async input channel (Plan Step 3.65)
+//! - [`issue_control`] — pure operator lifecycle policy for issues/projects
 //! - [`notify`]     — system notifications (Plan Step 7 / north star §5)
 //! - [`launchd`]    — daemon install/uninstall (Plan Step 7 / north star §1)
 //! - [`agent`]      — `AgentRunner` trait + 3 impls (Plan Step 4)
@@ -22,22 +24,30 @@
 //! - [`ipc`]        — Unix-socket Command/Event protocol
 //! - [`config`]     — global + per-project TOML
 
+#![allow(clippy::should_implement_trait)]
+
 pub mod agent;
 pub mod artifacts;
 pub mod backlog;
 pub mod clock;
 pub mod config;
+pub mod control_outbox;
 pub mod db;
 pub mod events;
 pub mod inbox;
 pub mod ipc;
+pub mod issue_control;
 pub mod launchd;
 pub mod main_job_runner;
 pub mod main_jobs;
+pub mod memory;
 pub mod notify;
 pub mod pipeline;
+pub mod project_setup;
 pub mod prompt;
 pub mod routines;
+pub mod routing;
+pub mod schedule;
 pub mod scheduler;
 pub mod skills;
 pub mod state;

@@ -26,15 +26,25 @@ use std::str::FromStr;
 // of their own. (backlog_items + steering live in the top-level `backlog` /
 // `steering` modules, alongside their gating logic.)
 pub mod agent_runs;
+pub mod arsenal;
+pub mod ask_answers;
 pub mod findings;
+pub mod global_settings;
 pub mod issues;
+pub mod memory_presets;
+pub mod profiles;
 pub mod projects;
 pub mod scheduler_runs;
 pub mod subtasks;
 
 pub use agent_runs::AgentRun;
+pub use arsenal::ArsenalPreset;
+pub use ask_answers::AskAnswer;
 pub use findings::Finding;
+pub use global_settings::GlobalSettings;
 pub use issues::Issue;
+pub use memory_presets::MemoryPreset;
+pub use profiles::Profile;
 pub use projects::Project;
 pub use scheduler_runs::SchedulerRun;
 pub use subtasks::Subtask;

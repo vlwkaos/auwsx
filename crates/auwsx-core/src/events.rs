@@ -15,10 +15,18 @@ pub enum Event {
         issue_id: i64,
         status: IssueStatus,
     },
+    IssueRemoved {
+        issue_id: i64,
+        project_id: i64,
+    },
     IssueLog {
         issue_id: i64,
         phase: String,
         chunk: String,
+    },
+    AskAnswered {
+        answer_id: i64,
+        project_id: i64,
     },
     BacklogChanged {
         item_id: i64,

@@ -59,6 +59,7 @@ pub struct AgentRun {
     pub exit_kind: Option<ExitKind>,
     pub prompt_path: Option<String>,
     pub log_path: Option<String>,
+    pub phase_report: Option<String>,
     pub spawned_at: i64,
     pub exited_at: Option<i64>,
     pub note: Option<String>,
@@ -90,6 +91,7 @@ impl AgentRun {
             exit_kind,
             prompt_path: row.try_get("prompt_path")?,
             log_path: row.try_get("log_path")?,
+            phase_report: row.try_get("phase_report")?,
             spawned_at: row.try_get("spawned_at")?,
             exited_at: row.try_get("exited_at")?,
             note: row.try_get("note")?,
@@ -184,6 +186,19 @@ pub async fn set_pid(pool: &SqlitePool, run_id: i64, pid: i64) -> Result<()> {
     Ok(())
 }
 
+pub async fn set_phase_report(pool: &SqlitePool, run_id: i64, phase_report: &str) -> Result<()> {
+    let n = sqlx::query("UPDATE agent_runs SET phase_report = ? WHERE id = ?")
+        .bind(phase_report)
+        .bind(run_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(anyhow!("agent_run {run_id} not found"));
+    }
+    Ok(())
+}
+
 pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<AgentRun>> {
     let row = sqlx::query("SELECT * FROM agent_runs WHERE id = ?")
         .bind(id)
@@ -199,6 +214,45 @@ pub async fn list_by_issue(pool: &SqlitePool, issue_id: i64) -> Result<Vec<Agent
         .fetch_all(pool)
         .await?;
     rows.iter().map(AgentRun::from_row).collect()
+}
+
+/// Issue runs that were opened but never closed. On daemon startup these are
+/// treated as interrupted by a previous daemon exit/crash; the in-memory
+/// running set cannot be reconstructed from them safely.
+pub async fn list_open_issue_runs(pool: &SqlitePool) -> Result<Vec<AgentRun>> {
+    let rows = sqlx::query(
+        "SELECT * FROM agent_runs
+         WHERE issue_id IS NOT NULL AND exited_at IS NULL
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(AgentRun::from_row).collect()
+}
+
+/// Main-job runs that were opened but never closed.
+pub async fn list_open_main_job_runs(pool: &SqlitePool) -> Result<Vec<AgentRun>> {
+    let rows = sqlx::query(
+        "SELECT * FROM agent_runs
+         WHERE main_job_id IS NOT NULL AND exited_at IS NULL
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(AgentRun::from_row).collect()
+}
+
+pub async fn latest_log_path_by_issue(pool: &SqlitePool, issue_id: i64) -> Result<Option<String>> {
+    let path = sqlx::query_scalar(
+        "SELECT log_path FROM agent_runs
+         WHERE issue_id = ? AND log_path IS NOT NULL
+         ORDER BY id DESC
+         LIMIT 1",
+    )
+    .bind(issue_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(path)
 }
 
 /// Recent runs for a project, newest first. Includes issue runs through the

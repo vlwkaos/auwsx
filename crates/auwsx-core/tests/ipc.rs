@@ -15,10 +15,12 @@
 
 use auwsx_core::backlog::{self, Approval, Source};
 use auwsx_core::db::agent_runs::{self, Role, StartRun};
+use auwsx_core::db::arsenal::ArsenalPreset;
 use auwsx_core::db::findings::Severity;
+use auwsx_core::db::global_settings::{GlobalSettings, PIPELINE_UX_GUIDANCE_MAX_CHARS};
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode};
 use auwsx_core::db::scheduler_runs::{self, SchedulerRunSource};
-use auwsx_core::db::{issues, Db};
+use auwsx_core::db::{issues, subtasks, Db};
 use auwsx_core::events::{self, Event};
 use auwsx_core::ipc::{self, Command, Response};
 use auwsx_core::routines::RoutineType;
@@ -73,6 +75,13 @@ fn want_err(r: Response) -> String {
     }
 }
 
+fn want_global_settings(r: Response) -> GlobalSettings {
+    match r {
+        Response::GlobalSettings(settings) => settings,
+        other => panic!("expected Response::GlobalSettings, got {other:?}"),
+    }
+}
+
 fn is_ok(r: &Response) -> bool {
     matches!(r, Response::Ok)
 }
@@ -94,6 +103,7 @@ async fn add_project(db: &Db, bus: &tokio::sync::broadcast::Sender<Event>, name:
                 name: name.to_string(),
                 repo_path: "/repo".to_string(),
                 default_branch: "main".to_string(),
+                arsenal_preset_name: None,
                 main_agent_cmd: "m {prompt}".to_string(),
                 plan_agent_cmd: "p {prompt}".to_string(),
                 work_agent_cmd: "w {prompt}".to_string(),
@@ -101,6 +111,8 @@ async fn add_project(db: &Db, bus: &tokio::sync::broadcast::Sender<Event>, name:
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
+                schedule_interval_min: None,
+                schedule_cron: None,
             },
         )
         .await,
@@ -117,6 +129,7 @@ async fn backlog_seed_project(db: &Db) -> anyhow::Result<i64> {
             name: "p",
             repo_path: "/r",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
@@ -124,6 +137,8 @@ async fn backlog_seed_project(db: &Db) -> anyhow::Result<i64> {
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -136,6 +151,20 @@ async fn issue_at(db: &Db, project_id: i64, status: IssueStatus) -> anyhow::Resu
     let id = issues::create(db.pool(), project_id, "t", None, TS).await?;
     issues::force_status(db.pool(), id, status, TS).await?;
     Ok(id)
+}
+
+fn arsenal_fixture(name: &str) -> ArsenalPreset {
+    ArsenalPreset {
+        id: 7,
+        name: name.to_string(),
+        main_agent_cmd: "main {prompt}".to_string(),
+        plan_agent_cmd: "plan {prompt}".to_string(),
+        work_agent_cmd: "work {prompt}".to_string(),
+        review_agent_cmd: Some("review {prompt}".to_string()),
+        builtin: false,
+        created_at: TS,
+        updated_at: TS,
+    }
 }
 
 // ===========================================================================
@@ -167,6 +196,288 @@ async fn given_manual_run_command_without_scheduler_when_dispatched_then_err() -
 }
 
 #[test]
+fn given_list_arsenal_command_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
+    let command = Command::ListArsenalPresets;
+    let json = serde_json::to_string(&command)?;
+    let got: Command = serde_json::from_str(&json)?;
+    assert_eq!(got, command);
+    Ok(())
+}
+
+#[test]
+fn given_upsert_arsenal_command_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
+    let command = Command::UpsertArsenalPreset {
+        name: "local".to_string(),
+        main_agent_cmd: "main".to_string(),
+        plan_agent_cmd: "plan".to_string(),
+        work_agent_cmd: "work".to_string(),
+        review_agent_cmd: None,
+    };
+    let json = serde_json::to_string(&command)?;
+    let got: Command = serde_json::from_str(&json)?;
+    assert_eq!(got, command);
+    Ok(())
+}
+
+#[test]
+fn given_global_settings_commands_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
+    let commands = vec![
+        Command::GetGlobalSettings,
+        Command::UpdateGlobalSettings {
+            memory_preset_name: "portable-markdown".to_string(),
+            pipeline_ux_guidance: "bounded operator guidance".to_string(),
+        },
+        Command::ListMemoryPresets,
+    ];
+
+    for command in commands {
+        let json = serde_json::to_string(&command)?;
+        let got: Command = serde_json::from_str(&json)?;
+        assert_eq!(got, command);
+    }
+    Ok(())
+}
+
+#[test]
+fn given_global_settings_response_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
+    let resp = Response::GlobalSettings(GlobalSettings {
+        memory_preset_name: "portable-markdown".to_string(),
+        memory_provider: "portable-markdown".to_string(),
+        pipeline_ux_guidance: "bounded operator guidance".to_string(),
+        updated_at: TS,
+    });
+
+    let json = serde_json::to_string(&resp)?;
+    let got: Response = serde_json::from_str(&json)?;
+
+    let settings = want_global_settings(got);
+    assert_eq!(settings.pipeline_ux_guidance, "bounded operator guidance");
+    assert_eq!(settings.updated_at, TS);
+    Ok(())
+}
+
+#[test]
+fn given_arsenal_presets_response_when_json_roundtripped_then_name_is_preserved(
+) -> anyhow::Result<()> {
+    let expected = arsenal_fixture("local");
+    let resp = Response::ArsenalPresets(vec![expected.clone()]);
+    let json = serde_json::to_string(&resp)?;
+    let got: Response = serde_json::from_str(&json)?;
+    match got {
+        Response::ArsenalPresets(presets) => {
+            assert_eq!(presets.len(), 1);
+            let got = &presets[0];
+            assert_eq!(got.id, expected.id);
+            assert_eq!(got.name, expected.name);
+            assert_eq!(got.main_agent_cmd, expected.main_agent_cmd);
+            assert_eq!(got.plan_agent_cmd, expected.plan_agent_cmd);
+            assert_eq!(got.work_agent_cmd, expected.work_agent_cmd);
+            assert_eq!(got.review_agent_cmd, expected.review_agent_cmd);
+            assert_eq!(got.builtin, expected.builtin);
+            assert_eq!(got.created_at, expected.created_at);
+            assert_eq!(got.updated_at, expected.updated_at);
+        }
+        other => panic!("expected ArsenalPresets, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn given_profile_commands_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
+    let commands = vec![
+        Command::ListProfiles,
+        Command::CreateProfile {
+            name: "ops".to_string(),
+        },
+        Command::RenameProfile {
+            profile_id: 1,
+            name: "renamed".to_string(),
+        },
+        Command::MoveProjectToProfile {
+            project_id: 2,
+            profile_id: 3,
+        },
+        Command::MoveProjectInProfile {
+            project_id: 4,
+            delta: -1,
+        },
+    ];
+
+    for command in commands {
+        let json = serde_json::to_string(&command)?;
+        let got: Command = serde_json::from_str(&json)?;
+        assert_eq!(got, command);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_list_arsenal_presets_when_dispatched_then_returns_arsenal_presets(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let resp = ipc::dispatch(&db, &bus, TS, Command::ListArsenalPresets).await;
+    match resp {
+        Response::ArsenalPresets(presets) => assert_eq!(presets.len(), 2),
+        other => panic!("expected ArsenalPresets, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_get_global_settings_when_dispatched_then_returns_seeded_settings(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+
+    let settings =
+        want_global_settings(ipc::dispatch(&db, &bus, TS, Command::GetGlobalSettings).await);
+
+    assert!(
+        settings.pipeline_ux_guidance.contains("operator console"),
+        "seeded guidance should preserve the auwsx UI standard"
+    );
+    assert_eq!(settings.updated_at, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_update_global_settings_when_dispatched_then_persists_trimmed_guidance(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::UpdateGlobalSettings {
+            memory_preset_name: "portable-markdown".to_string(),
+            pipeline_ux_guidance: "  no duplicate UI paths\n".to_string(),
+        },
+    )
+    .await;
+    assert!(
+        is_ok(&resp),
+        "UpdateGlobalSettings must return Ok, got {resp:?}"
+    );
+    let settings =
+        want_global_settings(ipc::dispatch(&db, &bus, TS, Command::GetGlobalSettings).await);
+
+    assert_eq!(settings.pipeline_ux_guidance, "no duplicate UI paths");
+    assert_eq!(settings.memory_preset_name, "portable-markdown");
+    assert_eq!(settings.updated_at, TS);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_update_global_settings_over_limit_when_dispatched_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let too_long = "x".repeat(PIPELINE_UX_GUIDANCE_MAX_CHARS + 1);
+
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::UpdateGlobalSettings {
+            memory_preset_name: "portable-markdown".to_string(),
+            pipeline_ux_guidance: too_long,
+        },
+    )
+    .await;
+
+    assert!(
+        want_err(resp).contains("at most"),
+        "overlong guidance must surface as Response::Err"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_valid_upsert_arsenal_preset_when_dispatched_then_returns_id() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::UpsertArsenalPreset {
+            name: "local".to_string(),
+            main_agent_cmd: "main".to_string(),
+            plan_agent_cmd: "plan".to_string(),
+            work_agent_cmd: "work".to_string(),
+            review_agent_cmd: None,
+        },
+    )
+    .await;
+    assert!(want_id(resp) > 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_list_memory_presets_when_dispatched_then_includes_builtins() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let resp = ipc::dispatch(&db, &bus, TS, Command::ListMemoryPresets).await;
+    let Response::MemoryPresets(presets) = resp else {
+        panic!("expected MemoryPresets response");
+    };
+    assert!(presets
+        .iter()
+        .any(|preset| preset.name == "portable-markdown"));
+    assert!(presets.iter().any(|preset| preset.name == "auwsx-skills"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_valid_upsert_memory_preset_when_dispatched_then_returns_id() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::UpsertMemoryPreset {
+            name: "custom-memory".to_string(),
+            retrieve_kind: "command".to_string(),
+            retrieve_cmd: Some("mem-get {query}".to_string()),
+            save_kind: "command".to_string(),
+            save_cmd: Some("mem-save {content_file}".to_string()),
+            dream_kind: "portable".to_string(),
+            dream_cmd: None,
+            deepsleep_kind: "portable".to_string(),
+            deepsleep_cmd: None,
+        },
+    )
+    .await;
+    assert!(want_id(resp) > 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_invalid_upsert_arsenal_preset_when_dispatched_then_returns_err() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::UpsertArsenalPreset {
+            name: "local".to_string(),
+            main_agent_cmd: " ".to_string(),
+            plan_agent_cmd: "plan".to_string(),
+            work_agent_cmd: "work".to_string(),
+            review_agent_cmd: None,
+        },
+    )
+    .await;
+    assert!(want_err(resp).contains("commands are required"));
+    Ok(())
+}
+
+#[test]
 fn given_new_operator_commands_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
     let commands = vec![
         Command::UpdateBacklogText {
@@ -174,22 +485,35 @@ fn given_new_operator_commands_when_json_roundtripped_then_unchanged() -> anyhow
             text: "edited".to_string(),
         },
         Command::RunSchedulerOnce { project_id: 2 },
+        Command::ExecuteProject { project_id: 2 },
+        Command::ExecuteIssue { issue_id: 3 },
         Command::RunIssueNow { issue_id: 3 },
+        Command::RetryIssue { issue_id: 3 },
+        Command::ApproveIssueMerge { issue_id: 3 },
+        Command::ApproveProjectMerge { project_id: 2 },
         Command::RunBacklogNow { item_id: 4 },
         Command::RunRoutineNow { routine_id: 5 },
-        Command::CreateRoutine {
+        Command::RemoveProject {
             project_id: 6,
+            shallow: true,
+        },
+        Command::RemoveProject {
+            project_id: 6,
+            shallow: false,
+        },
+        Command::CreateRoutine {
+            project_id: 7,
             name: "r".to_string(),
-            routine_type: RoutineType::Knowledge,
+            output_route: RoutineType::Knowledge,
             prompt: "p".to_string(),
             cron: "0 0 * * * *".to_string(),
             writable_paths: Some("knowledge/".to_string()),
             enabled: true,
         },
         Command::UpdateRoutine {
-            routine_id: 7,
+            routine_id: 8,
             name: "r2".to_string(),
-            routine_type: RoutineType::Idea,
+            output_route: RoutineType::Idea,
             prompt: "p2".to_string(),
             cron: "0 0 * * 1 *".to_string(),
             writable_paths: None,
@@ -231,6 +555,7 @@ async fn given_duplicate_name_when_add_project_then_err() -> anyhow::Result<()> 
             name: "dup".to_string(),
             repo_path: "/r".to_string(),
             default_branch: "main".to_string(),
+            arsenal_preset_name: None,
             main_agent_cmd: "m".to_string(),
             plan_agent_cmd: "p".to_string(),
             work_agent_cmd: "w".to_string(),
@@ -238,6 +563,8 @@ async fn given_duplicate_name_when_add_project_then_err() -> anyhow::Result<()> 
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
     )
     .await;
@@ -307,6 +634,7 @@ async fn given_update_project_when_dispatched_then_config_fields_change() -> any
             name: "configurable-renamed".to_string(),
             repo_path: "/repo2".to_string(),
             default_branch: "trunk".to_string(),
+            arsenal_preset_name: None,
             main_agent_cmd: "main2 {prompt}".to_string(),
             plan_agent_cmd: "plan2 {prompt}".to_string(),
             work_agent_cmd: "work2 {prompt}".to_string(),
@@ -320,9 +648,11 @@ async fn given_update_project_when_dispatched_then_config_fields_change() -> any
             conflict_max_attempts: 8,
             max_concurrency: 9,
             schedule_interval_min: Some(10),
+            schedule_cron: Some("*/10 * * * *".to_string()),
             merge_mode: MergeMode::Pr,
             skill_path: Some("/skills".to_string()),
             deepsleep_interval_days: 11,
+            deepsleep_cron: Some("0 0 */11 * *".to_string()),
         },
     )
     .await;
@@ -715,7 +1045,7 @@ async fn given_only_pending_item_when_triage_then_no_issue_created() -> anyhow::
 // ===========================================================================
 
 #[tokio::test]
-async fn given_approved_item_when_run_triage_then_issue_is_consolidating() -> anyhow::Result<()> {
+async fn given_approved_item_when_run_triage_then_issue_is_new() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
@@ -724,7 +1054,7 @@ async fn given_approved_item_when_run_triage_then_issue_is_consolidating() -> an
     let issue = issues::get(db.pool(), created[0])
         .await?
         .expect("created issue exists");
-    assert_eq!(issue.status, IssueStatus::Consolidating);
+    assert_eq!(issue.status, IssueStatus::New);
     Ok(())
 }
 
@@ -790,7 +1120,7 @@ async fn given_create_routine_when_dispatched_then_list_returns_it() -> anyhow::
             Command::CreateRoutine {
                 project_id: pid,
                 name: "daily".to_string(),
-                routine_type: RoutineType::Report,
+                output_route: RoutineType::Report,
                 prompt: "write report".to_string(),
                 cron: "0 0 * * * *".to_string(),
                 writable_paths: Some("reports/".to_string()),
@@ -806,7 +1136,7 @@ async fn given_create_routine_when_dispatched_then_list_returns_it() -> anyhow::
     assert_eq!(routines.len(), 1);
     assert_eq!(routines[0].id, routine_id);
     assert_eq!(routines[0].name, "daily");
-    assert_eq!(routines[0].routine_type, RoutineType::Report);
+    assert_eq!(routines[0].output_route, RoutineType::Report);
     assert!(routines[0].enabled);
     Ok(())
 }
@@ -825,7 +1155,7 @@ async fn given_update_routine_when_dispatched_then_get_returns_updated_fields() 
             Command::CreateRoutine {
                 project_id: pid,
                 name: "daily".to_string(),
-                routine_type: RoutineType::Report,
+                output_route: RoutineType::Report,
                 prompt: "write report".to_string(),
                 cron: "0 0 * * * *".to_string(),
                 writable_paths: None,
@@ -842,7 +1172,7 @@ async fn given_update_routine_when_dispatched_then_get_returns_updated_fields() 
         Command::UpdateRoutine {
             routine_id,
             name: "weekly ideas".to_string(),
-            routine_type: RoutineType::Idea,
+            output_route: RoutineType::Idea,
             prompt: "find ideas".to_string(),
             cron: "0 0 * * 1 *".to_string(),
             writable_paths: Some("ideas/".to_string()),
@@ -855,7 +1185,7 @@ async fn given_update_routine_when_dispatched_then_get_returns_updated_fields() 
     match ipc::dispatch(&db, &bus, TS, Command::GetRoutine { routine_id }).await {
         Response::Routine(Some(r)) => {
             assert_eq!(r.name, "weekly ideas");
-            assert_eq!(r.routine_type, RoutineType::Idea);
+            assert_eq!(r.output_route, RoutineType::Idea);
             assert_eq!(r.prompt, "find ideas");
             assert_eq!(r.cron, "0 0 * * 1 *");
             assert_eq!(r.writable_paths.as_deref(), Some("ideas/"));
@@ -919,9 +1249,9 @@ async fn given_agent_run_log_when_tail_requested_then_reads_recorded_path_only(
             issue_id: Some(issue_id),
             main_job_id: None,
             role: Role::Main,
-            phase: "consolidating",
+            phase: "new",
             agent_cmd: "agent {prompt}",
-            status_before: Some("CONSOLIDATING"),
+            status_before: Some("NEW"),
             pid: None,
             prompt_path: None,
             log_path: Some(&log_str),
@@ -962,9 +1292,9 @@ async fn given_agent_run_without_log_when_tail_requested_then_err() -> anyhow::R
             issue_id: Some(issue_id),
             main_job_id: None,
             role: Role::Main,
-            phase: "consolidating",
+            phase: "new",
             agent_cmd: "agent {prompt}",
-            status_before: Some("CONSOLIDATING"),
+            status_before: Some("NEW"),
             pid: None,
             prompt_path: None,
             log_path: None,
@@ -996,7 +1326,7 @@ async fn given_agent_run_without_log_when_tail_requested_then_err() -> anyhow::R
 // ===========================================================================
 
 #[tokio::test]
-async fn given_add_issue_when_dispatched_then_returns_id() -> anyhow::Result<()> {
+async fn given_add_issue_when_dispatched_then_err() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
@@ -1011,30 +1341,23 @@ async fn given_add_issue_when_dispatched_then_returns_id() -> anyhow::Result<()>
         },
     )
     .await;
-    assert!(want_id(resp) > 0);
+    let err = want_err(resp);
+    assert!(err.contains("agent-derived"));
     Ok(())
 }
 
 #[tokio::test]
-async fn given_add_issue_when_dispatched_then_issue_enters_consolidating() -> anyhow::Result<()> {
+async fn given_approved_item_when_triage_then_issue_enters_new() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let id = want_id(
-        ipc::dispatch(
-            &db,
-            &bus,
-            TS,
-            Command::AddIssue {
-                project_id: pid,
-                title: "t".to_string(),
-                description: None,
-            },
-        )
-        .await,
-    );
+    backlog::add(db.pool(), pid, "t", Source::Human, None, TS).await?;
+    let id = match ipc::dispatch(&db, &bus, TS, Command::Triage { project_id: pid }).await {
+        Response::Triaged { created_issue_ids } => created_issue_ids[0],
+        other => panic!("expected Triaged, got {other:?}"),
+    };
     match ipc::dispatch(&db, &bus, TS, Command::GetIssue { issue_id: id }).await {
-        Response::Issue(i) => assert_eq!(i.expect("present").status, IssueStatus::Consolidating),
+        Response::Issue(i) => assert_eq!(i.expect("present").status, IssueStatus::New),
         other => panic!("expected Issue, got {other:?}"),
     }
     Ok(())
@@ -1058,7 +1381,7 @@ async fn given_mixed_status_issues_when_list_filtered_then_only_that_status() ->
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
     let planning = issue_at(&db, pid, IssueStatus::Planning).await?;
-    issue_at(&db, pid, IssueStatus::Implementing).await?;
+    issue_at(&db, pid, IssueStatus::Working).await?;
     match ipc::dispatch(
         &db,
         &bus,
@@ -1085,7 +1408,7 @@ async fn given_no_status_filter_when_list_issues_then_returns_all() -> anyhow::R
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
     issue_at(&db, pid, IssueStatus::Planning).await?;
-    issue_at(&db, pid, IssueStatus::Implementing).await?;
+    issue_at(&db, pid, IssueStatus::Working).await?;
     match ipc::dispatch(
         &db,
         &bus,
@@ -1106,8 +1429,8 @@ async fn given_no_status_filter_when_list_issues_then_returns_all() -> anyhow::R
 // --- SetIssueStatus: legal / illegal / force / event ----------------------
 
 #[tokio::test]
-async fn given_consolidating_when_set_status_planning_then_ok() -> anyhow::Result<()> {
-    // CONSOLIDATING -> PLANNING is a legal transition.
+async fn given_new_when_set_status_planning_then_ok() -> anyhow::Result<()> {
+    // NEW -> PLANNING is a legal transition.
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
@@ -1157,7 +1480,7 @@ async fn given_legal_set_status_when_dispatched_then_emits_issue_status() -> any
 
 #[tokio::test]
 async fn given_illegal_set_status_unforced_when_dispatched_then_err() -> anyhow::Result<()> {
-    // CONSOLIDATING -> DONE is illegal; force=false must reject.
+    // NEW -> DONE is illegal; force=false must reject.
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
@@ -1198,7 +1521,7 @@ async fn given_illegal_set_status_unforced_when_dispatched_then_status_unchanged
     // Confirm via GetIssue that the rejected transition left status untouched.
     match ipc::dispatch(&db, &bus, TS, Command::GetIssue { issue_id: id }).await {
         Response::Issue(i) => {
-            assert_eq!(i.expect("present").status, IssueStatus::Consolidating)
+            assert_eq!(i.expect("present").status, IssueStatus::New)
         }
         other => panic!("expected Issue, got {other:?}"),
     }
@@ -1283,7 +1606,7 @@ async fn given_add_subtask_when_dispatched_then_returns_id() -> anyhow::Result<(
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Implementing).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Working).await?;
     let resp = ipc::dispatch(
         &db,
         &bus,
@@ -1304,18 +1627,8 @@ async fn given_subtask_added_when_list_subtasks_then_returns_it() -> anyhow::Res
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Implementing).await?;
-    let _ = ipc::dispatch(
-        &db,
-        &bus,
-        TS,
-        Command::AddSubtask {
-            issue_id: iid,
-            ord: 0,
-            text: "step".to_string(),
-        },
-    )
-    .await;
+    let iid = issue_at(&db, pid, IssueStatus::Working).await?;
+    let _ = subtasks::add(db.pool(), iid, 0, "step", TS).await?;
     match ipc::dispatch(&db, &bus, TS, Command::ListSubtasks { issue_id: iid }).await {
         Response::Subtasks(subs) => assert_eq!(subs.len(), 1),
         other => panic!("expected Subtasks, got {other:?}"),
@@ -1328,20 +1641,8 @@ async fn given_subtask_when_complete_subtask_then_ok() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Implementing).await?;
-    let sid = want_id(
-        ipc::dispatch(
-            &db,
-            &bus,
-            TS,
-            Command::AddSubtask {
-                issue_id: iid,
-                ord: 0,
-                text: "step".to_string(),
-            },
-        )
-        .await,
-    );
+    let iid = issue_at(&db, pid, IssueStatus::Working).await?;
+    let sid = subtasks::add(db.pool(), iid, 0, "step", TS).await?;
     let resp = ipc::dispatch(&db, &bus, TS, Command::CompleteSubtask { subtask_id: sid }).await;
     assert!(is_ok(&resp), "CompleteSubtask must return Ok, got {resp:?}");
     Ok(())
@@ -1394,7 +1695,7 @@ async fn given_add_finding_when_dispatched_then_returns_id() -> anyhow::Result<(
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Review).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Reviewing).await?;
     let fid = add_finding(&db, &bus, iid).await;
     assert!(fid > 0);
     Ok(())
@@ -1405,7 +1706,7 @@ async fn given_add_finding_when_dispatched_then_emits_finding_added() -> anyhow:
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Review).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Reviewing).await?;
     let mut rx = bus.subscribe();
     let fid = add_finding(&db, &bus, iid).await;
     match rx.try_recv() {
@@ -1425,7 +1726,7 @@ async fn given_two_findings_when_list_findings_all_then_returns_both() -> anyhow
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Review).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Reviewing).await?;
     add_finding(&db, &bus, iid).await;
     add_finding(&db, &bus, iid).await;
     match ipc::dispatch(
@@ -1450,7 +1751,7 @@ async fn given_accepted_finding_when_list_open_only_then_excluded() -> anyhow::R
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Review).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Reviewing).await?;
     let open = add_finding(&db, &bus, iid).await;
     let accepted = add_finding(&db, &bus, iid).await;
     let _ = ipc::dispatch(
@@ -1488,7 +1789,7 @@ async fn given_open_finding_when_accept_finding_then_ok() -> anyhow::Result<()> 
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Review).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Reviewing).await?;
     let fid = add_finding(&db, &bus, iid).await;
     let resp = ipc::dispatch(
         &db,
@@ -1509,7 +1810,7 @@ async fn given_open_finding_when_reject_finding_then_ok() -> anyhow::Result<()> 
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Review).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Reviewing).await?;
     let fid = add_finding(&db, &bus, iid).await;
     let resp = ipc::dispatch(
         &db,
@@ -1530,7 +1831,7 @@ async fn given_open_finding_when_dismiss_finding_then_ok() -> anyhow::Result<()>
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Review).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Reviewing).await?;
     let fid = add_finding(&db, &bus, iid).await;
     let resp = ipc::dispatch(&db, &bus, TS, Command::DismissFinding { finding_id: fid }).await;
     assert!(is_ok(&resp), "DismissFinding must return Ok, got {resp:?}");
@@ -1577,12 +1878,12 @@ async fn given_missing_finding_when_dismiss_then_err() -> anyhow::Result<()> {
 // ===========================================================================
 
 #[tokio::test]
-async fn given_implementing_issue_when_add_steering_then_returns_id() -> anyhow::Result<()> {
-    // IMPLEMENTING accepts steering -> Ok with an id.
+async fn given_working_issue_when_add_steering_then_returns_id() -> anyhow::Result<()> {
+    // WORKING accepts steering -> Ok with an id.
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Implementing).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Working).await?;
     let resp = ipc::dispatch(
         &db,
         &bus,
@@ -1599,11 +1900,32 @@ async fn given_implementing_issue_when_add_steering_then_returns_id() -> anyhow:
 }
 
 #[tokio::test]
+async fn given_ready_to_merge_issue_when_add_steering_then_returns_id() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let pid = add_project(&db, &bus, "p").await;
+    let iid = issue_at(&db, pid, IssueStatus::ReadyToMerge).await?;
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::AddSteering {
+            issue_id: iid,
+            source: SteeringSource::Human,
+            note: "verify one more case before merge".to_string(),
+        },
+    )
+    .await;
+    assert!(want_id(resp) > 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn given_add_steering_when_accepted_then_emits_steering_added() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Implementing).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Working).await?;
     let mut rx = bus.subscribe();
     let sid = want_id(
         ipc::dispatch(
@@ -1631,12 +1953,12 @@ async fn given_add_steering_when_accepted_then_emits_steering_added() -> anyhow:
 }
 
 #[tokio::test]
-async fn given_consolidating_issue_when_add_steering_then_err() -> anyhow::Result<()> {
-    // CONSOLIDATING does NOT accept steering (no locked plan yet) -> guard Err.
+async fn given_new_issue_when_add_steering_then_err() -> anyhow::Result<()> {
+    // NEW does NOT accept steering (no locked plan yet) -> guard Err.
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issues::create(db.pool(), pid, "t", None, TS).await?; // CONSOLIDATING
+    let iid = issues::create(db.pool(), pid, "t", None, TS).await?; // NEW
     let resp = ipc::dispatch(
         &db,
         &bus,
@@ -1653,12 +1975,12 @@ async fn given_consolidating_issue_when_add_steering_then_err() -> anyhow::Resul
 }
 
 #[tokio::test]
-async fn given_planned_issue_when_add_steering_then_err() -> anyhow::Result<()> {
-    // PLANNED is a real status but not a working phase -> guard Err.
+async fn given_plan_ready_issue_when_add_steering_then_err() -> anyhow::Result<()> {
+    // PLAN_READY is a real status but not a working phase -> guard Err.
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Planned).await?;
+    let iid = issue_at(&db, pid, IssueStatus::PlanReady).await?;
     let resp = ipc::dispatch(
         &db,
         &bus,
@@ -1680,7 +2002,7 @@ async fn given_rejected_steering_with_subscriber_then_no_event_emitted() -> anyh
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issues::create(db.pool(), pid, "t", None, TS).await?; // CONSOLIDATING
+    let iid = issues::create(db.pool(), pid, "t", None, TS).await?; // NEW
     let mut rx = bus.subscribe();
     let _ = ipc::dispatch(
         &db,
@@ -1706,7 +2028,7 @@ async fn given_pending_steering_when_list_steering_then_returns_it() -> anyhow::
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Implementing).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Working).await?;
     let _ = ipc::dispatch(
         &db,
         &bus,
@@ -1740,7 +2062,7 @@ async fn given_pending_steering_when_consume_steering_then_list_empty() -> anyho
     let db = Db::open_memory().await?;
     let bus = events::channel();
     let pid = add_project(&db, &bus, "p").await;
-    let iid = issue_at(&db, pid, IssueStatus::Implementing).await?;
+    let iid = issue_at(&db, pid, IssueStatus::Working).await?;
     let _ = ipc::dispatch(
         &db,
         &bus,
@@ -1880,6 +2202,7 @@ async fn given_running_server_when_request_add_project_then_id() -> anyhow::Resu
             name: "alpha".to_string(),
             repo_path: "/r".to_string(),
             default_branch: "main".to_string(),
+            arsenal_preset_name: None,
             main_agent_cmd: "m".to_string(),
             plan_agent_cmd: "p".to_string(),
             work_agent_cmd: "w".to_string(),
@@ -1887,6 +2210,8 @@ async fn given_running_server_when_request_add_project_then_id() -> anyhow::Resu
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
     )
     .await?;
@@ -1921,6 +2246,7 @@ async fn given_running_server_when_request_list_projects_then_projects_vec() -> 
             name: "alpha".to_string(),
             repo_path: "/r".to_string(),
             default_branch: "main".to_string(),
+            arsenal_preset_name: None,
             main_agent_cmd: "m".to_string(),
             plan_agent_cmd: "p".to_string(),
             work_agent_cmd: "w".to_string(),
@@ -1928,6 +2254,8 @@ async fn given_running_server_when_request_list_projects_then_projects_vec() -> 
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
     )
     .await?;

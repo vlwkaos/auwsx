@@ -128,6 +128,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "auwsx-core",
+ "chrono",
  "crossterm",
  "ratatui",
  "serde",
@@ -3085,7 +3086,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wsx-core"
-version = "0.16.0"
+version = "0.16.2"
 dependencies = [
  "anyhow",
  "dirs",

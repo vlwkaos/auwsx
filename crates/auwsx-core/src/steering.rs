@@ -1,16 +1,14 @@
-//! Steering: append-only guidance into in-flight issues. Plan Step 3.8.
+//! Queue messages: append-only guidance into in-flight issues. Plan Step 3.8.
 //!
-//! Steering replaces the old followups mechanism. A steering note is appended
-//! to an issue that is in a working phase (`IssueStatus::accepts_steering`) —
-//! it NEVER edits `plan.md` (that would risk conflicting with the locked plan).
-//! The work agent consumes pending steering on its next spawn.
+//! The table/module keeps the old `steering` storage name for compatibility.
+//! A queue message is appended to an issue that accepts messages
+//! (`IssueStatus::accepts_queue_message`) and never edits `plan.md`.
+//! The work agent consumes pending queue messages on its next spawn.
 //!
 //! Two sources:
-//!   * `human`         — the user nudges an in-flight issue.
-//!   * `consolidation` — the CONSOLIDATING phase folds a similar approved
-//!                       backlog task into an existing working issue instead of
-//!                       opening a new one; the donor issue then self-closes to
-//!                       `ABSORBED`.
+//! - `human`         — the user nudges an in-flight issue.
+//! - `consolidation` — routing folds a relevant approved backlog task into
+//!   an existing issue instead of opening a new one.
 //!
 //! Adding steering flips `issues.has_pending_steering = 1`, which re-activates
 //! the issue on the next scheduler tick even if it had gone quiet.
@@ -76,9 +74,10 @@ impl Steering {
 
 /// Append steering to an issue and flip its re-trigger flag, in one transaction.
 ///
-/// Guarded by `IssueStatus::accepts_steering`: the issue must be in a working
-/// phase (a locked plan + worktree exist), otherwise this errors — steering
-/// never touches `plan.md`, so it is meaningless before the plan is locked.
+/// Guarded by `IssueStatus::accepts_queue_message`: the issue must be in a
+/// queue-eligible phase (a locked plan + worktree exist, or READY_TO_MERGE is
+/// waiting for human verification), otherwise this errors. Steering never
+/// touches `plan.md`, so it is meaningless before the plan is locked.
 /// Returns the new steering id.
 pub async fn add(
     pool: &SqlitePool,
@@ -90,9 +89,9 @@ pub async fn add(
     let issue = issues::get(pool, issue_id)
         .await?
         .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
-    if !issue.status.accepts_steering() {
+    if !issue.status.accepts_queue_message() {
         bail!(
-            "issue {issue_id} is {:?}, which does not accept steering (needs a working phase)",
+            "issue {issue_id} is {:?}, which does not accept steering (needs a queue-eligible phase)",
             issue.status
         );
     }

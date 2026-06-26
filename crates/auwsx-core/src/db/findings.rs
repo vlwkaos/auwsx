@@ -1,9 +1,9 @@
 //! `findings` typed row + CRUD. Schema: src/db/migrations/0001_init.sql.
 //!
-//! A finding is one reviewer observation. The REVIEW agent emits findings
+//! A finding is one reviewer observation. The REVIEWING agent emits findings
 //! (`open`); the re-spawned implementer adjudicates each (`accepted`/`rejected`
 //! with a rationale on the record); a human may `dismissed` one. Open findings
-//! are what drive the `REVIEW <-> NEEDS_FIX` loop, so [`list_open`] is the
+//! are what drive the `REVIEWING <-> FIXING` loop, so [`list_open`] is the
 //! loop's read.
 
 use crate::Result;

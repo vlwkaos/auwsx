@@ -1,0 +1,2 @@
+-- Keep package defaults on the internal portable memory provider.
+-- Users can explicitly select the script-backed `auwsx-skills` preset in settings.

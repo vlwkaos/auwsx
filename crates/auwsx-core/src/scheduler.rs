@@ -1,7 +1,7 @@
 //! Per-project scheduler. Status is the sync marker: each tick reads issues and
 //! acts by scheduler class — `Actionable` → spawn the phase agent (up to
 //! `max_concurrency`, never double-spawning a running issue); `HumanGated` →
-//! wait, except soft gates (`PLANNED`, and `ENDED` under soft/auto completion
+//! wait, except soft gates (`PLAN_READY`, and `READY_TO_MERGE` under soft/auto completion
 //! policy) which arm a deadline and auto-release; `Terminal` → tear down a
 //! finished issue's worktree.
 //!
@@ -9,25 +9,33 @@
 //! fully testable; [`Scheduler`] is the runtime that executes decisions and
 //! owns the in-flight set.
 
-use crate::agent::AgentExecutor;
+use crate::agent::{self, AgentExecutor, AgentSpec, ExitKind};
+use crate::artifacts;
 use crate::backlog;
 use crate::clock::Clock;
+use crate::db::agent_runs;
+use crate::db::ask_answers::{self, AskMode};
 use crate::db::issues;
-use crate::db::projects::{self, CompletionPolicy, Project};
+use crate::db::projects::{self, CompletionPolicy, MergeMode, Project};
 use crate::db::scheduler_runs::{
     self, SchedulerRunDecision, SchedulerRunPicked, SchedulerRunSource,
 };
 use crate::db::Issue;
 use crate::events::Event;
+use crate::issue_control::{self, ControlOutcome, IssueExecutePlan, ProjectExecutePlan};
 use crate::main_job_runner;
-use crate::main_jobs::MainJobStatus;
+use crate::main_jobs::{self, MainJobStatus};
 use crate::pipeline::{self, Deps};
+use crate::routines::{self, Routine};
+use crate::routing;
 use crate::state::{IssueStatus, SchedulerClass};
-use crate::worktree::{branch_for_issue, WorktreeHandle, Worktrees};
+use crate::worktree::{
+    branch_for_issue, prune_orphaned_issue_worktrees, WorktreeHandle, Worktrees,
+};
 use crate::Result;
 use anyhow::{anyhow, bail};
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, Notify};
@@ -58,14 +66,42 @@ pub fn decide(
     let mut out = Vec::new();
     let cap = project.max_concurrency.max(0) as usize;
     let mut slots = cap.saturating_sub(running.len());
+    let local_merge_mode = project.merge_mode == MergeMode::Local;
+    let local_merge_blocked = local_merge_mode
+        && issues
+            .iter()
+            .any(|issue| issue.status == IssueStatus::ConflictBlocked);
+    let mut local_merge_slot_taken = local_merge_mode
+        && issues
+            .iter()
+            .any(|issue| issue.status == IssueStatus::Merging && running.contains(&issue.id));
+    let mut ordered: Vec<(usize, &Issue)> = issues.iter().enumerate().collect();
+    if local_merge_mode {
+        ordered.sort_by_key(|(idx, issue)| {
+            if issue.status == IssueStatus::Merging {
+                (0usize, issue.id as usize)
+            } else {
+                (1usize, *idx)
+            }
+        });
+    }
 
-    for issue in issues {
+    for (_, issue) in ordered {
         match issue.status.scheduler_class() {
             SchedulerClass::Actionable => {
                 if running.contains(&issue.id) {
                     continue; // its agent is still alive
                 }
                 if slots > 0 {
+                    if local_merge_mode && issue.status == IssueStatus::Merging {
+                        if local_merge_blocked {
+                            continue;
+                        }
+                        if local_merge_slot_taken {
+                            continue;
+                        }
+                        local_merge_slot_taken = true;
+                    }
                     out.push(Decision::Spawn(issue.id));
                     slots -= 1;
                 }
@@ -76,7 +112,9 @@ pub fn decide(
                 }
             }
             SchedulerClass::Terminal => {
-                if issue.status == IssueStatus::Done && issue.worktree_path.is_some() {
+                if matches!(issue.status, IssueStatus::Done | IssueStatus::Abandoned)
+                    && issue.worktree_path.is_some()
+                {
                     out.push(Decision::Teardown(issue.id));
                 }
             }
@@ -86,17 +124,108 @@ pub fn decide(
 }
 
 /// Whether a human-gated issue is on a soft (auto-releasing) gate at all.
-/// `PLANNED` always is; `ENDED` is under `soft`/`auto` completion policy; the
+/// `PLAN_READY` always is; `READY_TO_MERGE` is under `soft`/`auto` completion policy; the
 /// `*_BLOCKED` gates never are (they wait for an explicit human).
 fn soft_releasable(issue: &Issue, project: &Project) -> bool {
     match issue.status {
-        IssueStatus::Planned => true,
-        IssueStatus::Ended => matches!(
+        IssueStatus::PlanReady => true,
+        IssueStatus::ReadyToMerge => matches!(
             project.completion_policy,
             CompletionPolicy::Soft | CompletionPolicy::Auto
         ),
         _ => false,
     }
+}
+
+fn ask_context_summary(
+    project: &Project,
+    issues: &[Issue],
+    backlog: &[backlog::BacklogItem],
+    routines: &[Routine],
+) -> String {
+    let mut lines = vec![
+        format!("Project: {} ({})", project.name, project.repo_path),
+        format!(
+            "Policy: completion={} schedule={}",
+            project.completion_policy.as_str(),
+            crate::schedule::cadence_label(
+                project.schedule_cron.as_deref(),
+                project.schedule_interval_min
+            )
+        ),
+        format!(
+            "Counts: {} issues, {} live backlog, {} routines",
+            issues.len(),
+            backlog.len(),
+            routines.len()
+        ),
+        "Issues:".to_string(),
+    ];
+    for issue in issues.iter().take(12) {
+        lines.push(format!(
+            "- #{} [{} / {}] {}",
+            issue.id,
+            issue.status.stage_label(),
+            issue.status.as_str(),
+            issue.title.lines().next().unwrap_or("")
+        ));
+    }
+    if issues.is_empty() {
+        lines.push("- none".to_string());
+    }
+    lines.push("Live backlog:".to_string());
+    for item in backlog.iter().take(8) {
+        lines.push(format!(
+            "- #{} [{}] {}",
+            item.id,
+            item.approval.as_str(),
+            item.text.lines().next().unwrap_or("")
+        ));
+    }
+    if backlog.is_empty() {
+        lines.push("- none".to_string());
+    }
+    lines.join("\n")
+}
+
+fn ask_prompt(mode: AskMode, question: &str, context: &str) -> String {
+    let skill = match mode {
+        AskMode::Recall => "$recall",
+        AskMode::Seek => "$seek",
+    };
+    format!(
+        "\
+You are answering one operator question about the current auwsx project.
+
+Use {skill} before answering. Use project status below as immediate context.
+Do not modify files, do not run status-changing auwsx commands, and do not make commits.
+Return only the final answer for the operator.
+
+## Current Project Status
+{context}
+
+## Question
+{question}
+"
+    )
+}
+
+fn extract_answer_from_log(text: &str) -> Option<String> {
+    let mut last_agent_message = None;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(item) = value.get("item") else {
+            continue;
+        };
+        if item.get("type").and_then(|v| v.as_str()) == Some("agent_message") {
+            if let Some(msg) = item.get("text").and_then(|v| v.as_str()) {
+                last_agent_message = Some(msg.to_string());
+            }
+        }
+    }
+    last_agent_message
 }
 
 /// Whether a soft gate needs servicing this tick: it must be soft-releasable AND
@@ -178,20 +307,27 @@ impl Scheduler {
     /// global tick. Manual commands intentionally bypass this gate by calling
     /// `tick_project` directly.
     async fn project_due_for_auto_tick(&self, project: &Project, now: i64) -> bool {
-        let Some(interval_min) = project.schedule_interval_min else {
-            return false;
-        };
-        if interval_min <= 0 {
-            return true;
-        }
-
-        let interval_ms = interval_min.saturating_mul(60_000);
         match scheduler_runs::latest_auto_by_project(self.db.pool(), project.id).await {
-            Ok(Some(last)) => now.saturating_sub(last.fired_at) >= interval_ms,
-            Ok(None) => true,
+            Ok(last) => match crate::schedule::is_due(
+                project.schedule_cron.as_deref(),
+                project.schedule_interval_min,
+                last.map(|run| run.fired_at),
+                project.created_at,
+                now,
+                self.tick_interval.as_secs() as i64,
+            ) {
+                Ok(due) => due,
+                Err(e) => {
+                    tracing::warn!(
+                        "checking scheduler cron for project {} failed: {e:#}",
+                        project.id
+                    );
+                    false
+                }
+            },
             Err(e) => {
                 tracing::warn!(
-                    "checking scheduler interval for project {} failed: {e:#}",
+                    "checking latest scheduler tick for project {} failed: {e:#}",
                     project.id
                 );
                 true
@@ -213,10 +349,10 @@ impl Scheduler {
         };
         let snapshot = self.running.lock().unwrap().clone();
         let now = self.clock.now_ms();
-        let triaged = match backlog::run_triage_detailed(pool, project_id, now).await {
+        let routed = match routing::route_approved_project(pool, project_id, now).await {
             Ok(items) => items,
             Err(e) => {
-                tracing::warn!("triage for project {project_id} failed: {e:#}");
+                tracing::warn!("routing backlog for project {project_id} failed: {e:#}");
                 Vec::new()
             }
         };
@@ -228,7 +364,7 @@ impl Scheduler {
             .filter(|issue_id| issue_ids.contains(issue_id))
             .collect();
         let decisions = decide(&issues, &project, &project_running, now);
-        let triaged_issue_ids: Vec<i64> = triaged.iter().map(|item| item.issue_id).collect();
+        let triaged_issue_ids: Vec<i64> = routed.iter().map(|item| item.issue_id()).collect();
         let pending_backlog =
             backlog::count_by_approval(pool, project_id, backlog::Approval::Pending)
                 .await
@@ -260,16 +396,22 @@ impl Scheduler {
             }
         }
         let _ = self.events.send(Event::SchedulerTick { project_id });
-        for item in &triaged {
+        for item in &routed {
             let _ = self.events.send(Event::BacklogChanged {
-                item_id: item.item_id,
+                item_id: item.item_id(),
                 project_id,
                 approval: "approved".to_string(),
             });
             let _ = self.events.send(Event::IssueStatus {
-                issue_id: item.issue_id,
-                status: IssueStatus::Consolidating,
+                issue_id: item.issue_id(),
+                status: IssueStatus::New,
             });
+        }
+
+        if matches!(source, SchedulerRunSource::Auto) {
+            if let Err(e) = self.service_project_deepsleep(&project, now).await {
+                tracing::warn!("deepsleep scheduling for project {project_id} failed: {e:#}");
+            }
         }
 
         for d in decisions {
@@ -290,15 +432,42 @@ impl Scheduler {
         Ok(())
     }
 
+    async fn service_project_deepsleep(&self, project: &Project, now: i64) -> Result<()> {
+        let deepsleep_cron = project
+            .deepsleep_cron
+            .clone()
+            .or_else(|| crate::schedule::legacy_deepsleep_to_cron(project.deepsleep_interval_days));
+        let Some(deepsleep_cron) = deepsleep_cron else {
+            return Ok(());
+        };
+        let due = match project.last_deepsleep_at {
+            None => true,
+            Some(last) => crate::schedule::is_due(
+                Some(&deepsleep_cron),
+                None,
+                Some(last),
+                project.created_at,
+                now,
+                self.tick_interval.as_secs() as i64,
+            )?,
+        };
+        if !due {
+            return Ok(());
+        }
+        if main_jobs::has_active_project_job(self.db.pool(), project.id).await? {
+            return Ok(());
+        }
+        self.spawn_memory_job(project.id, "deepsleep", None);
+        Ok(())
+    }
+
     /// Execute the selected issue immediately if it is actionable and not
     /// already running. This is the daemon-owned imperative control used by
     /// clients for "run now"; it shares the same running set and pipeline as the
     /// automatic tick.
     pub async fn run_issue_now(&self, issue_id: i64) -> Result<()> {
         self.prune_inflight();
-        if self.running.lock().unwrap().contains(&issue_id) {
-            bail!("issue {issue_id} is already running");
-        }
+        self.ensure_issue_idle(issue_id)?;
         let issue = issues::get(self.db.pool(), issue_id)
             .await?
             .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
@@ -312,10 +481,335 @@ impl Scheduler {
         Ok(())
     }
 
+    pub async fn execute_issue(&self, issue_id: i64, now: i64) -> Result<ControlOutcome> {
+        self.prune_inflight();
+        self.ensure_issue_idle(issue_id)?;
+        let issue = issues::get(self.db.pool(), issue_id)
+            .await?
+            .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
+        let runs = if issue.status == IssueStatus::Failed {
+            agent_runs::list_by_issue(self.db.pool(), issue_id).await?
+        } else {
+            Vec::new()
+        };
+
+        match issue_control::plan_issue_execute(&issue, &runs)? {
+            IssueExecutePlan::RunPhase => {
+                self.spawn_phase(issue_id);
+                Ok(ControlOutcome::RanIssue { issue_id })
+            }
+            IssueExecutePlan::RetryFailed { retry_status } => {
+                self.retry_failed_issue_to_status(issue_id, retry_status, now)
+                    .await?;
+                Ok(ControlOutcome::RanIssue { issue_id })
+            }
+            IssueExecutePlan::ApproveMerge => {
+                self.release(issue_id, IssueStatus::Merging, now).await?;
+                self.tick_project(issue.project_id).await?;
+                Ok(ControlOutcome::ApprovedMerge {
+                    issue_ids: vec![issue_id],
+                })
+            }
+        }
+    }
+
+    pub async fn execute_project(&self, project_id: i64, now: i64) -> Result<ControlOutcome> {
+        projects::get(self.db.pool(), project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {project_id} not found"))?;
+        let ready =
+            issues::list_by_status(self.db.pool(), project_id, IssueStatus::ReadyToMerge).await?;
+
+        match issue_control::plan_project_execute(ready.len()) {
+            ProjectExecutePlan::TickScheduler => {
+                self.tick_project(project_id).await?;
+                Ok(ControlOutcome::Ok)
+            }
+            ProjectExecutePlan::ApproveReadyMergeQueue => {
+                let issue_ids = self.approve_project_merge(project_id, now).await?;
+                Ok(ControlOutcome::ApprovedMerge { issue_ids })
+            }
+        }
+    }
+
+    pub async fn retry_failed_issue(&self, issue_id: i64, now: i64) -> Result<()> {
+        self.prune_inflight();
+        self.ensure_issue_idle(issue_id)?;
+        let issue = issues::get(self.db.pool(), issue_id)
+            .await?
+            .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
+        if issue.status != IssueStatus::Failed {
+            bail!(
+                "issue {issue_id} is not failed; current status is {}",
+                issue.status.as_str()
+            );
+        }
+
+        let retry_status = self.retry_status_for_issue(issue_id).await?;
+        self.retry_failed_issue_to_status(issue_id, retry_status, now)
+            .await
+    }
+
+    async fn retry_failed_issue_to_status(
+        &self,
+        issue_id: i64,
+        retry_status: IssueStatus,
+        now: i64,
+    ) -> Result<()> {
+        issues::force_status(self.db.pool(), issue_id, retry_status, now).await?;
+        let _ = self.events.send(Event::IssueStatus {
+            issue_id,
+            status: retry_status,
+        });
+        self.run_issue_now(issue_id).await
+    }
+
+    async fn retry_status_for_issue(&self, issue_id: i64) -> Result<IssueStatus> {
+        let runs = agent_runs::list_by_issue(self.db.pool(), issue_id).await?;
+        Ok(issue_control::retry_status_from_runs(&runs))
+    }
+
+    pub async fn approve_issue_merge(&self, issue_id: i64, now: i64) -> Result<Vec<i64>> {
+        self.prune_inflight();
+        self.ensure_issue_idle(issue_id)?;
+        let issue = issues::get(self.db.pool(), issue_id)
+            .await?
+            .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
+        self.ensure_local_merge_not_conflict_blocked(issue.project_id)
+            .await?;
+        if issue.status != IssueStatus::ReadyToMerge {
+            bail!(
+                "issue {issue_id} is not ready to merge; current status is {}",
+                issue.status.as_str()
+            );
+        }
+        self.release(issue_id, IssueStatus::Merging, now).await?;
+        self.tick_project(issue.project_id).await?;
+        Ok(vec![issue_id])
+    }
+
+    pub async fn approve_project_merge(&self, project_id: i64, now: i64) -> Result<Vec<i64>> {
+        self.prune_inflight();
+        projects::get(self.db.pool(), project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {project_id} not found"))?;
+        self.ensure_local_merge_not_conflict_blocked(project_id)
+            .await?;
+
+        let ready =
+            issues::list_by_status(self.db.pool(), project_id, IssueStatus::ReadyToMerge).await?;
+        if ready.is_empty() {
+            bail!("project {project_id} has no READY_TO_MERGE issues");
+        }
+
+        let mut released = Vec::with_capacity(ready.len());
+        for issue in ready {
+            if self.running.lock().unwrap().contains(&issue.id) {
+                continue;
+            }
+            self.release(issue.id, IssueStatus::Merging, now).await?;
+            released.push(issue.id);
+        }
+
+        if released.is_empty() {
+            bail!("project {project_id} has no releasable READY_TO_MERGE issues");
+        }
+
+        self.tick_project(project_id).await?;
+        Ok(released)
+    }
+
+    async fn ensure_local_merge_not_conflict_blocked(&self, project_id: i64) -> Result<()> {
+        let Some(project) = projects::get(self.db.pool(), project_id).await? else {
+            bail!("project {project_id} not found");
+        };
+        if project.merge_mode != MergeMode::Local {
+            return Ok(());
+        }
+        let blocked =
+            issues::list_by_status(self.db.pool(), project_id, IssueStatus::ConflictBlocked)
+                .await?;
+        if let Some(issue) = blocked.first() {
+            bail!(
+                "project {project_id} has conflict-blocked issue {}; resolve it before releasing more local merges",
+                issue.id
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_issue_idle(&self, issue_id: i64) -> Result<()> {
+        if self.running.lock().unwrap().contains(&issue_id) {
+            bail!("issue {issue_id} is already running");
+        }
+        Ok(())
+    }
+
     pub async fn run_backlog_now(&self, item_id: i64, now: i64) -> Result<i64> {
-        let issue_id = backlog::promote_one(self.db.pool(), item_id, now).await?;
+        let issue_id = routing::route_one_now(self.db.pool(), item_id, now).await?;
         self.run_issue_now(issue_id).await?;
         Ok(issue_id)
+    }
+
+    /// Remove an issue through the runtime owner: refuse active agents, tear
+    /// down any worktree, resolve source backlog rows, then delete DB history.
+    pub async fn remove_issue(&self, issue_id: i64, now: i64) -> Result<()> {
+        self.prune_inflight();
+        if self.running.lock().unwrap().contains(&issue_id) {
+            bail!("issue {issue_id} is currently running");
+        }
+        let pool = self.db.pool();
+        let issue = issues::get(pool, issue_id)
+            .await?
+            .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
+        let project = projects::get(pool, issue.project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {} not found", issue.project_id))?;
+        self.cleanup_issue_worktree(&project, &issue).await?;
+        backlog::dismiss_consumed_by_issue(pool, issue_id, now).await?;
+        issues::remove(pool, issue_id).await?;
+        let _ = self.events.send(Event::IssueRemoved {
+            issue_id,
+            project_id: issue.project_id,
+        });
+        Ok(())
+    }
+
+    pub async fn abandon_issue(&self, issue_id: i64, now: i64) -> Result<()> {
+        self.prune_inflight();
+        if self.running.lock().unwrap().contains(&issue_id) {
+            bail!("issue {issue_id} is currently running");
+        }
+        let pool = self.db.pool();
+        let issue = issues::get(pool, issue_id)
+            .await?
+            .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
+        if issue.status.is_terminal() {
+            return Ok(());
+        }
+        let project = projects::get(pool, issue.project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {} not found", issue.project_id))?;
+        self.cleanup_issue_worktree(&project, &issue).await?;
+        issues::transition(pool, issue_id, IssueStatus::Abandoned, now).await?;
+        let _ = self.events.send(Event::IssueStatus {
+            issue_id,
+            status: IssueStatus::Abandoned,
+        });
+        Ok(())
+    }
+
+    /// Explicitly remove an issue worktree while keeping the issue row. This is
+    /// the operator recovery path for terminal FAILED issues, where the default
+    /// policy keeps the worktree available for inspection.
+    pub async fn cleanup_issue_worktree_by_id(&self, issue_id: i64) -> Result<()> {
+        self.prune_inflight();
+        if self.running.lock().unwrap().contains(&issue_id) {
+            bail!("issue {issue_id} is currently running");
+        }
+        let pool = self.db.pool();
+        let issue = issues::get(pool, issue_id)
+            .await?
+            .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
+        let project = projects::get(pool, issue.project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {} not found", issue.project_id))?;
+        self.cleanup_issue_worktree(&project, &issue).await
+    }
+
+    pub async fn remove_project(&self, project_id: i64, shallow: bool) -> Result<()> {
+        self.prune_inflight();
+        let project = projects::get(self.db.pool(), project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {project_id} not found"))?;
+        let issues = issues::list_by_project(self.db.pool(), project_id).await?;
+        if !shallow {
+            let running_issue = {
+                let running = self.running.lock().unwrap();
+                issues
+                    .iter()
+                    .find(|issue| running.contains(&issue.id))
+                    .map(|issue| issue.id)
+            };
+            if let Some(issue_id) = running_issue {
+                bail!(
+                    "project {project_id} has running issue {}; use shallow unregister or clean it up first",
+                    issue_id
+                );
+            }
+            self.cleanup_project_worktrees(&project, &issues).await?;
+        }
+        projects::remove(self.db.pool(), project_id).await?;
+        Ok(())
+    }
+
+    pub async fn ask_project(
+        &self,
+        project_id: i64,
+        mode: AskMode,
+        question: String,
+    ) -> Result<i64> {
+        let pool = self.db.pool();
+        let project = projects::get(pool, project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {project_id} not found"))?;
+        let issues = issues::list_by_project(pool, project_id).await?;
+        let backlog = backlog::list_by_project(pool, project_id).await?;
+        let routines = routines::list_by_project(pool, project_id).await?;
+        let now = self.clock.now_ms();
+        let context = ask_context_summary(&project, &issues, &backlog, &routines);
+        let prompt = ask_prompt(mode, &question, &context);
+        let log_path = artifacts::ask_log_path(project_id, now)?;
+        let timeout = Duration::from_secs(project.main_job_timeout_min.max(1) as u64 * 60);
+        let cwd = PathBuf::from(&project.repo_path);
+        let env = vec![
+            ("AUWSX_PROJECT_ID".to_string(), project_id.to_string()),
+            ("AUWSX_ASK_MODE".to_string(), mode.as_str().to_string()),
+        ];
+        let cmd_template = agent::expand_cmd_template(
+            &project.main_agent_cmd,
+            agent::AgentTemplateVars::main_job(&self.socket),
+        );
+        let outcome = self
+            .executor
+            .execute(AgentSpec {
+                cmd_template: &cmd_template,
+                prompt: &prompt,
+                cwd: &cwd,
+                log_path: &log_path,
+                timeout,
+                env: &env,
+            })
+            .await?;
+        let log_text = artifacts::tail_file(log_path.clone(), 64 * 1024)
+            .await
+            .unwrap_or_default();
+        let mut answer =
+            extract_answer_from_log(&log_text).unwrap_or_else(|| log_text.trim().to_string());
+        if answer.is_empty() {
+            answer = format!(
+                "Ask command ended with {:?} exit {:?}, but no answer text was captured.",
+                outcome.exit_kind, outcome.exit_code
+            );
+        }
+        let answer_id = ask_answers::create(
+            pool,
+            ask_answers::NewAskAnswer {
+                project_id,
+                mode,
+                question: &question,
+                answer: &answer,
+                context_summary: Some(&context),
+                log_path: Some(&log_path.to_string_lossy()),
+            },
+            now,
+        )
+        .await?;
+        let _ = self.events.send(Event::AskAnswered {
+            answer_id,
+            project_id,
+        });
+        Ok(answer_id)
     }
 
     pub fn is_running(&self, issue_id: i64) -> bool {
@@ -383,7 +877,60 @@ impl Scheduler {
                 main_job_id,
                 status,
             });
-            running_routines.lock().unwrap().remove(&routine_id);
+            if let Some(routine_id) = routine_id {
+                running_routines.lock().unwrap().remove(&routine_id);
+            }
+        });
+        self.inflight.lock().unwrap().push(handle);
+    }
+
+    fn spawn_memory_job(&self, project_id: i64, kind: &'static str, issue_id: Option<i64>) {
+        let db = self.db.clone();
+        let clock = self.clock.clone();
+        let executor = self.executor.clone();
+        let events = self.events.clone();
+        let socket = self.socket.clone();
+
+        let handle = tokio::spawn(async move {
+            let deps = main_job_runner::Deps {
+                db: &db,
+                clock: &*clock,
+                executor: &*executor,
+                events: &events,
+                socket,
+            };
+            let job = match main_job_runner::enqueue_memory_job(&deps, project_id, kind, issue_id)
+                .await
+            {
+                Ok(job) => job,
+                Err(e) => {
+                    tracing::warn!(
+                        "memory job {kind} enqueue for project {project_id} failed: {e:#}"
+                    );
+                    return;
+                }
+            };
+            let main_job_id = job.main_job_id;
+            let status = match main_job_runner::execute_routine(&deps, &job).await {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::warn!("memory job {kind} {main_job_id} failed: {e:#}");
+                    MainJobStatus::Failed
+                }
+            };
+            if kind == "deepsleep" && status == MainJobStatus::Done {
+                if let Err(e) =
+                    projects::mark_deepsleep_ran(db.pool(), project_id, clock.now_ms()).await
+                {
+                    tracing::warn!(
+                        "recording deepsleep completion for project {project_id} failed: {e:#}"
+                    );
+                }
+            }
+            let _ = events.send(Event::MainJobStatus {
+                main_job_id,
+                status,
+            });
         });
         self.inflight.lock().unwrap().push(handle);
     }
@@ -419,8 +966,164 @@ impl Scheduler {
                 tracing::warn!("phase execution for issue {issue_id} failed: {e:#}");
             }
             running.lock().unwrap().remove(&issue_id);
+            match issues::get(db.pool(), issue_id).await {
+                Ok(Some(issue)) if issue.status == IssueStatus::Done => {
+                    let deps = main_job_runner::Deps {
+                        db: &db,
+                        clock: &*clock,
+                        executor: &*executor,
+                        events: &events,
+                        socket: deps.socket.clone(),
+                    };
+                    match main_job_runner::enqueue_memory_job(
+                        &deps,
+                        issue.project_id,
+                        "dream",
+                        Some(issue_id),
+                    )
+                    .await
+                    {
+                        Ok(job) => {
+                            let main_job_id = job.main_job_id;
+                            let status = match main_job_runner::execute_routine(&deps, &job).await {
+                                Ok(status) => status,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "post-merge dream job {main_job_id} for issue {issue_id} failed: {e:#}"
+                                    );
+                                    MainJobStatus::Failed
+                                }
+                            };
+                            let _ = events.send(Event::MainJobStatus {
+                                main_job_id,
+                                status,
+                            });
+                        }
+                        Err(e) => tracing::warn!(
+                            "post-merge dream enqueue for issue {issue_id} failed: {e:#}"
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("checking issue {issue_id} after phase failed: {e:#}"),
+            }
         });
         self.inflight.lock().unwrap().push(handle);
+    }
+
+    /// Reconcile interrupted DB state left by a previous daemon exit.
+    pub async fn recover_interrupted_work(&self, now: i64) -> Result<usize> {
+        let issue_runs = self.recover_open_issue_runs(now).await?;
+        let main_jobs = self.recover_open_main_jobs(now).await?;
+        Ok(issue_runs + main_jobs)
+    }
+
+    /// Close open issue run rows left by a previous daemon and move still
+    /// actionable issues to FAILED. This prevents a restart from silently
+    /// spawning a second phase for the same issue while the previous run row is
+    /// still open.
+    pub async fn recover_open_issue_runs(&self, now: i64) -> Result<usize> {
+        let pool = self.db.pool();
+        let runs = agent_runs::list_open_issue_runs(pool).await?;
+        let mut recovered = 0;
+        for run in runs {
+            let Some(issue_id) = run.issue_id else {
+                continue;
+            };
+            let mut status_after = None;
+            if let Some(issue) = issues::get(pool, issue_id).await? {
+                let mut status = issue.status;
+                if issue.status.is_actionable()
+                    && run.status_before.as_deref() == Some(issue.status.as_str())
+                    && issues::transition(pool, issue_id, IssueStatus::Failed, now)
+                        .await
+                        .is_ok()
+                {
+                    status = IssueStatus::Failed;
+                    let _ = self.events.send(Event::IssueStatus {
+                        issue_id,
+                        status: IssueStatus::Failed,
+                    });
+                }
+                status_after = Some(status.as_str().to_string());
+            }
+            agent_runs::finish(
+                pool,
+                run.id,
+                status_after.as_deref(),
+                None,
+                ExitKind::Error,
+                now,
+                Some("closed during daemon startup recovery"),
+            )
+            .await?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    /// Close interrupted main-job run rows and mark RUNNING main jobs failed.
+    /// QUEUED jobs are left queued so routine/user work can be retried.
+    pub async fn recover_open_main_jobs(&self, now: i64) -> Result<usize> {
+        let pool = self.db.pool();
+        let mut recovered = 0;
+        let mut recovered_jobs = HashSet::new();
+        for run in agent_runs::list_open_main_job_runs(pool).await? {
+            let Some(main_job_id) = run.main_job_id else {
+                continue;
+            };
+            let status_after = match main_jobs::get(pool, main_job_id).await? {
+                Some(job) if job.status == MainJobStatus::Running => {
+                    main_jobs::finish(
+                        pool,
+                        job.id,
+                        MainJobStatus::Failed,
+                        now,
+                        Some("marked failed during daemon startup recovery"),
+                    )
+                    .await?;
+                    recovered_jobs.insert(job.id);
+                    let _ = self.events.send(Event::MainJobStatus {
+                        main_job_id: job.id,
+                        status: MainJobStatus::Failed,
+                    });
+                    Some(MainJobStatus::Failed.as_str().to_string())
+                }
+                Some(job) => Some(job.status.as_str().to_string()),
+                None => None,
+            };
+            agent_runs::finish(
+                pool,
+                run.id,
+                status_after.as_deref(),
+                None,
+                ExitKind::Error,
+                now,
+                Some("closed during daemon startup recovery"),
+            )
+            .await?;
+            recovered += 1;
+        }
+
+        for job in main_jobs::list_running(pool).await? {
+            if recovered_jobs.contains(&job.id) {
+                continue;
+            }
+            main_jobs::finish(
+                pool,
+                job.id,
+                MainJobStatus::Failed,
+                now,
+                Some("marked failed during daemon startup recovery"),
+            )
+            .await?;
+            recovered += 1;
+            let _ = self.events.send(Event::MainJobStatus {
+                main_job_id: job.id,
+                status: MainJobStatus::Failed,
+            });
+        }
+        Ok(recovered)
     }
 
     /// Arm a soft gate (set `wait_until`) or release it (transition) when due.
@@ -431,14 +1134,16 @@ impl Scheduler {
         };
         let now = self.clock.now_ms();
         let (target, deadline_min) = match issue.status {
-            IssueStatus::Planned => (IssueStatus::Implementing, project.plan_gate_timeout_min),
-            IssueStatus::Ended => {
+            IssueStatus::PlanReady => (IssueStatus::Working, project.plan_gate_timeout_min),
+            IssueStatus::ReadyToMerge => {
+                self.ensure_local_merge_not_conflict_blocked(issue.project_id)
+                    .await?;
                 let mins = match project.completion_policy {
                     CompletionPolicy::Auto => 0,
                     CompletionPolicy::Soft => project.completion_soft_timeout_min,
                     CompletionPolicy::Manual => return Ok(()), // not soft; decide filters this
                 };
-                (IssueStatus::Completing, mins)
+                (IssueStatus::Merging, mins)
             }
             _ => return Ok(()),
         };
@@ -469,6 +1174,44 @@ impl Scheduler {
         let Some(issue) = issues::get(pool, issue_id).await? else {
             return Ok(());
         };
+        self.cleanup_issue_worktree(project, &issue).await
+    }
+
+    async fn cleanup_project_worktrees(&self, project: &Project, issues: &[Issue]) -> Result<()> {
+        for issue in issues {
+            self.cleanup_issue_worktree(project, issue).await?;
+        }
+
+        let repo_path = Path::new(&project.repo_path);
+        let known_paths = self
+            .known_issue_worktree_paths_for_repo(repo_path, project.id)
+            .await?;
+        prune_orphaned_issue_worktrees(repo_path, &known_paths).await?;
+        Ok(())
+    }
+
+    async fn known_issue_worktree_paths_for_repo(
+        &self,
+        repo_path: &Path,
+        excluding_project_id: i64,
+    ) -> Result<HashMap<i64, PathBuf>> {
+        let mut known = HashMap::new();
+        for project in projects::list(self.db.pool()).await? {
+            if project.id == excluding_project_id
+                || !same_repo_path(Path::new(&project.repo_path), repo_path)
+            {
+                continue;
+            }
+            for issue in issues::list_by_project(self.db.pool(), project.id).await? {
+                if let Some(path) = issue.worktree_path {
+                    known.insert(issue.id, PathBuf::from(path));
+                }
+            }
+        }
+        Ok(known)
+    }
+
+    async fn cleanup_issue_worktree(&self, project: &Project, issue: &Issue) -> Result<()> {
         let Some(path) = issue.worktree_path.clone() else {
             return Ok(());
         };
@@ -476,12 +1219,19 @@ impl Scheduler {
             branch: issue
                 .branch
                 .clone()
-                .unwrap_or_else(|| branch_for_issue(issue_id)),
+                .unwrap_or_else(|| branch_for_issue(issue.id)),
             path: PathBuf::from(path),
         };
         self.worktrees.teardown(project, &handle).await?;
-        // Clear the worktree fields so we don't try again next tick.
-        issues::set_worktree(pool, issue_id, None, None, None, self.clock.now_ms()).await
+        issues::set_worktree(
+            self.db.pool(),
+            issue.id,
+            None,
+            None,
+            None,
+            self.clock.now_ms(),
+        )
+        .await
     }
 
     /// Drop handles for tasks that have finished (keeps the in-flight Vec from
@@ -496,6 +1246,13 @@ impl Scheduler {
         for h in handles {
             let _ = h.await;
         }
+    }
+}
+
+fn same_repo_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
     }
 }
 

@@ -1,6 +1,6 @@
 //! `subtasks` typed row + CRUD. Schema: src/db/migrations/0001_init.sql.
 //!
-//! Subtasks are the plan agent's output: the ordered IMPLEMENTING checklist for
+//! Subtasks are the plan agent's output: the ordered WORKING checklist for
 //! one issue. `ord` is the display/execution order; `done` flips as the work
 //! agent completes each item.
 

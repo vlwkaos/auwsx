@@ -39,6 +39,7 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             name,
             repo_path: "/repo/path",
             default_branch: "main",
+            arsenal_preset_name: None,
             main_agent_cmd: "claude {prompt}",
             plan_agent_cmd: "claude-plan {prompt}",
             work_agent_cmd: "claude-work {prompt}",
@@ -46,6 +47,8 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
         },
         TS,
     )
@@ -77,7 +80,7 @@ fn start_for_issue(issue_id: i64) -> StartRun<'static> {
         role: Role::Work,
         phase: "implement",
         agent_cmd: "claude {prompt}",
-        status_before: Some("IMPLEMENTING"),
+        status_before: Some("WORKING"),
         pid: Some(1234),
         prompt_path: Some("/tmp/prompt.txt"),
         log_path: Some("/tmp/run.log"),
@@ -478,7 +481,7 @@ async fn given_issue_only_start_when_get_then_status_before_and_pid_and_log_path
             run.pid,
             run.log_path.as_deref()
         ),
-        (Some("IMPLEMENTING"), Some(1234), Some("/tmp/run.log"))
+        (Some("WORKING"), Some(1234), Some("/tmp/run.log"))
     );
     Ok(())
 }
@@ -678,6 +681,43 @@ async fn given_multiple_runs_for_issue_when_list_by_issue_then_oldest_id_first(
         .map(|r| r.id)
         .collect();
     assert_eq!(ids, vec![a, b, c]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_multiple_runs_for_issue_when_latest_log_path_then_newest_log_returned(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let (_, iid) = insert_issue(db.pool(), "p").await?;
+    let first = start_for_issue(iid);
+    agent_runs::start(db.pool(), first, TS).await?;
+    let second = StartRun {
+        issue_id: Some(iid),
+        main_job_id: None,
+        role: Role::Work,
+        phase: "implement",
+        agent_cmd: "claude {prompt}",
+        status_before: Some("WORKING"),
+        pid: Some(1234),
+        prompt_path: Some("/tmp/run2.prompt.txt"),
+        log_path: Some("/tmp/run2.log"),
+    };
+    agent_runs::start(db.pool(), second, TS2).await?;
+
+    let path = agent_runs::latest_log_path_by_issue(db.pool(), iid).await?;
+
+    assert_eq!(path.as_deref(), Some("/tmp/run2.log"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_no_runs_for_issue_when_latest_log_path_then_none() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let (_, iid) = insert_issue(db.pool(), "p").await?;
+
+    let path = agent_runs::latest_log_path_by_issue(db.pool(), iid).await?;
+
+    assert_eq!(path, None);
     Ok(())
 }
 

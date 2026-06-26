@@ -113,9 +113,14 @@ async fn insert_main_job(pool: &SqlitePool, project_id: i64) -> anyhow::Result<i
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn all_ten_tables_exist() -> anyhow::Result<()> {
+async fn all_runtime_tables_exist() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let expected = [
+        "arsenal_agent_presets",
+        "ask_answers",
+        "global_settings",
+        "memory_presets",
+        "profiles",
         "projects",
         "routines",
         "issues",
@@ -127,6 +132,17 @@ async fn all_ten_tables_exist() -> anyhow::Result<()> {
         "agent_runs",
         "scheduler_runs",
     ];
+    let actual_count: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name NOT LIKE '_sqlx%'",
+    )
+    .fetch_one(db.pool())
+    .await?
+    .get("n");
+    assert_eq!(
+        actual_count,
+        expected.len() as i64,
+        "runtime table count should match the expected migrated schema"
+    );
     for table in expected {
         let count: i64 =
             sqlx::query("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name=?")
@@ -136,6 +152,18 @@ async fn all_ten_tables_exist() -> anyhow::Result<()> {
                 .get("n");
         assert_eq!(count, 1, "table `{table}` should exist exactly once");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_settings_seed_row_exists() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM global_settings WHERE id = 1")
+        .fetch_one(db.pool())
+        .await?
+        .get("n");
+
+    assert_eq!(count, 1, "global settings should have one singleton row");
     Ok(())
 }
 
@@ -361,7 +389,7 @@ async fn main_jobs_status_bad_value_rejected() -> anyhow::Result<()> {
 async fn findings_severity_bad_value_rejected() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let project_id = insert_project(db.pool(), "p").await?;
-    let issue_id = insert_issue(db.pool(), project_id, "REVIEW").await?;
+    let issue_id = insert_issue(db.pool(), project_id, "REVIEWING").await?;
 
     let res = sqlx::query(
         "INSERT INTO findings
@@ -475,7 +503,7 @@ async fn main_jobs_status_valid_value_accepted() -> anyhow::Result<()> {
 async fn findings_severity_valid_value_accepted() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let project_id = insert_project(db.pool(), "p").await?;
-    let issue_id = insert_issue(db.pool(), project_id, "REVIEW").await?;
+    let issue_id = insert_issue(db.pool(), project_id, "REVIEWING").await?;
     sqlx::query(
         "INSERT INTO findings
             (issue_id, review_round, severity, title, created_at)

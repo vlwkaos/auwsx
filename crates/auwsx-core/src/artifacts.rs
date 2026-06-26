@@ -9,6 +9,7 @@ use anyhow::Context;
 use directories::ProjectDirs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn issue_run_paths(issue_id: i64, spawned_at: i64) -> Result<(PathBuf, PathBuf)> {
     let base = data_dir().join("runs").join(format!("issue-{issue_id}"));
@@ -29,6 +30,15 @@ pub fn main_job_log_path(project_id: i64, main_job_id: i64, started_at: i64) -> 
     Ok(base.join(format!("job-{main_job_id}-{started_at}.log")))
 }
 
+pub fn ask_log_path(project_id: i64, started_at: i64) -> Result<PathBuf> {
+    let base = data_dir()
+        .join("asks")
+        .join(format!("project-{project_id}"));
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("creating ask log dir {}", base.display()))?;
+    Ok(base.join(format!("ask-{started_at}.log")))
+}
+
 pub fn data_dir() -> PathBuf {
     if let Ok(env) = std::env::var("AUWSX_DATA_DIR") {
         return PathBuf::from(env);
@@ -37,6 +47,30 @@ pub fn data_dir() -> PathBuf {
         return dirs.data_dir().to_path_buf();
     }
     std::env::temp_dir().join("auwsx")
+}
+
+pub fn append_system_event(path: &Path, event: serde_json::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating log dir {}", parent.display()))?;
+    }
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default();
+    let line = serde_json::json!({
+        "type": "auwsx.event",
+        "timestamp_ms": timestamp_ms,
+        "event": event,
+    });
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening log file {}", path.display()))?;
+    writeln!(file, "{line}").with_context(|| format!("writing log file {}", path.display()))?;
+    Ok(())
 }
 
 pub async fn tail_file(path: PathBuf, max_bytes: usize) -> Result<String> {

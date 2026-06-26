@@ -15,9 +15,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
-/// Status a freshly-created issue enters: consolidation runs before any
-/// worktree exists and decides standalone-vs-delegate.
-pub const INITIAL_STATUS: IssueStatus = IssueStatus::Consolidating;
+/// Status a freshly-created standalone issue enters.
+pub const INITIAL_STATUS: IssueStatus = IssueStatus::New;
 
 /// Full `issues` row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +25,9 @@ pub struct Issue {
     pub project_id: i64,
     pub title: String,
     pub description: Option<String>,
+    pub agent_summary: Option<String>,
+    pub progress_report: Option<String>,
+    pub result_report: Option<String>,
     pub status: IssueStatus,
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
@@ -48,6 +50,9 @@ impl Issue {
             project_id: row.try_get("project_id")?,
             title: row.try_get("title")?,
             description: row.try_get("description")?,
+            agent_summary: row.try_get("agent_summary")?,
+            progress_report: row.try_get("progress_report")?,
+            result_report: row.try_get("result_report")?,
             status: IssueStatus::from_str(&status_raw)
                 .ok_or_else(|| anyhow!("unknown issue status {status_raw:?} in db"))?,
             branch: row.try_get("branch")?,
@@ -64,7 +69,7 @@ impl Issue {
     }
 }
 
-/// Create an issue at [`INITIAL_STATUS`] (`CONSOLIDATING`). Returns the new id.
+/// Create an issue at [`INITIAL_STATUS`]. Returns the new id.
 pub async fn create(
     pool: &SqlitePool,
     project_id: i64,
@@ -95,6 +100,33 @@ pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Issue>> {
         .fetch_optional(pool)
         .await?;
     row.as_ref().map(Issue::from_row).transpose()
+}
+
+pub async fn update_reports(
+    pool: &SqlitePool,
+    id: i64,
+    agent_summary: Option<&str>,
+    progress_report: Option<&str>,
+    result_report: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let n = sqlx::query(
+        "UPDATE issues
+         SET agent_summary = COALESCE(?, agent_summary),
+             progress_report = COALESCE(?, progress_report),
+             result_report = COALESCE(?, result_report),
+             updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(agent_summary)
+    .bind(progress_report)
+    .bind(result_report)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    ensure_found(n, id)
 }
 
 /// All issues for a project, newest first.
@@ -159,44 +191,12 @@ async fn write_status(pool: &SqlitePool, id: i64, to: IssueStatus, now: i64) -> 
     Ok(())
 }
 
-/// Self-close by delegating into another issue: `CONSOLIDATING -> ABSORBED`
-/// plus recording the target. Legality of the status edge is enforced.
-pub async fn mark_absorbed(pool: &SqlitePool, id: i64, into_id: i64, now: i64) -> Result<()> {
-    if id == into_id {
-        return Err(anyhow!("issue {id} cannot absorb into itself"));
-    }
-    let source = get(pool, id)
-        .await?
-        .ok_or_else(|| anyhow!("issue {id} not found"))?;
-    let target = get(pool, into_id)
-        .await?
-        .ok_or_else(|| anyhow!("issue {into_id} not found"))?;
-    state::check_transition(source.status, IssueStatus::Absorbed)?;
-    if source.project_id != target.project_id {
-        return Err(anyhow!(
-            "issue {id} cannot absorb into issue {into_id} from another project"
-        ));
-    }
-    if !target.status.accepts_steering() {
-        return Err(anyhow!(
-            "issue {id} cannot absorb into issue {into_id} in status {}",
-            target.status.as_str()
-        ));
-    }
-    let n = sqlx::query(
-        "UPDATE issues SET status = ?, absorbed_into_id = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(IssueStatus::Absorbed.as_str())
-    .bind(into_id)
-    .bind(now)
-    .bind(id)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    if n == 0 {
-        return Err(anyhow!("issue {id} not found"));
-    }
-    Ok(())
+/// Deprecated compatibility shim. Backlog attachment now records the target on
+/// the backlog/message path instead of self-closing a donor issue.
+pub async fn mark_absorbed(_pool: &SqlitePool, id: i64, _into_id: i64, _now: i64) -> Result<()> {
+    Err(anyhow!(
+        "issue {id} absorption was replaced by backlog routing to queue messages"
+    ))
 }
 
 /// Record the worktree/branch/session a standalone issue acquires at PLANNING.
@@ -221,6 +221,17 @@ pub async fn set_worktree(
     .execute(pool)
     .await?
     .rows_affected();
+    ensure_found(n, id)
+}
+
+/// Delete an issue after the caller has handled runtime cleanup. Child tables
+/// cascade via schema FKs; backlog links use ON DELETE SET NULL.
+pub async fn remove(pool: &SqlitePool, id: i64) -> Result<()> {
+    let n = sqlx::query("DELETE FROM issues WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
     ensure_found(n, id)
 }
 

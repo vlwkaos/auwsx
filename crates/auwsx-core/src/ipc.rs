@@ -17,8 +17,13 @@ use crate::artifacts;
 use crate::backlog::{self, Approval, BacklogItem, Source};
 use crate::db::{
     agent_runs::{self, AgentRun},
+    arsenal::{self, ArsenalPreset, NewArsenalPreset},
+    ask_answers::{self, AskAnswer, AskMode},
     findings::{self, Finding, NewFinding, Severity},
+    global_settings::{self, GlobalSettings},
     issues::{self, Issue},
+    memory_presets::{self, MemoryPreset, NewMemoryPreset},
+    profiles::{self, Profile},
     projects::{
         self, CompletionPolicy, MergeMode, NewProject, Project, UpdateProject as ProjectUpdate,
     },
@@ -27,8 +32,12 @@ use crate::db::{
     Db,
 };
 use crate::events::Event;
+use crate::issue_control::ControlOutcome;
 use crate::main_jobs::{self, MainJob};
-use crate::routines::{self, Routine, RoutineType};
+use crate::memory;
+use crate::project_setup;
+use crate::routines::{self, OutputRoute, Routine};
+use crate::routing;
 use crate::scheduler::Scheduler;
 use crate::state::IssueStatus;
 use crate::steering::{self, Steering, SteeringSource};
@@ -48,6 +57,71 @@ use tokio::sync::{broadcast, Notify};
 pub enum Command {
     Ping,
 
+    // --- global config ---
+    ListArsenalPresets,
+    ListMemoryPresets,
+    GetGlobalSettings,
+    UpdateGlobalSettings {
+        memory_preset_name: String,
+        pipeline_ux_guidance: String,
+    },
+    UpsertArsenalPreset {
+        name: String,
+        main_agent_cmd: String,
+        plan_agent_cmd: String,
+        work_agent_cmd: String,
+        review_agent_cmd: Option<String>,
+    },
+    UpsertMemoryPreset {
+        name: String,
+        retrieve_kind: String,
+        retrieve_cmd: Option<String>,
+        save_kind: String,
+        save_cmd: Option<String>,
+        dream_kind: String,
+        dream_cmd: Option<String>,
+        deepsleep_kind: String,
+        deepsleep_cmd: Option<String>,
+    },
+    ListAskAnswers {
+        project_id: i64,
+        limit: i64,
+    },
+    MemoryRetrieve {
+        project_id: i64,
+        query: String,
+    },
+    MemorySave {
+        project_id: i64,
+        kind: String,
+        content: String,
+    },
+    MemoryConsolidate {
+        project_id: i64,
+        mode: String,
+    },
+    AskProject {
+        project_id: i64,
+        mode: AskMode,
+        question: String,
+    },
+    ListProfiles,
+    CreateProfile {
+        name: String,
+    },
+    RenameProfile {
+        profile_id: i64,
+        name: String,
+    },
+    MoveProjectToProfile {
+        project_id: i64,
+        profile_id: i64,
+    },
+    MoveProjectInProfile {
+        project_id: i64,
+        delta: isize,
+    },
+
     // --- projects ---
     ListProjects,
     GetProject {
@@ -57,6 +131,7 @@ pub enum Command {
         name: String,
         repo_path: String,
         default_branch: String,
+        arsenal_preset_name: Option<String>,
         main_agent_cmd: String,
         plan_agent_cmd: String,
         work_agent_cmd: String,
@@ -65,12 +140,17 @@ pub enum Command {
         completion_policy: Option<CompletionPolicy>,
         plan_gate_timeout_min: Option<i64>,
         completion_soft_timeout_min: Option<i64>,
+        /// Legacy autonomous cadence in minutes; `schedule_cron` is canonical.
+        schedule_interval_min: Option<i64>,
+        /// User-facing autonomous cadence: 5-field cron, @tick, @every, or normalized shorthand.
+        schedule_cron: Option<String>,
     },
     UpdateProject {
         project_id: i64,
         name: String,
         repo_path: String,
         default_branch: String,
+        arsenal_preset_name: Option<String>,
         main_agent_cmd: String,
         plan_agent_cmd: String,
         work_agent_cmd: String,
@@ -84,9 +164,17 @@ pub enum Command {
         conflict_max_attempts: i64,
         max_concurrency: i64,
         schedule_interval_min: Option<i64>,
+        schedule_cron: Option<String>,
         merge_mode: MergeMode,
         skill_path: Option<String>,
         deepsleep_interval_days: i64,
+        deepsleep_cron: Option<String>,
+    },
+    RemoveProject {
+        project_id: i64,
+        /// Delete only DB registration/history, leaving any live agent process
+        /// or worktree cleanup to the operator.
+        shallow: bool,
     },
 
     // --- backlog ---
@@ -137,11 +225,35 @@ pub enum Command {
         issue_id: i64,
         into_issue_id: i64,
     },
+    RemoveIssue {
+        issue_id: i64,
+    },
+    AbandonIssue {
+        issue_id: i64,
+    },
+    CleanupIssueWorktree {
+        issue_id: i64,
+    },
     RunSchedulerOnce {
         project_id: i64,
     },
+    ExecuteProject {
+        project_id: i64,
+    },
+    ExecuteIssue {
+        issue_id: i64,
+    },
     RunIssueNow {
         issue_id: i64,
+    },
+    RetryIssue {
+        issue_id: i64,
+    },
+    ApproveIssueMerge {
+        issue_id: i64,
+    },
+    ApproveProjectMerge {
+        project_id: i64,
     },
     RunBacklogNow {
         item_id: i64,
@@ -164,7 +276,7 @@ pub enum Command {
     CreateRoutine {
         project_id: i64,
         name: String,
-        routine_type: RoutineType,
+        output_route: OutputRoute,
         prompt: String,
         cron: String,
         writable_paths: Option<String>,
@@ -173,11 +285,14 @@ pub enum Command {
     UpdateRoutine {
         routine_id: i64,
         name: String,
-        routine_type: RoutineType,
+        output_route: OutputRoute,
         prompt: String,
         cron: String,
         writable_paths: Option<String>,
         enabled: bool,
+    },
+    RemoveRoutine {
+        routine_id: i64,
     },
     RecentAgentRunsByProject {
         project_id: i64,
@@ -272,12 +387,18 @@ pub enum Command {
 /// option (`Project(Option<_>)`), none of which serde_json can serialize under
 /// an internal `tag`. Adjacent tagging puts the payload in its own `data` field,
 /// so every variant shape round-trips.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
     Ok,
     Err { message: String },
     Id(i64),
+    AskAnswers(Vec<AskAnswer>),
+    ArsenalPresets(Vec<ArsenalPreset>),
+    MemoryPresets(Vec<MemoryPreset>),
+    GlobalSettings(GlobalSettings),
+    Profiles(Vec<Profile>),
     Projects(Vec<Project>),
     Project(Option<Project>),
     Backlog(Vec<BacklogItem>),
@@ -292,8 +413,10 @@ pub enum Response {
     MainJobs(Vec<MainJob>),
     SchedulerRuns(Vec<SchedulerRun>),
     LogTail { path: String, text: String },
+    MemoryText { text: String },
     Triaged { created_issue_ids: Vec<i64> },
     RanIssue { issue_id: i64 },
+    ApprovedMerge { issue_ids: Vec<i64> },
     Event(Event),
 }
 
@@ -301,6 +424,16 @@ impl Response {
     fn err(e: impl std::fmt::Display) -> Self {
         Response::Err {
             message: e.to_string(),
+        }
+    }
+}
+
+impl From<ControlOutcome> for Response {
+    fn from(outcome: ControlOutcome) -> Self {
+        match outcome {
+            ControlOutcome::Ok => Response::Ok,
+            ControlOutcome::RanIssue { issue_id } => Response::RanIssue { issue_id },
+            ControlOutcome::ApprovedMerge { issue_ids } => Response::ApprovedMerge { issue_ids },
         }
     }
 }
@@ -359,6 +492,102 @@ async fn dispatch_inner(
     Ok(match cmd {
         Command::Ping | Command::Subscribe | Command::Shutdown => Response::Ok,
 
+        // --- global config ---
+        Command::ListArsenalPresets => Response::ArsenalPresets(arsenal::list(pool).await?),
+        Command::ListMemoryPresets => Response::MemoryPresets(memory_presets::list(pool).await?),
+        Command::GetGlobalSettings => Response::GlobalSettings(global_settings::get(pool).await?),
+        Command::UpdateGlobalSettings {
+            memory_preset_name,
+            pipeline_ux_guidance,
+        } => {
+            global_settings::update(pool, &memory_preset_name, &pipeline_ux_guidance, now).await?;
+            Response::Ok
+        }
+        Command::UpsertArsenalPreset {
+            name,
+            main_agent_cmd,
+            plan_agent_cmd,
+            work_agent_cmd,
+            review_agent_cmd,
+        } => Response::Id(
+            arsenal::upsert(
+                pool,
+                NewArsenalPreset {
+                    name: &name,
+                    main_agent_cmd: &main_agent_cmd,
+                    plan_agent_cmd: &plan_agent_cmd,
+                    work_agent_cmd: &work_agent_cmd,
+                    review_agent_cmd: review_agent_cmd.as_deref(),
+                },
+                now,
+            )
+            .await?,
+        ),
+        Command::UpsertMemoryPreset {
+            name,
+            retrieve_kind,
+            retrieve_cmd,
+            save_kind,
+            save_cmd,
+            dream_kind,
+            dream_cmd,
+            deepsleep_kind,
+            deepsleep_cmd,
+        } => Response::Id(
+            memory_presets::upsert(
+                pool,
+                NewMemoryPreset {
+                    name: &name,
+                    retrieve_kind: &retrieve_kind,
+                    retrieve_cmd: retrieve_cmd.as_deref(),
+                    save_kind: &save_kind,
+                    save_cmd: save_cmd.as_deref(),
+                    dream_kind: &dream_kind,
+                    dream_cmd: dream_cmd.as_deref(),
+                    deepsleep_kind: &deepsleep_kind,
+                    deepsleep_cmd: deepsleep_cmd.as_deref(),
+                },
+                now,
+            )
+            .await?,
+        ),
+        Command::ListAskAnswers { project_id, limit } => {
+            Response::AskAnswers(ask_answers::list_by_project(pool, project_id, limit).await?)
+        }
+        Command::MemoryRetrieve { project_id, query } => Response::MemoryText {
+            text: memory::retrieve(db, project_id, &query).await?,
+        },
+        Command::MemorySave {
+            project_id,
+            kind,
+            content,
+        } => Response::MemoryText {
+            text: memory::save(db, project_id, &kind, &content).await?,
+        },
+        Command::MemoryConsolidate { project_id, mode } => Response::MemoryText {
+            text: memory::consolidate(db, project_id, &mode).await?,
+        },
+        Command::AskProject { .. } => {
+            anyhow::bail!("ask commands require the daemon runtime")
+        }
+        Command::ListProfiles => Response::Profiles(profiles::list(pool).await?),
+        Command::CreateProfile { name } => Response::Id(profiles::create(pool, &name, now).await?),
+        Command::RenameProfile { profile_id, name } => {
+            profiles::rename(pool, profile_id, &name).await?;
+            Response::Ok
+        }
+        Command::MoveProjectToProfile {
+            project_id,
+            profile_id,
+        } => {
+            projects::move_to_profile(pool, project_id, profile_id).await?;
+            Response::Ok
+        }
+        Command::MoveProjectInProfile { project_id, delta } => {
+            projects::move_within_profile(pool, project_id, delta).await?;
+            Response::Ok
+        }
+
         // --- projects ---
         Command::ListProjects => Response::Projects(projects::list(pool).await?),
         Command::GetProject { project_id } => {
@@ -368,6 +597,7 @@ async fn dispatch_inner(
             name,
             repo_path,
             default_branch,
+            arsenal_preset_name,
             main_agent_cmd,
             plan_agent_cmd,
             work_agent_cmd,
@@ -375,6 +605,8 @@ async fn dispatch_inner(
             completion_policy,
             plan_gate_timeout_min,
             completion_soft_timeout_min,
+            schedule_interval_min,
+            schedule_cron,
         } => {
             let id = projects::create(
                 pool,
@@ -382,6 +614,7 @@ async fn dispatch_inner(
                     name: &name,
                     repo_path: &repo_path,
                     default_branch: &default_branch,
+                    arsenal_preset_name: arsenal_preset_name.as_deref(),
                     main_agent_cmd: &main_agent_cmd,
                     plan_agent_cmd: &plan_agent_cmd,
                     work_agent_cmd: &work_agent_cmd,
@@ -389,10 +622,17 @@ async fn dispatch_inner(
                     completion_policy,
                     plan_gate_timeout_min,
                     completion_soft_timeout_min,
+                    schedule_interval_min,
+                    schedule_cron: schedule_cron.as_deref(),
                 },
                 now,
             )
             .await?;
+            if let Err(e) =
+                project_setup::ensure_agents_knowledge_block(Path::new(&repo_path), &name)
+            {
+                tracing::warn!("setting up AGENTS.md for project {name:?} failed: {e:#}");
+            }
             Response::Id(id)
         }
         Command::UpdateProject {
@@ -400,6 +640,7 @@ async fn dispatch_inner(
             name,
             repo_path,
             default_branch,
+            arsenal_preset_name,
             main_agent_cmd,
             plan_agent_cmd,
             work_agent_cmd,
@@ -413,9 +654,11 @@ async fn dispatch_inner(
             conflict_max_attempts,
             max_concurrency,
             schedule_interval_min,
+            schedule_cron,
             merge_mode,
             skill_path,
             deepsleep_interval_days,
+            deepsleep_cron,
         } => {
             projects::update(
                 pool,
@@ -424,6 +667,7 @@ async fn dispatch_inner(
                     name: &name,
                     repo_path: &repo_path,
                     default_branch: &default_branch,
+                    arsenal_preset_name: arsenal_preset_name.as_deref(),
                     main_agent_cmd: &main_agent_cmd,
                     plan_agent_cmd: &plan_agent_cmd,
                     work_agent_cmd: &work_agent_cmd,
@@ -437,13 +681,23 @@ async fn dispatch_inner(
                     conflict_max_attempts,
                     max_concurrency,
                     schedule_interval_min,
+                    schedule_cron: schedule_cron.as_deref(),
                     merge_mode,
                     skill_path: skill_path.as_deref(),
                     deepsleep_interval_days,
+                    deepsleep_cron: deepsleep_cron.as_deref(),
                 },
             )
             .await?;
+            if let Err(e) =
+                project_setup::ensure_agents_knowledge_block(Path::new(&repo_path), &name)
+            {
+                tracing::warn!("setting up AGENTS.md for project {name:?} failed: {e:#}");
+            }
             Response::Ok
+        }
+        Command::RemoveProject { .. } => {
+            anyhow::bail!("project removal requires the daemon runtime")
         }
 
         // --- backlog ---
@@ -484,7 +738,11 @@ async fn dispatch_inner(
             Response::Ok
         }
         Command::Triage { project_id } => {
-            let created = backlog::run_triage(pool, project_id, now).await?;
+            let created = routing::route_approved_project(pool, project_id, now)
+                .await?
+                .into_iter()
+                .map(|outcome| outcome.issue_id())
+                .collect();
             Response::Triaged {
                 created_issue_ids: created,
             }
@@ -511,46 +769,81 @@ async fn dispatch_inner(
         }
         Command::GetIssue { issue_id } => Response::Issue(issues::get(pool, issue_id).await?),
         Command::AddIssue {
-            project_id,
-            title,
-            description,
+            project_id: _,
+            title: _,
+            description: _,
         } => {
-            let id = issues::create(pool, project_id, &title, description.as_deref(), now).await?;
-            Response::Id(id)
+            anyhow::bail!("issues are agent-derived; add backlog and let routing create issues")
         }
         Command::SetIssueStatus {
             issue_id,
             status,
             force,
         } => {
-            if status == IssueStatus::Absorbed && !force {
-                anyhow::bail!("use `issue absorb <issue_id> <into_issue_id>` to record the target");
-            }
-            if force {
-                issues::force_status(pool, issue_id, status, now).await?;
+            let before = issues::get(pool, issue_id)
+                .await?
+                .map(|issue| issue.status.as_str().to_string());
+            let result = if force {
+                issues::force_status(pool, issue_id, status, now).await
             } else {
-                issues::transition(pool, issue_id, status, now).await?;
+                issues::transition(pool, issue_id, status, now).await
+            };
+            let after = issues::get(pool, issue_id)
+                .await?
+                .map(|issue| issue.status.as_str().to_string());
+            let log_path = agent_runs::latest_log_path_by_issue(pool, issue_id).await?;
+            match &result {
+                Ok(()) => {
+                    append_issue_system_event(
+                        log_path.as_deref(),
+                        serde_json::json!({
+                            "kind": "status",
+                            "issue_id": issue_id,
+                            "from": before,
+                            "to": status.as_str(),
+                            "after": after,
+                            "force": force,
+                            "result": "ok",
+                        }),
+                    );
+                }
+                Err(e) => {
+                    append_issue_system_event(
+                        log_path.as_deref(),
+                        serde_json::json!({
+                            "kind": "status",
+                            "issue_id": issue_id,
+                            "from": before,
+                            "to": status.as_str(),
+                            "after": after,
+                            "force": force,
+                            "result": "error",
+                            "error": e.to_string(),
+                        }),
+                    );
+                }
             }
+            result?;
             emit(events, Event::IssueStatus { issue_id, status });
             Response::Ok
         }
         Command::AbsorbIssue {
-            issue_id,
-            into_issue_id,
+            issue_id: _,
+            into_issue_id: _,
         } => {
-            issues::mark_absorbed(pool, issue_id, into_issue_id, now).await?;
-            emit(
-                events,
-                Event::IssueStatus {
-                    issue_id,
-                    status: IssueStatus::Absorbed,
-                },
-            );
-            Response::Ok
+            anyhow::bail!("issue absorption was replaced by backlog routing to queue messages")
         }
         Command::RunSchedulerOnce { .. }
+        | Command::ExecuteProject { .. }
+        | Command::ExecuteIssue { .. }
         | Command::RunIssueNow { .. }
+        | Command::RetryIssue { .. }
+        | Command::ApproveIssueMerge { .. }
+        | Command::ApproveProjectMerge { .. }
         | Command::RunBacklogNow { .. }
+        | Command::RemoveIssue { .. }
+        | Command::AbandonIssue { .. }
+        | Command::CleanupIssueWorktree { .. }
         | Command::RunRoutineNow { .. } => {
             anyhow::bail!("manual run commands require the daemon runtime")
         }
@@ -572,7 +865,7 @@ async fn dispatch_inner(
         Command::CreateRoutine {
             project_id,
             name,
-            routine_type,
+            output_route,
             prompt,
             cron,
             writable_paths,
@@ -583,7 +876,7 @@ async fn dispatch_inner(
                 routines::NewRoutine {
                     project_id,
                     name: &name,
-                    routine_type,
+                    output_route,
                     prompt: &prompt,
                     cron: &cron,
                     writable_paths: writable_paths.as_deref(),
@@ -596,7 +889,7 @@ async fn dispatch_inner(
         Command::UpdateRoutine {
             routine_id,
             name,
-            routine_type,
+            output_route,
             prompt,
             cron,
             writable_paths,
@@ -607,7 +900,7 @@ async fn dispatch_inner(
                 routine_id,
                 routines::UpdateRoutine {
                     name: &name,
-                    routine_type,
+                    output_route,
                     prompt: &prompt,
                     cron: &cron,
                     writable_paths: writable_paths.as_deref(),
@@ -615,6 +908,10 @@ async fn dispatch_inner(
                 },
             )
             .await?;
+            Response::Ok
+        }
+        Command::RemoveRoutine { routine_id } => {
+            routines::remove(pool, routine_id).await?;
             Response::Ok
         }
         Command::RecentAgentRunsByProject { project_id, limit } => {
@@ -762,6 +1059,15 @@ fn emit(events: &broadcast::Sender<Event>, ev: Event) {
     let _ = events.send(ev);
 }
 
+fn append_issue_system_event(log_path: Option<&str>, event: serde_json::Value) {
+    let Some(path) = log_path else {
+        return;
+    };
+    if let Err(e) = artifacts::append_system_event(Path::new(path), event) {
+        tracing::warn!("writing issue system log {path} failed: {e:#}");
+    }
+}
+
 /// Look up a backlog item's project to emit a `BacklogChanged` after a state
 /// change. Best-effort: a lookup miss just skips the event.
 async fn emit_backlog_changed(
@@ -889,9 +1195,19 @@ async fn handle_conn(
                 return Ok(());
             }
             manual @ (Command::RunSchedulerOnce { .. }
+            | Command::ExecuteProject { .. }
+            | Command::ExecuteIssue { .. }
             | Command::RunIssueNow { .. }
+            | Command::RetryIssue { .. }
+            | Command::ApproveIssueMerge { .. }
+            | Command::ApproveProjectMerge { .. }
             | Command::RunBacklogNow { .. }
-            | Command::RunRoutineNow { .. }) => {
+            | Command::RunRoutineNow { .. }
+            | Command::RemoveIssue { .. }
+            | Command::AbandonIssue { .. }
+            | Command::CleanupIssueWorktree { .. }
+            | Command::RemoveProject { .. }
+            | Command::AskProject { .. }) => {
                 let resp = dispatch_manual(&db, scheduler.as_deref(), now_ms(), manual).await;
                 write_line(&mut write_half, &resp).await?;
             }
@@ -927,13 +1243,56 @@ async fn manual_inner(_db: &Db, scheduler: &Scheduler, now: i64, cmd: Command) -
             scheduler.tick_project(project_id).await?;
             Response::Ok
         }
+        Command::ExecuteProject { project_id } => {
+            scheduler.execute_project(project_id, now).await?.into()
+        }
+        Command::ExecuteIssue { issue_id } => scheduler.execute_issue(issue_id, now).await?.into(),
         Command::RunIssueNow { issue_id } => {
             scheduler.run_issue_now(issue_id).await?;
             Response::RanIssue { issue_id }
         }
+        Command::RetryIssue { issue_id } => {
+            scheduler.retry_failed_issue(issue_id, now).await?;
+            Response::RanIssue { issue_id }
+        }
+        Command::ApproveIssueMerge { issue_id } => {
+            let issue_ids = scheduler.approve_issue_merge(issue_id, now).await?;
+            Response::ApprovedMerge { issue_ids }
+        }
+        Command::ApproveProjectMerge { project_id } => {
+            let issue_ids = scheduler.approve_project_merge(project_id, now).await?;
+            Response::ApprovedMerge { issue_ids }
+        }
         Command::RunBacklogNow { item_id } => {
             let issue_id = scheduler.run_backlog_now(item_id, now).await?;
             Response::RanIssue { issue_id }
+        }
+        Command::RemoveIssue { issue_id } => {
+            scheduler.remove_issue(issue_id, now).await?;
+            Response::Ok
+        }
+        Command::AbandonIssue { issue_id } => {
+            scheduler.abandon_issue(issue_id, now).await?;
+            Response::Ok
+        }
+        Command::CleanupIssueWorktree { issue_id } => {
+            scheduler.cleanup_issue_worktree_by_id(issue_id).await?;
+            Response::Ok
+        }
+        Command::RemoveProject {
+            project_id,
+            shallow,
+        } => {
+            scheduler.remove_project(project_id, shallow).await?;
+            Response::Ok
+        }
+        Command::AskProject {
+            project_id,
+            mode,
+            question,
+        } => {
+            let answer_id = scheduler.ask_project(project_id, mode, question).await?;
+            Response::Id(answer_id)
         }
         Command::RunRoutineNow { routine_id } => {
             let _main_job_id = scheduler.run_routine_now(routine_id).await?;
@@ -991,7 +1350,23 @@ pub async fn request(socket: &Path, cmd: &Command) -> Result<Response> {
     if n == 0 {
         anyhow::bail!("daemon closed connection without responding");
     }
-    Ok(serde_json::from_str(&line)?)
+    let resp: Response = serde_json::from_str(&line)?;
+    Ok(with_protocol_hint(resp))
+}
+
+fn with_protocol_hint(resp: Response) -> Response {
+    let Response::Err { message } = resp else {
+        return resp;
+    };
+    if message.contains("unknown variant") {
+        Response::Err {
+            message: format!(
+                "{message}; daemon protocol is older than this client, restart the auwsx daemon"
+            ),
+        }
+    } else {
+        Response::Err { message }
+    }
 }
 
 /// A live event subscription. Each [`next`](EventStream::next) yields one
@@ -1029,6 +1404,37 @@ impl EventStream {
         match serde_json::from_str::<Response>(&line)? {
             Response::Event(ev) => Ok(Some(ev)),
             other => anyhow::bail!("expected event, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{with_protocol_hint, Response};
+
+    #[test]
+    fn given_unknown_variant_error_when_protocol_hint_added_then_mentions_restart() {
+        let resp = with_protocol_hint(Response::Err {
+            message: "bad command: unknown variant `execute_issue`".to_string(),
+        });
+
+        match resp {
+            Response::Err { message } => {
+                assert!(message.contains("restart the auwsx daemon"));
+            }
+            other => panic!("expected err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_other_error_when_protocol_hint_added_then_message_is_unchanged() {
+        let resp = with_protocol_hint(Response::Err {
+            message: "issue 1 is already running".to_string(),
+        });
+
+        match resp {
+            Response::Err { message } => assert_eq!(message, "issue 1 is already running"),
+            other => panic!("expected err, got {other:?}"),
         }
     }
 }

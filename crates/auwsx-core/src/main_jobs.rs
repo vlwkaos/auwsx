@@ -152,6 +152,27 @@ pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<MainJob>> {
     row.as_ref().map(MainJob::from_row).transpose()
 }
 
+pub async fn list_running(pool: &SqlitePool) -> Result<Vec<MainJob>> {
+    let rows = sqlx::query("SELECT * FROM main_jobs WHERE status = ? ORDER BY id")
+        .bind(MainJobStatus::Running.as_str())
+        .fetch_all(pool)
+        .await?;
+    rows.iter().map(MainJob::from_row).collect()
+}
+
+pub async fn has_active_project_job(pool: &SqlitePool, project_id: i64) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM main_jobs
+         WHERE project_id = ?
+           AND status IN ('QUEUED','RUNNING')",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
 pub async fn enqueue_routine(
     pool: &SqlitePool,
     project_id: i64,
@@ -169,6 +190,72 @@ pub async fn enqueue_routine(
     .bind(project_id)
     .bind(routine_id)
     .bind(MainJobSource::Routine.as_str())
+    .bind(kind)
+    .bind(prompt)
+    .bind(MainJobStatus::Queued.as_str())
+    .bind(queued_at)
+    .fetch_one(pool)
+    .await?
+    .get("id");
+    Ok(id)
+}
+
+pub async fn enqueue_post_merge_dream(
+    pool: &SqlitePool,
+    project_id: i64,
+    issue_id: i64,
+    queued_at: i64,
+) -> Result<i64> {
+    let prompt = format!(
+        "Run memory consolidation after issue #{issue_id} merged. Use auwsx memory consolidate --mode dream and summarize the persisted knowledge."
+    );
+    enqueue_project_job(
+        pool,
+        project_id,
+        None,
+        MainJobSource::PostMerge,
+        "dream",
+        &prompt,
+        queued_at,
+    )
+    .await
+}
+
+pub async fn enqueue_project_deepsleep(
+    pool: &SqlitePool,
+    project_id: i64,
+    queued_at: i64,
+) -> Result<i64> {
+    enqueue_project_job(
+        pool,
+        project_id,
+        None,
+        MainJobSource::Routine,
+        "deepsleep",
+        "Run memory consolidation housekeeping for this project. Use auwsx memory consolidate --mode deepsleep and report any follow-up items.",
+        queued_at,
+    )
+    .await
+}
+
+async fn enqueue_project_job(
+    pool: &SqlitePool,
+    project_id: i64,
+    routine_id: Option<i64>,
+    source: MainJobSource,
+    kind: &str,
+    prompt: &str,
+    queued_at: i64,
+) -> Result<i64> {
+    let id: i64 = sqlx::query(
+        "INSERT INTO main_jobs
+            (project_id, routine_id, source, kind, prompt, status, queued_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(project_id)
+    .bind(routine_id)
+    .bind(source.as_str())
     .bind(kind)
     .bind(prompt)
     .bind(MainJobStatus::Queued.as_str())
