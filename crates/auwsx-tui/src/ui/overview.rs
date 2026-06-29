@@ -72,7 +72,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Some(TreeItem::BacklogRoot(_)) => render_backlog_summary(frame, app, cols[1]),
         Some(TreeItem::Backlog { .. }) => render_backlog(frame, app, cols[1]),
         Some(TreeItem::IssuesRoot(_)) => render_issue_summary(frame, app, cols[1]),
-        Some(TreeItem::Issue { .. }) => render_issue(frame, app, cols[1]),
+        Some(TreeItem::ArchiveRoot(_)) => render_archive_summary(frame, app, cols[1]),
+        Some(TreeItem::Issue { .. } | TreeItem::ArchivedIssue { .. }) => {
+            render_issue(frame, app, cols[1])
+        }
     }
 }
 

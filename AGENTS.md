@@ -23,6 +23,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - Project path inspection uses `repo_path`, e.g. `sqlite3 '<db path>' "SELECT id, name, repo_path FROM projects ORDER BY id;"`
 - Inline env assignment does not affect same-line shell expansion; use a literal id or `env AUWSX_ISSUE_ID=1 sh -c '"$AUWSX_BIN" issue status "$AUWSX_ISSUE_ID" PLANNING'`.
 - Active issue listing from an agent shell should use exported daemon env directly: `"$AUWSX_BIN" issue ls "$AUWSX_PROJECT_ID"`.
+- For issue-local `issue get`/`finding add`/`issue status`, use `$AUWSX_BIN`; `target/debug/auwsx` talks to the daemon and can fail on worker-only statuses.
 - Cargo test accepts one positional test filter per invocation; run multiple focused tests as separate `cargo test --package <pkg> <filter>` commands.
 - This repo has no `crates/auwsx-tui/tests`; broad source/test scans should use existing paths such as `crates/auwsx-core/tests` and `crates/auwsx-tui/src`.
 - Shell patterns containing Markdown backticks must be single-quoted, e.g. `rg -n 'on `FAILED`' README.md`; double quotes trigger command substitution.
@@ -30,9 +31,15 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - Process inspection should use the plain approved form `ps -axo pid,command`; avoid filtering it with a pipe in this sandbox.
 - Package-scoped formatting avoids the sibling `wsx` path dependency: `cargo fmt --package auwsx-core --package auwsx-tui`.
 - If the configured current plan path is missing, list available plan files with `rg --files /Users/eliot/.claude/plans`.
+- During conflict resolution, restore the default-side worktree copy with `git restore --ours --worktree <paths>`; `git restore --source=:2 --worktree <paths>` does not address conflict stages.
+- During non-interactive rebase conflict resolution, continue with `GIT_EDITOR=true git rebase --continue` so Git reuses the existing commit message instead of opening `nvim`.
+- Commit messages containing parentheses must be quoted in zsh, e.g. `git commit -m "docs(agents): note no-ff merge message quoting"`.
+- No-ff merge messages with spaces must be quoted, e.g. `git merge --no-ff auwsx/issue-3 -m "merge issue 3 archive progress view"`.
 - On macOS the default DB path is `~/Library/Application Support/auwsx/state.db`, not `~/.local/share/auwsx/state.db`.
 - The `agent_runs` start-time column is `spawned_at`; latest run inspection can use `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, issue_id, role, phase, status_before, status_after, spawned_at, exited_at, exit_kind, exit_code, log_path FROM agent_runs ORDER BY id DESC LIMIT 5;"`.
 - The findings review round column is `review_round`, not `round`; latest finding inspection can use `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, issue_id, review_round, severity, status, title FROM findings ORDER BY id DESC LIMIT 5;"`.
+- For review findings, use the literal provided id: `"$AUWSX_BIN" finding accept 3 "..."`; there is no `$AUWSX_FINDING_ID` env var in issue workers.
+- ^ Integration workers cannot `git switch main` from an issue worktree when `main` is already checked out in the sibling primary worktree; inspect `/Users/eliot/ws-ps/auwsx` before merging, and do not merge until overlapping dirty files there are committed or cleared.
 
 ## Key Files (planned, mostly stubs at scaffold time)
 

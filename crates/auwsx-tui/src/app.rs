@@ -95,6 +95,8 @@ pub enum TreeItem {
     Backlog { project_id: i64, id: i64 },
     IssuesRoot(i64),
     Issue { project_id: i64, id: i64 },
+    ArchiveRoot(i64),
+    ArchivedIssue { project_id: i64, id: i64 },
 }
 
 impl TreeItem {
@@ -105,9 +107,11 @@ impl TreeItem {
             | TreeItem::RoutinesRoot(id)
             | TreeItem::BacklogRoot(id)
             | TreeItem::IssuesRoot(id)
+            | TreeItem::ArchiveRoot(id)
             | TreeItem::Routine { project_id: id, .. }
             | TreeItem::Backlog { project_id: id, .. }
-            | TreeItem::Issue { project_id: id, .. } => *id,
+            | TreeItem::Issue { project_id: id, .. }
+            | TreeItem::ArchivedIssue { project_id: id, .. } => *id,
         }
     }
 }
@@ -988,6 +992,9 @@ pub struct App {
     pub children: HashMap<i64, ProjectChildren>,
     /// Project ids whose children are expanded in the tree.
     pub expanded: HashSet<i64>,
+    /// Project ids whose archive section is expanded. Archives are low-frequency
+    /// UX, so expanding a project does not automatically expose terminal issues.
+    pub archive_expanded: HashSet<i64>,
     pub issue_sel: usize,
     pub backlog_sel: usize,
     pub tree_sel: usize,
@@ -1047,6 +1054,7 @@ impl App {
             proj_sel: 0,
             children: HashMap::new(),
             expanded: HashSet::new(),
+            archive_expanded: HashSet::new(),
             issue_sel: 0,
             backlog_sel: 0,
             tree_sel: 0,
@@ -1422,9 +1430,31 @@ impl App {
                 _ => None,
             };
         }
+        self.selected_issue_row_id().or_else(|| {
+            (self.view == View::Issue)
+                .then(|| self.issues().get(self.issue_sel).map(|i| i.id))
+                .flatten()
+        })
+    }
+
+    fn selected_active_issue_id(&self) -> Option<i64> {
         match self.selected_tree_item() {
-            Some(TreeItem::Issue { id, .. }) => Some(id),
-            _ if self.view == View::Issue => self.issues().get(self.issue_sel).map(|i| i.id),
+            Some(TreeItem::Issue { id, .. }) => self
+                .selected_issue()
+                .filter(|issue| !issue.status.is_terminal())
+                .map(|_| id),
+            Some(TreeItem::ArchivedIssue { .. }) => None,
+            _ => self
+                .issues()
+                .get(self.issue_sel)
+                .filter(|issue| !issue.status.is_terminal())
+                .map(|issue| issue.id),
+        }
+    }
+
+    fn selected_issue_row_id(&self) -> Option<i64> {
+        match self.selected_tree_item() {
+            Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) => Some(id),
             _ => None,
         }
     }
@@ -1526,6 +1556,24 @@ impl App {
                     depth: 2,
                 });
             }
+
+            rows.push(TreeRow {
+                item: TreeItem::ArchiveRoot(p.id),
+                label: format!("Archive   {}", kids.archived_issues.len()),
+                depth: 1,
+            });
+            if self.archive_expanded.contains(&p.id) {
+                for i in &kids.archived_issues {
+                    rows.push(TreeRow {
+                        item: TreeItem::ArchivedIssue {
+                            project_id: p.id,
+                            id: i.id,
+                        },
+                        label: crate::ui::vm::issue_tree_label(i),
+                        depth: 2,
+                    });
+                }
+            }
         }
         rows
     }
@@ -1600,7 +1648,11 @@ impl App {
                 .children_of(project_id)?
                 .issues
                 .iter()
-                .chain(self.children_of(project_id)?.archived_issues.iter())
+                .find(|i| i.id == id),
+            TreeItem::ArchivedIssue { project_id, id } => self
+                .children_of(project_id)?
+                .archived_issues
+                .iter()
                 .find(|i| i.id == id),
             _ if self.view == View::Issue => self.issues().get(self.issue_sel),
             _ => None,
@@ -1746,6 +1798,9 @@ impl App {
             Some(TreeItem::IssuesRoot(_)) => {
                 caps.push(CapabilityAction::Drill, "Enter fold");
             }
+            Some(TreeItem::ArchiveRoot(_)) => {
+                caps.push(CapabilityAction::Drill, "Enter fold");
+            }
             Some(TreeItem::Issue { .. }) => {
                 caps.push(CapabilityAction::Drill, "Enter detail");
                 if self.selected_issue_accepts_queue_message() {
@@ -1754,6 +1809,10 @@ impl App {
                 if self.selected_issue_can_execute() {
                     caps.push(CapabilityAction::Execute, "E run");
                 }
+                caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
+            }
+            Some(TreeItem::ArchivedIssue { .. }) => {
+                caps.push(CapabilityAction::Drill, "Enter detail");
                 caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
             }
             None => {}
@@ -1811,6 +1870,46 @@ impl App {
         }
     }
 
+    fn select_issue_in_tree(&mut self, issue_id: i64) -> bool {
+        if let Some(project_id) = self.children.iter().find_map(|(project_id, kids)| {
+            kids.issues
+                .iter()
+                .chain(kids.archived_issues.iter())
+                .any(|issue| issue.id == issue_id)
+                .then_some(*project_id)
+        }) {
+            return self.preserve_tree_issue_selection(project_id, issue_id);
+        }
+
+        let rows = self.tree_rows();
+        let Some((idx, item)) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(idx, row)| match row.item {
+                TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }
+                    if id == issue_id =>
+                {
+                    Some((idx, row.item.clone()))
+                }
+                _ => None,
+            })
+        else {
+            return false;
+        };
+
+        self.tree_sel = idx;
+        if let TreeItem::Issue { project_id, id } = item {
+            if let Some(idx) = self
+                .children_of(project_id)
+                .and_then(|kids| kids.issues.iter().position(|issue| issue.id == id))
+            {
+                self.issue_sel = idx;
+            }
+        }
+        self.sync_active_project();
+        true
+    }
+
     // --- IPC helpers --------------------------------------------------------
 
     async fn req(&self, cmd: Command) -> Result<Response> {
@@ -1866,6 +1965,7 @@ impl App {
             let live: HashSet<i64> = self.projects.iter().map(|p| p.id).collect();
             self.children.retain(|id, _| live.contains(id));
             self.expanded.retain(|id| live.contains(id));
+            self.archive_expanded.retain(|id| live.contains(id));
             if self.expanded.is_empty() {
                 self.expanded.extend(live);
             }
@@ -1973,7 +2073,9 @@ impl App {
     /// Refresh just the active project's children (used after local mutations).
     async fn refresh_issues(&mut self) -> Result<()> {
         let selected_issue = match self.selected_tree_item() {
-            Some(TreeItem::Issue { project_id, id }) => Some((project_id, id)),
+            Some(
+                TreeItem::Issue { project_id, id } | TreeItem::ArchivedIssue { project_id, id },
+            ) => Some((project_id, id)),
             _ => None,
         };
         if let Some(pid) = self.selected_project_id() {
@@ -2129,6 +2231,7 @@ impl App {
                 self.log_tail_path = None;
                 self.issue_log_scroll = 0;
             }
+            self.clamp_issue_log_scroll();
         }
         Ok(())
     }
@@ -2136,6 +2239,11 @@ impl App {
     fn scroll_issue_log(&mut self, delta: isize) {
         let max = self.log_tail.lines().count().saturating_sub(1);
         self.issue_log_scroll = self.issue_log_scroll.saturating_add_signed(delta).min(max);
+    }
+
+    fn clamp_issue_log_scroll(&mut self) {
+        let max = self.log_tail.lines().count().saturating_sub(1);
+        self.issue_log_scroll = self.issue_log_scroll.min(max);
     }
 
     fn jump_issue_log_top(&mut self) {
@@ -2425,7 +2533,7 @@ impl App {
                             .await;
                         self.refresh_backlog().await?;
                     }
-                    Some(TreeItem::Issue { id, .. }) => {
+                    Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) => {
                         let (cmd, label) = self.issue_delete_command(id);
                         self.req_ok(cmd, label).await;
                         self.refresh_issues().await?;
@@ -2504,6 +2612,9 @@ impl App {
                     self.execute_control(Command::ExecuteIssue { issue_id })
                         .await;
                 }
+            }
+            Some(TreeItem::ArchivedIssue { .. }) => {
+                self.status = "archived issue is terminal; no run action available".into();
             }
             Some(TreeItem::Routine { id: routine_id, .. }) => {
                 self.req_ok(Command::RunRoutineNow { routine_id }, "routine run")
@@ -3003,8 +3114,8 @@ impl App {
                 self.refresh_asks().await?;
             }
             FormKind::QueueMessage => {
-                let Some(issue_id) = self.selected_issue_id() else {
-                    self.status = "select an issue first".into();
+                let Some(issue_id) = self.selected_active_issue_id() else {
+                    self.status = "select an active issue first".into();
                     return Ok(());
                 };
                 self.submit_create(
@@ -3075,7 +3186,9 @@ impl App {
         // cursor now sits in.
         self.sync_active_project();
         self.refresh_asks().await?;
-        if let Some(TreeItem::Issue { id, .. }) = self.selected_tree_item() {
+        if let Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) =
+            self.selected_tree_item()
+        {
             if let Some(idx) = self.issues().iter().position(|i| i.id == id) {
                 self.issue_sel = idx;
             }
@@ -3219,11 +3332,16 @@ impl App {
             self.issue_sel = idx;
         }
         if is_archived.is_some() {
-            if let Some(idx) = self
-                .tree_rows()
-                .iter()
-                .position(|row| row.item == TreeItem::Project(project_id))
-            {
+            self.archive_expanded.insert(project_id);
+            if let Some(idx) = self.tree_rows().iter().position(|row| {
+                matches!(
+                    &row.item,
+                    TreeItem::ArchivedIssue {
+                        project_id: pid,
+                        id
+                    } if *pid == project_id && *id == issue_id
+                )
+            }) {
                 self.tree_sel = idx;
                 self.sync_active_project();
                 return true;
@@ -3284,8 +3402,17 @@ impl App {
                 self.clamp_tree();
                 self.sync_active_project();
             }
+            Some(TreeItem::ArchiveRoot(pid)) => {
+                if self.archive_expanded.contains(&pid) {
+                    self.archive_expanded.remove(&pid);
+                } else {
+                    self.archive_expanded.insert(pid);
+                }
+                self.clamp_tree();
+                self.sync_active_project();
+            }
             // Enter on an issue keeps the main screen and moves focus to the detail pane.
-            Some(TreeItem::Issue { .. }) => {
+            Some(TreeItem::Issue { .. } | TreeItem::ArchivedIssue { .. }) => {
                 if self.enter_selected_issue_detail_from_left() {
                     self.refresh_detail().await?;
                 }
@@ -3328,13 +3455,26 @@ impl App {
     async fn on_event(&mut self, ev: Event) -> Result<()> {
         self.push_log(format_event(&ev));
         match ev {
-            Event::IssueStatus { .. }
-            | Event::IssueRemoved { .. }
+            Event::IssueStatus { issue_id, .. } => {
+                let should_reselect_issue = self.selected_issue_row_id() == Some(issue_id);
+                self.refresh_issues().await?;
+                if should_reselect_issue {
+                    self.select_issue_in_tree(issue_id);
+                }
+                self.refresh_detail().await?;
+                self.refresh_activity().await?;
+            }
+            Event::IssueRemoved { .. }
             | Event::FindingAdded { .. }
             | Event::SteeringAdded { .. } => {
                 self.refresh_issues().await?;
                 self.refresh_detail().await?;
                 self.refresh_activity().await?;
+            }
+            Event::IssueLog { issue_id, .. } => {
+                if self.selected_issue_matches(issue_id) {
+                    self.refresh_issue_runs_and_tail().await?;
+                }
             }
             Event::BacklogChanged { .. } => {
                 self.refresh_backlog().await?;
@@ -3354,11 +3494,6 @@ impl App {
             Event::MainJobStatus { .. } | Event::RoutineFired { .. } => {
                 self.refresh_routines().await?;
                 self.refresh_activity().await?;
-            }
-            Event::IssueLog { issue_id, .. } => {
-                if self.selected_issue_matches(issue_id) {
-                    self.refresh_issue_runs_and_tail().await?;
-                }
             }
             _ => {}
         }
@@ -3568,6 +3703,10 @@ async fn next_event(es: &mut Option<ipc::EventStream>) -> Option<Result<Event>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use auwsx_core::db::agent_runs::Role;
+    use auwsx_core::state::IssueStatus;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
 
     #[test]
     fn view_step_forward_one() {
@@ -3792,7 +3931,15 @@ mod tests {
         assert!(app.preserve_tree_issue_selection(1, 8));
 
         assert!(app.expanded.contains(&1));
-        assert_eq!(app.selected_tree_item(), Some(TreeItem::Project(1)));
+        assert!(app.archive_expanded.contains(&1));
+        assert_eq!(app.selected_issue_row_id(), Some(8));
+        assert_eq!(
+            app.selected_tree_item(),
+            Some(TreeItem::ArchivedIssue {
+                project_id: 1,
+                id: 8
+            })
+        );
     }
 
     #[test]
@@ -3936,12 +4083,331 @@ mod tests {
         assert_eq!(app.issue_log_scroll, 1);
     }
 
+    fn test_agent_run(id: i64, issue_id: i64, log_path: Option<&str>) -> AgentRun {
+        AgentRun {
+            id,
+            issue_id: Some(issue_id),
+            main_job_id: None,
+            role: Role::Work,
+            phase: "fix".into(),
+            agent_cmd: "agent".into(),
+            status_before: Some("implementing".into()),
+            status_after: None,
+            pid: Some(123),
+            exit_code: None,
+            exit_kind: None,
+            prompt_path: None,
+            log_path: log_path.map(str::to_string),
+            spawned_at: 1,
+            exited_at: None,
+            note: None,
+            phase_report: None,
+        }
+    }
+
+    fn issue_log_socket_path(name: &str) -> PathBuf {
+        let dir = PathBuf::from("target/auwsx-tui-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{name}-{}.sock", std::process::id()))
+    }
+
+    async fn serve_selected_issue_log(socket: PathBuf, ready: tokio::sync::oneshot::Sender<()>) {
+        if socket.exists() {
+            std::fs::remove_file(&socket).unwrap();
+        }
+        let listener = UnixListener::bind(&socket).unwrap();
+        let _ = ready.send(());
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let cmd: Command = serde_json::from_str(&line).unwrap();
+            let resp = match cmd {
+                Command::ListAgentRunsByIssue { issue_id: 7 } => {
+                    Response::AgentRuns(vec![test_agent_run(99, 7, Some("target/agent.log"))])
+                }
+                Command::TailAgentRunLog {
+                    agent_run_id: 99, ..
+                } => Response::LogTail {
+                    path: "target/agent.log".into(),
+                    text: "fresh\nlog".into(),
+                },
+                other => panic!("unexpected command: {other:?}"),
+            };
+            let mut stream = reader.into_inner();
+            let mut data = serde_json::to_vec(&resp).unwrap();
+            data.push(b'\n');
+            stream.write_all(&data).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+        std::fs::remove_file(&socket).unwrap();
+    }
+
     #[test]
     fn given_issue_log_at_oldest_when_scroll_older_then_clamps() {
         let mut app = test_app();
         app.log_tail = "one\ntwo\nthree\n".to_string();
 
         app.scroll_issue_log(10);
+
+        assert_eq!(app.issue_log_scroll, 2);
+    }
+
+    #[test]
+    fn given_terminal_and_active_issues_when_tree_rows_then_archive_is_collapsed_by_default() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                issues: vec![test_issue(1, IssueStatus::Working, "active")],
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+
+        let rows = app.tree_rows();
+        let labels = rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>();
+
+        assert!(labels.contains(&"Issues    1"));
+        assert!(labels.contains(&"Archive   1"));
+        assert!(rows.iter().any(|r| r.item
+            == TreeItem::Issue {
+                project_id: 42,
+                id: 1
+            }));
+        assert!(!rows.iter().any(|r| r.item
+            == TreeItem::ArchivedIssue {
+                project_id: 42,
+                id: 2
+            }));
+    }
+
+    #[test]
+    fn given_expanded_archive_when_tree_rows_then_archived_issues_are_visible() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                issues: vec![test_issue(1, IssueStatus::Working, "active")],
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+
+        let rows = app.tree_rows();
+
+        assert!(rows.iter().any(|r| r.item
+            == TreeItem::Issue {
+                project_id: 42,
+                id: 1
+            }));
+        assert!(rows.iter().any(|r| r.item
+            == TreeItem::ArchivedIssue {
+                project_id: 42,
+                id: 2
+            }));
+    }
+
+    #[test]
+    fn given_archived_issue_row_when_selected_then_issue_detail_selection_reuses_issue() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchivedIssue { id: 2, .. }))
+            .unwrap();
+
+        assert_eq!(app.selected_issue_id(), Some(2));
+        assert_eq!(
+            app.selected_issue().map(|issue| issue.title.as_str()),
+            Some("archived")
+        );
+    }
+
+    #[tokio::test]
+    async fn given_archived_issue_row_when_new_context_then_action_is_read_only() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchivedIssue { id: 2, .. }))
+            .unwrap();
+
+        app.apply(Action::NewContext).await.unwrap();
+
+        assert!(app.form.is_none());
+        assert_eq!(app.status, "issue cannot receive queue messages in DONE");
+    }
+
+    #[tokio::test]
+    async fn given_queue_message_form_when_selection_becomes_archived_then_submit_is_blocked() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchivedIssue { id: 2, .. }))
+            .unwrap();
+        let mut form = Form::steering();
+        form.set("note", "do it");
+        app.form = Some(form);
+
+        app.submit_form().await.unwrap();
+
+        assert_eq!(app.status, "select an active issue first");
+    }
+
+    #[test]
+    fn given_non_issue_row_when_issue_selection_falls_back_then_issue_row_id_is_empty() {
+        let mut app = test_app();
+        app.view = View::Issue;
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                issues: vec![test_issue(7, IssueStatus::Working, "active")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.issue_sel = 0;
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::Project(42)))
+            .unwrap();
+
+        assert_eq!(app.selected_issue_id(), Some(7));
+        assert_eq!(app.selected_issue_row_id(), None);
+    }
+
+    #[tokio::test]
+    async fn given_archive_root_when_drilled_then_archived_issue_rows_toggle() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchiveRoot(42)))
+            .unwrap();
+
+        app.drill().await.unwrap();
+
+        assert!(app.archive_expanded.contains(&42));
+        assert!(app.tree_rows().iter().any(|r| matches!(
+            r.item,
+            TreeItem::ArchivedIssue {
+                project_id: 42,
+                id: 2
+            }
+        )));
+
+        app.drill().await.unwrap();
+
+        assert!(!app.archive_expanded.contains(&42));
+        assert!(!app.tree_rows().iter().any(|r| matches!(
+            r.item,
+            TreeItem::ArchivedIssue {
+                project_id: 42,
+                id: 2
+            }
+        )));
+    }
+
+    #[test]
+    fn given_issue_moves_to_archive_when_reselected_then_tree_focus_follows_issue() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(7, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+
+        assert!(app.select_issue_in_tree(7));
+
+        assert!(app.archive_expanded.contains(&42));
+        assert!(matches!(
+            app.selected_tree_item(),
+            Some(TreeItem::ArchivedIssue { id: 7, .. })
+        ));
+        assert!(app.archive_expanded.contains(&42));
+        assert_eq!(app.selected_issue_id(), Some(7));
+        assert_eq!(app.selected_project_id(), Some(42));
+    }
+
+    #[test]
+    fn given_missing_issue_when_reselected_then_tree_focus_is_preserved() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(7, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = 2;
+
+        assert!(!app.select_issue_in_tree(99));
+
+        assert_eq!(app.tree_sel, 2);
+    }
+
+    #[test]
+    fn given_log_scroll_past_end_when_clamped_then_last_line_is_max() {
+        let mut app = test_app();
+        app.log_tail = "one\ntwo\nthree".into();
+        app.issue_log_scroll = 99;
+
+        app.clamp_issue_log_scroll();
 
         assert_eq!(app.issue_log_scroll, 2);
     }
@@ -3969,22 +4435,90 @@ mod tests {
         assert_eq!(app.issue_log_scroll, 0);
     }
 
-    #[test]
-    fn given_issue_selected_when_issue_log_event_matches_then_live_tail_should_refresh() {
-        let mut app = test_app();
-        app.projects.push(project_fixture());
+    #[tokio::test]
+    async fn given_selected_issue_log_event_when_handled_then_log_tail_refreshes() {
+        let socket = issue_log_socket_path("selected-issue-log");
+        let server_socket = socket.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            serve_selected_issue_log(server_socket, ready_tx).await;
+        });
+        ready_rx.await.unwrap();
+        let mut app = App::new(socket);
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
         app.children.insert(
-            1,
+            42,
             ProjectChildren {
-                issues: vec![issue_fixture()],
+                issues: vec![test_issue(7, IssueStatus::Working, "active")],
                 ..ProjectChildren::default()
             },
         );
-        app.expanded.insert(1);
-        app.select_tree_issue(7);
+        app.select_issue_in_tree(7);
+        app.log_tail = "stale".into();
+        app.log_tail_path = Some("target/agent.log".into());
 
-        assert!(app.selected_issue_matches(7));
-        assert!(!app.selected_issue_matches(8));
+        app.on_event(Event::IssueLog {
+            issue_id: 7,
+            phase: "fix".into(),
+            chunk: "new".into(),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(app.log_tail, "fresh\nlog");
+        assert_eq!(app.detail.runs.len(), 1);
+        assert_eq!(app.issue_log_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn given_other_issue_log_event_when_handled_then_no_log_refresh_is_requested() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                issues: vec![test_issue(7, IssueStatus::Working, "active")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.select_issue_in_tree(7);
+        app.log_tail = "current".into();
+
+        app.on_event(Event::IssueLog {
+            issue_id: 8,
+            phase: "fix".into(),
+            chunk: "new".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.log_tail, "current");
+    }
+
+    // --- archive/log fixtures --------------------------------------------
+
+    fn test_project() -> Project {
+        let mut project = project_fixture();
+        project.id = 42;
+        project.name = "demo".into();
+        project.schedule_interval_min = Some(15);
+        project.skill_path = Some("skills".into());
+        project
+    }
+
+    fn test_issue(id: i64, status: IssueStatus, title: &str) -> Issue {
+        let mut issue = issue_fixture();
+        issue.id = id;
+        issue.project_id = 42;
+        issue.status = status;
+        issue.title = title.into();
+        issue
     }
 
     #[tokio::test]
@@ -4016,7 +4550,9 @@ mod tests {
     // --- App::repo_suggestions -------------------------------------------
 
     fn test_app() -> App {
-        App::new(std::path::PathBuf::from("/tmp/test.sock"))
+        App::new(std::path::PathBuf::from(
+            "target/nonexistent-auwsx-test.sock",
+        ))
     }
 
     #[test]
