@@ -36,6 +36,8 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - On macOS the default DB path is `~/Library/Application Support/auwsx/state.db`, not `~/.local/share/auwsx/state.db`.
 - The `agent_runs` start-time column is `spawned_at`; latest run inspection can use `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, issue_id, role, phase, status_before, status_after, spawned_at, exited_at, exit_kind, exit_code, log_path FROM agent_runs ORDER BY id DESC LIMIT 5;"`.
 - The findings review round column is `review_round`, not `round`; latest finding inspection can use `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, issue_id, review_round, severity, status, title FROM findings ORDER BY id DESC LIMIT 5;"`.
+- For review findings, use the literal provided id: `"$AUWSX_BIN" finding accept 3 "..."`; there is no `$AUWSX_FINDING_ID` env var in issue workers.
+- ^ Integration workers cannot `git switch main` from an issue worktree when `main` is already checked out in the sibling primary worktree; inspect `/Users/eliot/ws-ps/auwsx` before merging.
 
 ## Key Files (planned, mostly stubs at scaffold time)
 
