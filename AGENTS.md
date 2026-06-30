@@ -41,7 +41,9 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - No-ff merge messages with spaces must be quoted, e.g. `git merge --no-ff auwsx/issue-3 -m "merge issue 3 archive progress view"`.
 - On macOS the default DB path is `~/Library/Application Support/auwsx/state.db`, not `~/.local/share/auwsx/state.db`.
 - The `agent_runs` start-time column is `spawned_at`; latest run inspection can use `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, issue_id, role, phase, status_before, status_after, spawned_at, exited_at, exit_kind, exit_code, log_path FROM agent_runs ORDER BY id DESC LIMIT 5;"`.
+- The `main_jobs` finish-time column is `ended_at`, not `finished_at` or `completed_at`; latest main job inspection can use `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, project_id, kind, status, queued_at, started_at, ended_at, outcome FROM main_jobs ORDER BY id DESC LIMIT 8;"`.
 - The findings review round column is `review_round`, not `round`; latest finding inspection can use `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, issue_id, review_round, severity, status, title FROM findings ORDER BY id DESC LIMIT 5;"`.
+- There is no `auwsx activity main-jobs` CLI command; inspect main jobs with `sqlite3 "$HOME/Library/Application Support/auwsx/state.db" "SELECT id, project_id, kind, status, queued_at, started_at, ended_at, log_path, outcome FROM main_jobs ORDER BY id DESC LIMIT 5;"`.
 - For review findings, use the literal provided id: `"$AUWSX_BIN" finding accept 3 "..."`; there is no `$AUWSX_FINDING_ID` env var in issue workers.
 - ^ Integration workers cannot `git switch main` from an issue worktree when `main` is already checked out in the sibling primary worktree; inspect `/Users/eliot/ws-ps/auwsx` before merging, and do not merge until overlapping dirty files there are committed or cleared.
 
@@ -56,6 +58,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - `crates/auwsx-core/src/routing.rs` — approved backlog semantic routing into existing queue-capable issues or new issues
 - `crates/auwsx-core/src/steering.rs` — append-only steering into in-flight issues
 - `crates/auwsx-core/src/main_jobs.rs` — main-workspace lifecycle, queued ops
+- `crates/auwsx-core/src/reconcile.rs` — project-level deterministic reconcile report, safe action classification, and agent proposal validation helpers
 - `crates/auwsx-core/src/routines.rs` — cron routines (incl. built-ins: triage, deepsleep, dream, morning-summary)
 - `crates/auwsx-core/src/inbox.rs` — `notify` watcher on `~/.auwsx/inbox/*.txt`
 - `crates/auwsx-core/src/agent/mod.rs` — direct-subprocess runner (`run`/`AgentSpec`/`AgentOutcome`/`ExitKind`, `{prompt}`-or-stdin); `{claude,codex,opencode}.rs` hold per-agent `DEFAULT_CMD` templates
