@@ -171,6 +171,7 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
     // Context for the prompt.
     let subtasks = subtasks::list_by_issue(pool, issue_id).await?;
     let steering = steering::list_pending(pool, issue_id).await?;
+    let steering_snapshot_ids: Vec<i64> = steering.iter().map(|item| item.id).collect();
     let open_findings = findings::list_open(pool, issue_id).await?;
     let global_settings = global_settings::get(pool).await?;
     let agent_cmd = project.agent_cmd_for(role);
@@ -460,6 +461,39 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
                     .to_string()
             },
         );
+    }
+    if let Err(e) =
+        steering::consume_ids(pool, issue_id, &steering_snapshot_ids, deps.clock.now_ms()).await
+    {
+        append_system_event(
+            &log_path,
+            serde_json::json!({
+                "kind": "queue_consume_failed",
+                "run_id": run_id,
+                "issue_id": issue_id,
+                "message": e.to_string(),
+            }),
+        );
+    }
+    if let Some(current) = issues::get(pool, issue_id).await? {
+        if current.has_pending_steering && current.status == IssueStatus::ReadyToMerge {
+            issues::transition(pool, issue_id, IssueStatus::Working, deps.clock.now_ms()).await?;
+            status_after = Some(IssueStatus::Working.as_str().to_string());
+            append_system_event(
+                &log_path,
+                serde_json::json!({
+                    "kind": "queue_rework",
+                    "run_id": run_id,
+                    "issue_id": issue_id,
+                    "from": IssueStatus::ReadyToMerge.as_str(),
+                    "to": IssueStatus::Working.as_str(),
+                }),
+            );
+            let _ = deps.events.send(Event::IssueStatus {
+                issue_id,
+                status: IssueStatus::Working,
+            });
+        }
     }
     let phase_report_path = cwd.join(".auwsx").join(PHASE_REPORT_FILE);
     let read_phase_report = read_phase_report(&cwd);

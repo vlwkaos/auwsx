@@ -95,10 +95,12 @@ fn project_with(max_concurrency: i64, completion_policy: CompletionPolicy) -> Pr
         default_branch: "main".to_string(),
         arsenal_preset_name: None,
         main_agent_cmd: "main {prompt}".to_string(),
+        route_agent_cmd: "main {prompt}".to_string(),
         plan_agent_cmd: "plan {prompt}".to_string(),
         work_agent_cmd: "work {prompt}".to_string(),
         review_agent_cmd: None,
         main_agent_cmd_override: Some("main {prompt}".to_string()),
+        route_agent_cmd_override: Some("main {prompt}".to_string()),
         plan_agent_cmd_override: Some("plan {prompt}".to_string()),
         work_agent_cmd_override: Some("work {prompt}".to_string()),
         review_agent_cmd_override: None,
@@ -592,6 +594,31 @@ fn given_codex_memory_invocation_when_build_complete_then_uses_dollar_skill() {
 }
 
 #[test]
+fn given_merge_prompt_when_built_then_includes_dirty_main_recovery_contract() {
+    let issue = issue_at(1, IssueStatus::Merging);
+    let ctx = PromptContext {
+        issue: &issue,
+        subtasks: &[],
+        steering: &[],
+        open_findings: &[],
+        pipeline_ux_guidance: None,
+        memory_invocation: MemoryInvocation::Dollar,
+    };
+
+    let text = prompt::build(&ctx).expect("merge prompt");
+
+    assert!(text.contains("\"$AUWSX_BIN\" issue apply-merge \"$AUWSX_ISSUE_ID\""));
+    assert!(text.contains("Do not hand-roll primary-worktree stash/merge/restore commands"));
+    assert!(text.contains("CONFLICT_BLOCKED"));
+    assert!(text.contains("set exactly one issue status"));
+    assert!(text.contains("do not invoke"));
+    assert!(text.contains("$memory-save"));
+    assert!(text.contains("again"));
+    assert!(text.contains("issue-local control mode"));
+    assert!(text.contains("`apply-merge` owns the final status transition"));
+}
+
+#[test]
 fn given_prompt_preview_count_when_checked_then_matches_catalog_len() {
     assert_eq!(prompt::preview_count(), prompt::preview_catalog().len());
 }
@@ -1035,6 +1062,7 @@ async fn drive_project(pool: &SqlitePool) -> anyhow::Result<i64> {
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "main {prompt}",
+            route_agent_cmd: "main {prompt}",
             plan_agent_cmd: "plan {prompt}",
             work_agent_cmd: "work {prompt}",
             review_agent_cmd: None,
@@ -1980,6 +2008,7 @@ async fn given_issue_running_in_other_project_when_tick_project_then_capacity_is
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "main {prompt}",
+            route_agent_cmd: "main {prompt}",
             plan_agent_cmd: "plan {prompt}",
             work_agent_cmd: "work {prompt}",
             review_agent_cmd: None,

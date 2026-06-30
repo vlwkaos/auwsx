@@ -34,6 +34,7 @@ pub mod issues;
 pub mod memory_presets;
 pub mod profiles;
 pub mod projects;
+pub mod routing_runs;
 pub mod scheduler_runs;
 pub mod subtasks;
 
@@ -46,6 +47,7 @@ pub use issues::Issue;
 pub use memory_presets::MemoryPreset;
 pub use profiles::Profile;
 pub use projects::Project;
+pub use routing_runs::RoutingRun;
 pub use scheduler_runs::SchedulerRun;
 pub use subtasks::Subtask;
 

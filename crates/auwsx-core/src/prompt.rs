@@ -337,12 +337,31 @@ fn conflicted(_ctx: &PromptContext) -> String {
 fn completing(_ctx: &PromptContext) -> String {
     let memory_save = _ctx.memory_invocation.skill("memory-save");
     "JOB (complete): integrate this issue.\n\
-     - Rebase the worktree branch onto the current default branch (do NOT merge \
-       default into the branch), then merge with a single `--no-ff` commit.\n\
-     - Record durable memory of what shipped (`{memory_save}`).\n\
-     - On success: `\"$AUWSX_BIN\" issue status \"$AUWSX_ISSUE_ID\" DONE`.\n\
+     Order is part of the contract: perform the Git integration first, write \
+       `.auwsx/phase-report.md`, set exactly one issue status, then exit. Do \
+       not continue exploring after a successful merge.\n\
+     - Rebase the issue worktree branch onto the current default branch (do NOT merge \
+       default into the issue branch).\n\
+     - If repo setup guidance points to a missing plan file, list fallback files once; \
+       if they are unrelated, record that fact in the phase report and continue.\n\
+     - Do not hand-roll primary-worktree stash/merge/restore commands. Run \
+       `\"$AUWSX_BIN\" issue apply-merge \"$AUWSX_ISSUE_ID\"`; auwsx performs the \
+       named dirty-worktree snapshot, `--no-ff` merge, dirty-state restore, status \
+       transition, and structured merge log event.\n\
+     - After `apply-merge` returns ok, write `.auwsx/phase-report.md` and exit. \
+       In issue-local control mode the daemon applies DONE or CONFLICT_BLOCKED \
+       when it replays the command after this worker exits, so do not inspect \
+       or set another status.\n\
+     - Durable memory: if the issue branch already contains a committed \
+       `knowledge/sessions/...` record for this issue, cite that path in the \
+       phase report and do not invoke `{memory_save}` again. Otherwise record \
+       durable memory of what shipped with `{memory_save}`.\n\
+     - On success, immediately write `.auwsx/phase-report.md` and exit; \
+       `apply-merge` owns the final status transition.\n\
      - If the rebase hits conflicts you cannot finish here: \
-       `\"$AUWSX_BIN\" issue status \"$AUWSX_ISSUE_ID\" RESOLVING_CONFLICT`."
+       `\"$AUWSX_BIN\" issue status \"$AUWSX_ISSUE_ID\" RESOLVING_CONFLICT`.\n\
+     - If merge or stash-restore is blocked by dirty primary-worktree state, \
+       `apply-merge` sets CONFLICT_BLOCKED. Do not override it."
         .replace("{memory_save}", &memory_save)
 }
 

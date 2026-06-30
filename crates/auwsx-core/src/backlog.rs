@@ -255,14 +255,17 @@ pub async fn edit_text(pool: &SqlitePool, id: i64, text: &str) -> Result<()> {
 
 /// Link an item to the issue triage grouped it into (sets `consumed_issue_id`).
 pub async fn mark_consumed(pool: &SqlitePool, id: i64, issue_id: i64, now: i64) -> Result<()> {
-    let n =
-        sqlx::query("UPDATE backlog_items SET consumed_issue_id = ?, resolved_at = ? WHERE id = ?")
-            .bind(issue_id)
-            .bind(now)
-            .bind(id)
-            .execute(pool)
-            .await?
-            .rows_affected();
+    let n = sqlx::query(
+        "UPDATE backlog_items
+         SET consumed_issue_id = ?, resolved_at = ?
+         WHERE id = ? AND consumed_issue_id IS NULL",
+    )
+    .bind(issue_id)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
     ensure_found(n, id)
 }
 

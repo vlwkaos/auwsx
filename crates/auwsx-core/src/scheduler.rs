@@ -18,7 +18,7 @@ use crate::db::ask_answers::{self, AskMode};
 use crate::db::issues;
 use crate::db::projects::{self, CompletionPolicy, MergeMode, Project};
 use crate::db::scheduler_runs::{
-    self, SchedulerRunDecision, SchedulerRunPicked, SchedulerRunSource,
+    self, SchedulerRunDecision, SchedulerRunPicked, SchedulerRunRoute, SchedulerRunSource,
 };
 use crate::db::Issue;
 use crate::events::Event;
@@ -252,8 +252,23 @@ pub struct Scheduler {
     socket: PathBuf,
     tick_interval: Duration,
     running: Arc<Mutex<HashSet<i64>>>,
+    running_projects: Arc<Mutex<HashSet<i64>>>,
     running_routines: Arc<Mutex<HashSet<i64>>>,
     inflight: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+struct ProjectTickGuard {
+    project_id: i64,
+    running_projects: Arc<Mutex<HashSet<i64>>>,
+}
+
+impl Drop for ProjectTickGuard {
+    fn drop(&mut self) {
+        self.running_projects
+            .lock()
+            .unwrap()
+            .remove(&self.project_id);
+    }
 }
 
 impl Scheduler {
@@ -276,9 +291,21 @@ impl Scheduler {
             socket,
             tick_interval,
             running: Arc::new(Mutex::new(HashSet::new())),
+            running_projects: Arc::new(Mutex::new(HashSet::new())),
             running_routines: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn try_project_tick(&self, project_id: i64) -> Option<ProjectTickGuard> {
+        let mut running_projects = self.running_projects.lock().unwrap();
+        if !running_projects.insert(project_id) {
+            return None;
+        }
+        Some(ProjectTickGuard {
+            project_id,
+            running_projects: Arc::clone(&self.running_projects),
+        })
     }
 
     /// Run until `shutdown` fires: every `tick_interval`, tick all projects.
@@ -342,6 +369,9 @@ impl Scheduler {
     }
 
     async fn tick_project_from(&self, project_id: i64, source: SchedulerRunSource) -> Result<()> {
+        let Some(_tick_guard) = self.try_project_tick(project_id) else {
+            return Ok(());
+        };
         self.prune_inflight();
         let pool = self.db.pool();
         let Some(project) = projects::get(pool, project_id).await? else {
@@ -349,13 +379,22 @@ impl Scheduler {
         };
         let snapshot = self.running.lock().unwrap().clone();
         let now = self.clock.now_ms();
-        let routed = match routing::route_approved_project(pool, project_id, now).await {
+        let routed = match routing::route_approved_project_semantic(&routing::RouteDeps {
+            pool,
+            project: &project,
+            executor: self.executor.as_ref(),
+            socket: &self.socket,
+            now,
+        })
+        .await
+        {
             Ok(items) => items,
             Err(e) => {
                 tracing::warn!("routing backlog for project {project_id} failed: {e:#}");
                 Vec::new()
             }
         };
+        let route_outcomes: Vec<_> = routed.iter().map(|item| item.outcome.clone()).collect();
         let issues = issues::list_by_project(pool, project_id).await?;
         let issue_ids: HashSet<i64> = issues.iter().map(|issue| issue.id).collect();
         let project_running: HashSet<i64> = snapshot
@@ -364,7 +403,8 @@ impl Scheduler {
             .filter(|issue_id| issue_ids.contains(issue_id))
             .collect();
         let decisions = decide(&issues, &project, &project_running, now);
-        let triaged_issue_ids: Vec<i64> = routed.iter().map(|item| item.issue_id()).collect();
+        let triaged_issue_ids: Vec<i64> =
+            route_outcomes.iter().map(|item| item.issue_id()).collect();
         let pending_backlog =
             backlog::count_by_approval(pool, project_id, backlog::Approval::Pending)
                 .await
@@ -375,6 +415,7 @@ impl Scheduler {
                 .unwrap_or(0) as usize;
         let picked = picked_summary(
             &triaged_issue_ids,
+            &routed,
             &decisions,
             pending_backlog,
             ready_backlog,
@@ -396,16 +437,29 @@ impl Scheduler {
             }
         }
         let _ = self.events.send(Event::SchedulerTick { project_id });
-        for item in &routed {
+        for item in &route_outcomes {
             let _ = self.events.send(Event::BacklogChanged {
                 item_id: item.item_id(),
                 project_id,
                 approval: "approved".to_string(),
             });
-            let _ = self.events.send(Event::IssueStatus {
-                issue_id: item.issue_id(),
-                status: IssueStatus::New,
-            });
+            if let Ok(Some(issue)) = issues::get(pool, item.issue_id()).await {
+                let _ = self.events.send(Event::IssueStatus {
+                    issue_id: item.issue_id(),
+                    status: issue.status,
+                });
+            }
+            if let routing::RouteOutcome::AttachedToIssue {
+                issue_id,
+                message_id,
+                ..
+            } = item
+            {
+                let _ = self.events.send(Event::SteeringAdded {
+                    steering_id: *message_id,
+                    issue_id: *issue_id,
+                });
+            }
         }
 
         if matches!(source, SchedulerRunSource::Auto) {
@@ -646,7 +700,24 @@ impl Scheduler {
     }
 
     pub async fn run_backlog_now(&self, item_id: i64, now: i64) -> Result<i64> {
-        let issue_id = routing::route_one_now(self.db.pool(), item_id, now).await?;
+        let item = backlog::get(self.db.pool(), item_id)
+            .await?
+            .ok_or_else(|| anyhow!("backlog item {item_id} not found"))?;
+        let project = projects::get(self.db.pool(), item.project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {} not found", item.project_id))?;
+        let routed = routing::route_one_now_semantic(
+            &routing::RouteDeps {
+                pool: self.db.pool(),
+                project: &project,
+                executor: self.executor.as_ref(),
+                socket: &self.socket,
+                now,
+            },
+            item_id,
+        )
+        .await?;
+        let issue_id = routed.outcome.issue_id();
         self.run_issue_now(issue_id).await?;
         Ok(issue_id)
     }
@@ -1258,6 +1329,7 @@ fn same_repo_path(left: &Path, right: &Path) -> bool {
 
 fn picked_summary(
     triaged_issue_ids: &[i64],
+    routes: &[routing::RouteOneResult],
     decisions: &[Decision],
     pending_backlog: usize,
     ready_backlog: usize,
@@ -1280,6 +1352,15 @@ fn picked_summary(
         .collect();
     SchedulerRunPicked {
         triaged_issue_ids: triaged_issue_ids.to_vec(),
+        triaged_routes: routes
+            .iter()
+            .map(|route| SchedulerRunRoute {
+                backlog_item_id: route.outcome.item_id(),
+                issue_id: route.outcome.issue_id(),
+                kind: route.outcome.kind().to_string(),
+                fallback_reason: route.fallback_reason.clone(),
+            })
+            .collect(),
         decisions,
         pending_backlog,
         ready_backlog,

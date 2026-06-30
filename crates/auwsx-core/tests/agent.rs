@@ -41,6 +41,7 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "claude {prompt}",
+            route_agent_cmd: "claude {prompt}",
             plan_agent_cmd: "claude-plan {prompt}",
             work_agent_cmd: "claude-work {prompt}",
             review_agent_cmd: None,

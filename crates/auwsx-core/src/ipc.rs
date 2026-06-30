@@ -42,6 +42,7 @@ use crate::scheduler::Scheduler;
 use crate::state::IssueStatus;
 use crate::steering::{self, Steering, SteeringSource};
 use crate::Result;
+use crate::{local_merge, local_merge::LocalMergeOutcome};
 use anyhow::Context;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,8 @@ pub enum Command {
     UpsertArsenalPreset {
         name: String,
         main_agent_cmd: String,
+        #[serde(default)]
+        route_agent_cmd: String,
         plan_agent_cmd: String,
         work_agent_cmd: String,
         review_agent_cmd: Option<String>,
@@ -133,6 +136,8 @@ pub enum Command {
         default_branch: String,
         arsenal_preset_name: Option<String>,
         main_agent_cmd: String,
+        #[serde(default)]
+        route_agent_cmd: String,
         plan_agent_cmd: String,
         work_agent_cmd: String,
         review_agent_cmd: Option<String>,
@@ -152,6 +157,8 @@ pub enum Command {
         default_branch: String,
         arsenal_preset_name: Option<String>,
         main_agent_cmd: String,
+        #[serde(default)]
+        route_agent_cmd: String,
         plan_agent_cmd: String,
         work_agent_cmd: String,
         review_agent_cmd: Option<String>,
@@ -232,6 +239,9 @@ pub enum Command {
         issue_id: i64,
     },
     CleanupIssueWorktree {
+        issue_id: i64,
+    },
+    ApplyIssueMerge {
         issue_id: i64,
     },
     RunSchedulerOnce {
@@ -506,23 +516,32 @@ async fn dispatch_inner(
         Command::UpsertArsenalPreset {
             name,
             main_agent_cmd,
+            route_agent_cmd,
             plan_agent_cmd,
             work_agent_cmd,
             review_agent_cmd,
-        } => Response::Id(
-            arsenal::upsert(
-                pool,
-                NewArsenalPreset {
-                    name: &name,
-                    main_agent_cmd: &main_agent_cmd,
-                    plan_agent_cmd: &plan_agent_cmd,
-                    work_agent_cmd: &work_agent_cmd,
-                    review_agent_cmd: review_agent_cmd.as_deref(),
-                },
-                now,
+        } => {
+            let route_agent_cmd = if route_agent_cmd.trim().is_empty() {
+                work_agent_cmd.as_str()
+            } else {
+                route_agent_cmd.as_str()
+            };
+            Response::Id(
+                arsenal::upsert(
+                    pool,
+                    NewArsenalPreset {
+                        name: &name,
+                        main_agent_cmd: &main_agent_cmd,
+                        route_agent_cmd,
+                        plan_agent_cmd: &plan_agent_cmd,
+                        work_agent_cmd: &work_agent_cmd,
+                        review_agent_cmd: review_agent_cmd.as_deref(),
+                    },
+                    now,
+                )
+                .await?,
             )
-            .await?,
-        ),
+        }
         Command::UpsertMemoryPreset {
             name,
             retrieve_kind,
@@ -599,6 +618,7 @@ async fn dispatch_inner(
             default_branch,
             arsenal_preset_name,
             main_agent_cmd,
+            route_agent_cmd,
             plan_agent_cmd,
             work_agent_cmd,
             review_agent_cmd,
@@ -608,6 +628,12 @@ async fn dispatch_inner(
             schedule_interval_min,
             schedule_cron,
         } => {
+            let route_agent_cmd =
+                if route_agent_cmd.trim().is_empty() && arsenal_preset_name.is_none() {
+                    work_agent_cmd.as_str()
+                } else {
+                    route_agent_cmd.as_str()
+                };
             let id = projects::create(
                 pool,
                 NewProject {
@@ -616,6 +642,7 @@ async fn dispatch_inner(
                     default_branch: &default_branch,
                     arsenal_preset_name: arsenal_preset_name.as_deref(),
                     main_agent_cmd: &main_agent_cmd,
+                    route_agent_cmd,
                     plan_agent_cmd: &plan_agent_cmd,
                     work_agent_cmd: &work_agent_cmd,
                     review_agent_cmd: review_agent_cmd.as_deref(),
@@ -642,6 +669,7 @@ async fn dispatch_inner(
             default_branch,
             arsenal_preset_name,
             main_agent_cmd,
+            route_agent_cmd,
             plan_agent_cmd,
             work_agent_cmd,
             review_agent_cmd,
@@ -660,6 +688,12 @@ async fn dispatch_inner(
             deepsleep_interval_days,
             deepsleep_cron,
         } => {
+            let route_agent_cmd =
+                if route_agent_cmd.trim().is_empty() && arsenal_preset_name.is_none() {
+                    work_agent_cmd.as_str()
+                } else {
+                    route_agent_cmd.as_str()
+                };
             projects::update(
                 pool,
                 project_id,
@@ -669,6 +703,7 @@ async fn dispatch_inner(
                     default_branch: &default_branch,
                     arsenal_preset_name: arsenal_preset_name.as_deref(),
                     main_agent_cmd: &main_agent_cmd,
+                    route_agent_cmd,
                     plan_agent_cmd: &plan_agent_cmd,
                     work_agent_cmd: &work_agent_cmd,
                     review_agent_cmd: review_agent_cmd.as_deref(),
@@ -780,10 +815,16 @@ async fn dispatch_inner(
             status,
             force,
         } => {
-            let before = issues::get(pool, issue_id)
-                .await?
+            let before_issue = issues::get(pool, issue_id).await?;
+            let before = before_issue
+                .as_ref()
                 .map(|issue| issue.status.as_str().to_string());
-            let result = if force {
+            let result = if before_issue
+                .as_ref()
+                .is_some_and(|issue| issue.status == status)
+            {
+                Ok(())
+            } else if force {
                 issues::force_status(pool, issue_id, status, now).await
             } else {
                 issues::transition(pool, issue_id, status, now).await
@@ -825,6 +866,10 @@ async fn dispatch_inner(
             }
             result?;
             emit(events, Event::IssueStatus { issue_id, status });
+            Response::Ok
+        }
+        Command::ApplyIssueMerge { issue_id } => {
+            apply_issue_merge(pool, events, issue_id, now).await?;
             Response::Ok
         }
         Command::AbsorbIssue {
@@ -1057,6 +1102,103 @@ async fn dispatch_inner(
 /// Send an event, ignoring "no subscribers" (events are advisory).
 fn emit(events: &broadcast::Sender<Event>, ev: Event) {
     let _ = events.send(ev);
+}
+
+async fn apply_issue_merge(
+    pool: &sqlx::SqlitePool,
+    events: &broadcast::Sender<Event>,
+    issue_id: i64,
+    now: i64,
+) -> Result<()> {
+    let issue = issues::get(pool, issue_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("issue {issue_id} not found"))?;
+    if issue.status != IssueStatus::Merging {
+        anyhow::bail!(
+            "issue {issue_id} must be MERGING before apply-merge; current status is {}",
+            issue.status.as_str()
+        );
+    }
+    let project = projects::get(pool, issue.project_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project {} not found", issue.project_id))?;
+    if project.merge_mode != MergeMode::Local {
+        anyhow::bail!(
+            "issue {issue_id} belongs to project {} with non-local merge mode {}",
+            project.id,
+            project.merge_mode.as_str()
+        );
+    }
+    let branch = issue
+        .branch
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("issue {issue_id} has no branch"))?;
+    let repo_path = PathBuf::from(project.repo_path);
+    let log_path = agent_runs::latest_log_path_by_issue(pool, issue_id).await?;
+    append_issue_system_event(
+        log_path.as_deref(),
+        serde_json::json!({
+            "kind": "merge",
+            "issue_id": issue_id,
+            "branch": branch,
+            "stage": "start",
+            "repo_path": repo_path.display().to_string(),
+        }),
+    );
+
+    let merge_issue_id = issue_id;
+    let merge_branch = branch.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        local_merge::merge_issue_branch(&repo_path, merge_issue_id, &merge_branch)
+    })
+    .await??;
+
+    match outcome {
+        LocalMergeOutcome::Merged(result) => {
+            issues::transition(pool, issue_id, IssueStatus::Done, now).await?;
+            append_issue_system_event(
+                log_path.as_deref(),
+                serde_json::json!({
+                    "kind": "merge",
+                    "issue_id": issue_id,
+                    "branch": result.branch,
+                    "stage": "done",
+                    "dirty_snapshot": result.dirty_snapshot,
+                    "merge_commit": result.merge_commit,
+                }),
+            );
+            emit(
+                events,
+                Event::IssueStatus {
+                    issue_id,
+                    status: IssueStatus::Done,
+                },
+            );
+        }
+        LocalMergeOutcome::Blocked(blocked) => {
+            issues::transition(pool, issue_id, IssueStatus::ConflictBlocked, now).await?;
+            append_issue_system_event(
+                log_path.as_deref(),
+                serde_json::json!({
+                    "kind": "merge",
+                    "issue_id": issue_id,
+                    "branch": branch,
+                    "stage": "blocked",
+                    "blocked_stage": format!("{:?}", blocked.stage),
+                    "dirty_snapshot": blocked.dirty_snapshot,
+                    "message": blocked.message,
+                }),
+            );
+            emit(
+                events,
+                Event::IssueStatus {
+                    issue_id,
+                    status: IssueStatus::ConflictBlocked,
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 fn append_issue_system_event(log_path: Option<&str>, event: serde_json::Value) {
@@ -1350,7 +1492,9 @@ pub async fn request(socket: &Path, cmd: &Command) -> Result<Response> {
     if n == 0 {
         anyhow::bail!("daemon closed connection without responding");
     }
-    let resp: Response = serde_json::from_str(&line)?;
+    let resp: Response = serde_json::from_str(&line).with_context(|| {
+        "decoding daemon response; daemon protocol may be older than this client, restart the auwsx daemon"
+    })?;
     Ok(with_protocol_hint(resp))
 }
 

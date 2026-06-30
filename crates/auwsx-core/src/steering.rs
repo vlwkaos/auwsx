@@ -75,9 +75,8 @@ impl Steering {
 /// Append steering to an issue and flip its re-trigger flag, in one transaction.
 ///
 /// Guarded by `IssueStatus::accepts_queue_message`: the issue must be in a
-/// queue-eligible phase (a locked plan + worktree exist, or READY_TO_MERGE is
-/// waiting for human verification), otherwise this errors. Steering never
-/// touches `plan.md`, so it is meaningless before the plan is locked.
+/// queue-eligible phase. Pre-work queue messages are consumed by the plan
+/// phase; post-plan queue messages re-trigger implementation or replan.
 /// Returns the new steering id.
 pub async fn add(
     pool: &SqlitePool,
@@ -153,6 +152,39 @@ pub async fn consume_all(pool: &SqlitePool, issue_id: i64, now: i64) -> Result<(
     .execute(&mut *tx)
     .await?;
     sqlx::query("UPDATE issues SET has_pending_steering = 0, updated_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(issue_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Mark only the messages that were included in a worker snapshot as consumed.
+/// Messages added after the snapshot stay pending for the next worker.
+pub async fn consume_ids(pool: &SqlitePool, issue_id: i64, ids: &[i64], now: i64) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for id in ids {
+        sqlx::query(
+            "UPDATE steering SET consumed = 1, consumed_at = ?
+             WHERE id = ? AND issue_id = ? AND consumed = 0",
+        )
+        .bind(now)
+        .bind(id)
+        .bind(issue_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM steering WHERE issue_id = ? AND consumed = 0")
+            .bind(issue_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    sqlx::query("UPDATE issues SET has_pending_steering = ?, updated_at = ? WHERE id = ?")
+        .bind(if pending > 0 { 1 } else { 0 })
         .bind(now)
         .bind(issue_id)
         .execute(&mut *tx)

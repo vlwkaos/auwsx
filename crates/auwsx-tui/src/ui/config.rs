@@ -261,6 +261,7 @@ fn arsenal_detail_lines(preset: Option<&ArsenalPreset>) -> Vec<Line<'static>> {
         sep(),
         section("Role Commands"),
         kv("main", preset.main_agent_cmd.clone()),
+        kv("route", preset.route_agent_cmd.clone()),
         kv("plan", preset.plan_agent_cmd.clone()),
         kv("work", preset.work_agent_cmd.clone()),
         kv(

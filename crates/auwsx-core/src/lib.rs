@@ -38,6 +38,7 @@ pub mod inbox;
 pub mod ipc;
 pub mod issue_control;
 pub mod launchd;
+pub mod local_merge;
 pub mod main_job_runner;
 pub mod main_jobs;
 pub mod memory;

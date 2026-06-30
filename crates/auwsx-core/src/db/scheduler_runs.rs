@@ -62,11 +62,21 @@ pub enum SchedulerRunDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulerRunPicked {
     pub triaged_issue_ids: Vec<i64>,
+    #[serde(default)]
+    pub triaged_routes: Vec<SchedulerRunRoute>,
     pub decisions: Vec<SchedulerRunDecision>,
     pub pending_backlog: usize,
     pub ready_backlog: usize,
     pub running_issues: usize,
     pub max_concurrency: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerRunRoute {
+    pub backlog_item_id: i64,
+    pub issue_id: i64,
+    pub kind: String,
+    pub fallback_reason: Option<String>,
 }
 
 impl SchedulerRunPicked {

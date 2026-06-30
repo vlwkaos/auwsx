@@ -79,10 +79,14 @@ pub struct Project {
 
     pub arsenal_preset_name: Option<String>,
     pub main_agent_cmd: String,
+    #[serde(default)]
+    pub route_agent_cmd: String,
     pub plan_agent_cmd: String,
     pub work_agent_cmd: String,
     pub review_agent_cmd: Option<String>,
     pub main_agent_cmd_override: Option<String>,
+    #[serde(default)]
+    pub route_agent_cmd_override: Option<String>,
     pub plan_agent_cmd_override: Option<String>,
     pub work_agent_cmd_override: Option<String>,
     pub review_agent_cmd_override: Option<String>,
@@ -119,6 +123,7 @@ pub struct NewProject<'a> {
     /// Linked Arsenal preset. Commands below are per-project overrides when set.
     pub arsenal_preset_name: Option<&'a str>,
     pub main_agent_cmd: &'a str,
+    pub route_agent_cmd: &'a str,
     pub plan_agent_cmd: &'a str,
     pub work_agent_cmd: &'a str,
     /// NULL falls back to `work_agent_cmd` at spawn (still a fresh third-eye).
@@ -143,6 +148,7 @@ pub struct UpdateProject<'a> {
     /// Linked Arsenal preset. Commands below are per-project overrides when set.
     pub arsenal_preset_name: Option<&'a str>,
     pub main_agent_cmd: &'a str,
+    pub route_agent_cmd: &'a str,
     pub plan_agent_cmd: &'a str,
     pub work_agent_cmd: &'a str,
     pub review_agent_cmd: Option<&'a str>,
@@ -179,6 +185,10 @@ impl Project {
         }
     }
 
+    pub fn route_agent_cmd(&self) -> &str {
+        &self.route_agent_cmd
+    }
+
     fn from_row(row: &SqliteRow) -> Result<Self> {
         let merge_raw: String = row.try_get("merge_mode")?;
         let policy_raw: String = row.try_get("completion_policy")?;
@@ -191,10 +201,12 @@ impl Project {
             default_branch: row.try_get("default_branch")?,
             arsenal_preset_name: row.try_get("arsenal_preset_name")?,
             main_agent_cmd: row.try_get("main_agent_cmd")?,
+            route_agent_cmd: row.try_get("route_agent_cmd")?,
             plan_agent_cmd: row.try_get("plan_agent_cmd")?,
             work_agent_cmd: row.try_get("work_agent_cmd")?,
             review_agent_cmd: row.try_get("review_agent_cmd")?,
             main_agent_cmd_override: row.try_get("main_agent_cmd_override")?,
+            route_agent_cmd_override: row.try_get("route_agent_cmd_override")?,
             plan_agent_cmd_override: row.try_get("plan_agent_cmd_override")?,
             work_agent_cmd_override: row.try_get("work_agent_cmd_override")?,
             review_agent_cmd_override: row.try_get("review_agent_cmd_override")?,
@@ -232,10 +244,12 @@ const PROJECT_SELECT: &str = "
         p.default_branch,
         p.arsenal_preset_name,
         COALESCE(NULLIF(p.main_agent_cmd, ''), a.main_agent_cmd) AS main_agent_cmd,
+        COALESCE(NULLIF(p.route_agent_cmd, ''), a.route_agent_cmd, NULLIF(p.work_agent_cmd, ''), a.work_agent_cmd) AS route_agent_cmd,
         COALESCE(NULLIF(p.plan_agent_cmd, ''), a.plan_agent_cmd) AS plan_agent_cmd,
         COALESCE(NULLIF(p.work_agent_cmd, ''), a.work_agent_cmd) AS work_agent_cmd,
         COALESCE(NULLIF(p.review_agent_cmd, ''), a.review_agent_cmd) AS review_agent_cmd,
         NULLIF(p.main_agent_cmd, '') AS main_agent_cmd_override,
+        NULLIF(p.route_agent_cmd, '') AS route_agent_cmd_override,
         NULLIF(p.plan_agent_cmd, '') AS plan_agent_cmd_override,
         NULLIF(p.work_agent_cmd, '') AS work_agent_cmd_override,
         NULLIF(p.review_agent_cmd, '') AS review_agent_cmd_override,
@@ -276,6 +290,7 @@ async fn validate_agent_source(
     pool: &SqlitePool,
     arsenal_preset_name: Option<&str>,
     main_agent_cmd: &str,
+    route_agent_cmd: &str,
     plan_agent_cmd: &str,
     work_agent_cmd: &str,
 ) -> Result<Option<String>> {
@@ -290,11 +305,12 @@ async fn validate_agent_source(
             return Err(anyhow!("unknown Arsenal preset {name:?}"));
         }
     } else if main_agent_cmd.trim().is_empty()
+        || route_agent_cmd.trim().is_empty()
         || plan_agent_cmd.trim().is_empty()
         || work_agent_cmd.trim().is_empty()
     {
         return Err(anyhow!(
-            "main, plan, and work commands are required without an Arsenal preset"
+            "main, route, plan, and work commands are required without an Arsenal preset"
         ));
     }
     Ok(arsenal_preset_name)
@@ -310,6 +326,7 @@ pub async fn create(pool: &SqlitePool, new: NewProject<'_>, now: i64) -> Result<
         pool,
         new.arsenal_preset_name,
         new.main_agent_cmd,
+        new.route_agent_cmd,
         new.plan_agent_cmd,
         new.work_agent_cmd,
     )
@@ -318,9 +335,9 @@ pub async fn create(pool: &SqlitePool, new: NewProject<'_>, now: i64) -> Result<
     let id: i64 = sqlx::query(
         "INSERT INTO projects
             (profile_id, profile_order, name, repo_path, default_branch,
-             arsenal_preset_name, main_agent_cmd, plan_agent_cmd, work_agent_cmd, review_agent_cmd,
+             arsenal_preset_name, main_agent_cmd, route_agent_cmd, plan_agent_cmd, work_agent_cmd, review_agent_cmd,
              max_concurrency, created_at)
-         VALUES (1, (SELECT COALESCE(MAX(profile_order), 0) + 1 FROM projects WHERE profile_id = 1), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (1, (SELECT COALESCE(MAX(profile_order), 0) + 1 FROM projects WHERE profile_id = 1), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING id",
     )
     .bind(new.name)
@@ -328,6 +345,7 @@ pub async fn create(pool: &SqlitePool, new: NewProject<'_>, now: i64) -> Result<
     .bind(new.default_branch)
     .bind(arsenal_preset_name)
     .bind(new.main_agent_cmd)
+    .bind(new.route_agent_cmd)
     .bind(new.plan_agent_cmd)
     .bind(new.work_agent_cmd)
     .bind(new.review_agent_cmd)
@@ -383,6 +401,7 @@ pub async fn update(pool: &SqlitePool, id: i64, update: UpdateProject<'_>) -> Re
         pool,
         update.arsenal_preset_name,
         update.main_agent_cmd,
+        update.route_agent_cmd,
         update.plan_agent_cmd,
         update.work_agent_cmd,
     )
@@ -396,6 +415,7 @@ pub async fn update(pool: &SqlitePool, id: i64, update: UpdateProject<'_>) -> Re
             default_branch = ?,
             arsenal_preset_name = ?,
             main_agent_cmd = ?,
+            route_agent_cmd = ?,
             plan_agent_cmd = ?,
             work_agent_cmd = ?,
             review_agent_cmd = ?,
@@ -420,6 +440,7 @@ pub async fn update(pool: &SqlitePool, id: i64, update: UpdateProject<'_>) -> Re
     .bind(update.default_branch)
     .bind(arsenal_preset_name)
     .bind(update.main_agent_cmd)
+    .bind(update.route_agent_cmd)
     .bind(update.plan_agent_cmd)
     .bind(update.work_agent_cmd)
     .bind(update.review_agent_cmd)

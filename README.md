@@ -12,7 +12,8 @@ git primitives.
 Pre-release, but no longer scaffold-only. The current implementation includes:
 
 - SQLite-backed projects, backlog items, issues, steering, findings, subtasks,
-  routines, main jobs, scheduler runs, agent runs, and global Arsenal presets.
+  routines, main jobs, scheduler runs, route runs, agent runs, and global
+  Arsenal presets.
 - A daemon process with Unix-socket IPC. Database writes are daemon-owned.
 - A ratatui operator console with one project tree and contextual detail pane.
 - A deterministic issue pipeline driven by issue status.
@@ -86,8 +87,8 @@ databases and scripts. New UI and CLI writes should use `schedule_cron`.
 Manual commands bypass the cadence gate:
 
 - Project selected in the TUI: `E` runs one scheduler pass for that project.
-- Backlog item selected: `E` approves/promotes it if needed, then runs the new
-  issue's first actionable phase.
+- Backlog item selected: `E` approves/routes it if needed, then runs the target
+  issue's next actionable phase.
 - Issue selected: `E` runs the current actionable phase if it is not already
   running; on `FAILED`, it retries from the last actionable phase.
 - Routine selected: `E` enqueues and runs one main job for that routine.
@@ -96,8 +97,11 @@ The project detail pane shows a board with broad lanes (`TODO`, `IN PROGRESS`,
 `REVIEW`, `COMPLETE`) while each issue still carries its detailed scheduler
 status. A pending backlog item is not automatic work until it is approved; human
 and inbox backlog default to approved, agent and routine backlog default to
-pending. Promoted backlog is linked to its issue and drops out of the live
-backlog list.
+pending. Approved backlog is semantically routed: if it clearly belongs to an
+existing queue-capable issue, auwsx appends a consolidation queue message and
+links the backlog row to that issue; otherwise it creates a new issue. Ambiguous
+or failed route-agent output falls back to creating a new issue. Route decisions
+are recorded in `routing_runs`.
 
 ## Memory Interface
 
@@ -218,6 +222,7 @@ Deterministic parts:
 
 - Scheduler cadence and concurrency checks.
 - Backlog approval, triage, and consumed-item tracking.
+- Route-agent decisions and fallback reasons for approved backlog.
 - Issue status legality and soft gates.
 - Phase entry transitions before a subprocess is spawned.
 - Worktree creation/teardown.

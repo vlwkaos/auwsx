@@ -39,6 +39,22 @@ pub fn ask_log_path(project_id: i64, started_at: i64) -> Result<PathBuf> {
     Ok(base.join(format!("ask-{started_at}.log")))
 }
 
+pub fn routing_run_paths(
+    project_id: i64,
+    backlog_item_id: i64,
+    started_at: i64,
+) -> Result<(PathBuf, PathBuf)> {
+    let base = data_dir()
+        .join("routing")
+        .join(format!("project-{project_id}"));
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("creating routing run dir {}", base.display()))?;
+    Ok((
+        base.join(format!("backlog-{backlog_item_id}-{started_at}.log")),
+        base.join(format!("backlog-{backlog_item_id}-{started_at}.prompt.txt")),
+    ))
+}
+
 pub fn data_dir() -> PathBuf {
     if let Ok(env) = std::env::var("AUWSX_DATA_DIR") {
         return PathBuf::from(env);

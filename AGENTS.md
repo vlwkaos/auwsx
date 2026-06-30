@@ -15,6 +15,10 @@ cargo run --bin auwsx               # default = TUI (auto-starts daemon if none 
 cargo run --bin auwsx -- daemon     # start daemon explicitly
 ```
 
+## Project Workflow
+
+- auwsx feature/fix work must be implemented and merged through auwsx itself. Use direct edits only for emergency recovery, documentation-only corrections, or when auwsx is the thing being repaired and cannot run far enough to create/drive the issue. Record that caveat in the final report.
+
 ## Command Notes
 
 - Repo-local auwsx file listing without shell redirection: `rg --files .auwsx`
@@ -49,15 +53,16 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - `crates/auwsx-core/src/{clock,worktree,prompt}.rs` — ports/adapters: `Clock`+`SystemClock`; `Worktrees`+`WsxWorktrees` (wsx-core); per-phase prompt builder
 - `crates/auwsx-core/src/agent/mod.rs` also defines the `AgentExecutor` port + `SubprocessExecutor` (the test seam for the drive loop)
 - `crates/auwsx-core/src/backlog.rs` — backlog_items CRUD (source/approval) + triage/consolidation
+- `crates/auwsx-core/src/routing.rs` — approved backlog semantic routing into existing queue-capable issues or new issues
 - `crates/auwsx-core/src/steering.rs` — append-only steering into in-flight issues
 - `crates/auwsx-core/src/main_jobs.rs` — main-workspace lifecycle, queued ops
 - `crates/auwsx-core/src/routines.rs` — cron routines (incl. built-ins: triage, deepsleep, dream, morning-summary)
 - `crates/auwsx-core/src/inbox.rs` — `notify` watcher on `~/.auwsx/inbox/*.txt`
 - `crates/auwsx-core/src/agent/mod.rs` — direct-subprocess runner (`run`/`AgentSpec`/`AgentOutcome`/`ExitKind`, `{prompt}`-or-stdin); `{claude,codex,opencode}.rs` hold per-agent `DEFAULT_CMD` templates
-- `crates/auwsx-core/src/db/arsenal.rs` — global Arsenal presets for reusable per-role agent command templates
+- `crates/auwsx-core/src/db/arsenal.rs` — global Arsenal presets for reusable per-role agent command templates, including the cheap route-agent command
 - `crates/auwsx-core/src/db/global_settings.rs` — singleton global settings such as persisted Pipeline UX Standard prompt guidance
 - `crates/auwsx-core/src/ipc.rs` — Unix-socket `Command`/`Response`/`Event` protocol + `serve`/`request`/`EventStream` + unit-testable `dispatch`
-- `crates/auwsx-core/src/db/{projects,issues,subtasks,findings,agent_runs,ask_answers}.rs` — typed row structs + CRUD (issues/backlog/steering/findings persistence + append-only agent run/ask logs; `db/mod.rs` re-exports the row types)
+- `crates/auwsx-core/src/db/{projects,issues,subtasks,findings,agent_runs,routing_runs,ask_answers}.rs` — typed row structs + CRUD (issues/backlog/steering/findings persistence + append-only agent run/route/ask logs; `db/mod.rs` re-exports the row types)
 - `crates/auwsx-core/src/db/migrations/0001_init.sql` — full schema
 - `crates/auwsx-tui/src/cli.rs` — `auwsx` CLI: pure `parse` (arg grammar) + `run_daemon`/`run_request` IPC client glue
 - `crates/auwsx-tui/src/app.rs` — ratatui top-level state + view router

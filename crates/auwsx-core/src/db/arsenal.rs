@@ -14,6 +14,8 @@ pub struct ArsenalPreset {
     pub id: i64,
     pub name: String,
     pub main_agent_cmd: String,
+    #[serde(default)]
+    pub route_agent_cmd: String,
     pub plan_agent_cmd: String,
     pub work_agent_cmd: String,
     pub review_agent_cmd: Option<String>,
@@ -26,6 +28,7 @@ pub struct ArsenalPreset {
 pub struct NewArsenalPreset<'a> {
     pub name: &'a str,
     pub main_agent_cmd: &'a str,
+    pub route_agent_cmd: &'a str,
     pub plan_agent_cmd: &'a str,
     pub work_agent_cmd: &'a str,
     pub review_agent_cmd: Option<&'a str>,
@@ -37,6 +40,7 @@ impl ArsenalPreset {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
             main_agent_cmd: row.try_get("main_agent_cmd")?,
+            route_agent_cmd: row.try_get("route_agent_cmd")?,
             plan_agent_cmd: row.try_get("plan_agent_cmd")?,
             work_agent_cmd: row.try_get("work_agent_cmd")?,
             review_agent_cmd: row.try_get("review_agent_cmd")?,
@@ -67,19 +71,23 @@ pub async fn upsert(pool: &SqlitePool, preset: NewArsenalPreset<'_>, now: i64) -
         return Err(anyhow!("arsenal preset name is required"));
     }
     if preset.main_agent_cmd.trim().is_empty()
+        || preset.route_agent_cmd.trim().is_empty()
         || preset.plan_agent_cmd.trim().is_empty()
         || preset.work_agent_cmd.trim().is_empty()
     {
-        return Err(anyhow!("main, plan, and work agent commands are required"));
+        return Err(anyhow!(
+            "main, route, plan, and work agent commands are required"
+        ));
     }
 
     let id: i64 = sqlx::query(
         "INSERT INTO arsenal_agent_presets
-            (name, main_agent_cmd, plan_agent_cmd, work_agent_cmd, review_agent_cmd,
+            (name, main_agent_cmd, route_agent_cmd, plan_agent_cmd, work_agent_cmd, review_agent_cmd,
              builtin, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
          ON CONFLICT(name) DO UPDATE SET
             main_agent_cmd = excluded.main_agent_cmd,
+            route_agent_cmd = excluded.route_agent_cmd,
             plan_agent_cmd = excluded.plan_agent_cmd,
             work_agent_cmd = excluded.work_agent_cmd,
             review_agent_cmd = excluded.review_agent_cmd,
@@ -89,6 +97,7 @@ pub async fn upsert(pool: &SqlitePool, preset: NewArsenalPreset<'_>, now: i64) -
     )
     .bind(preset.name.trim())
     .bind(preset.main_agent_cmd)
+    .bind(preset.route_agent_cmd)
     .bind(preset.plan_agent_cmd)
     .bind(preset.work_agent_cmd)
     .bind(preset.review_agent_cmd)

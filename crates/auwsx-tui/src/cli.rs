@@ -65,7 +65,7 @@ USAGE:
         --deepsleep-kind portable|command|auwsx_skill [--deepsleep-cmd <cmd>]
 
   auwsx project add <name> <repo_path> --branch <b> \\
-        (--arsenal <preset> | --main <cmd> --plan <cmd> --work <cmd>) [--review <cmd>] \\
+        (--arsenal <preset> | --main <cmd> --plan <cmd> --work <cmd>) [--route <cmd>] [--review <cmd>] \\
         [--completion-policy manual|soft|auto] \\
         [--plan-gate-timeout <min>] [--merge-delay <min>] [--schedule <cron|30m|1h|1d>]
   auwsx project ls
@@ -82,6 +82,7 @@ USAGE:
   auwsx issue status <issue_id> <STATUS> [--force]
   auwsx issue retry <issue_id>             retry a FAILED issue
   auwsx issue merge <issue_id>             approve one READY_TO_MERGE issue
+  auwsx issue apply-merge <issue_id>       run deterministic local merge transaction
   auwsx issue abandon <issue_id>
   auwsx issue cleanup <issue_id>       remove this issue's worktree only
 
@@ -240,11 +241,13 @@ fn parse_arsenal(args: &[String]) -> Result<CliAction> {
         "ls" | "list" => Command::ListArsenalPresets,
         "set" => {
             p.exact_positionals(1, "arsenal set")?;
+            let work_agent_cmd = p.req_flag("work")?;
             Command::UpsertArsenalPreset {
                 name: p.pos(0, "name")?,
                 main_agent_cmd: p.req_flag("main")?,
+                route_agent_cmd: p.flag("route").unwrap_or_else(|| work_agent_cmd.clone()),
                 plan_agent_cmd: p.req_flag("plan")?,
-                work_agent_cmd: p.req_flag("work")?,
+                work_agent_cmd,
                 review_agent_cmd: p.flag("review"),
             }
         }
@@ -266,6 +269,11 @@ fn parse_project(args: &[String]) -> Result<CliAction> {
                     .with_context(|| format!("invalid --schedule {raw:?}"))?,
                 None => None,
             };
+            let work_agent_cmd = if has_arsenal {
+                p.flag("work").unwrap_or_default()
+            } else {
+                p.req_flag("work")?
+            };
             Command::AddProject {
                 name: p.pos(0, "name")?,
                 repo_path: p.pos(1, "repo_path")?,
@@ -276,16 +284,17 @@ fn parse_project(args: &[String]) -> Result<CliAction> {
                 } else {
                     p.req_flag("main")?
                 },
+                route_agent_cmd: if has_arsenal {
+                    p.flag("route").unwrap_or_default()
+                } else {
+                    p.flag("route").unwrap_or_else(|| work_agent_cmd.clone())
+                },
                 plan_agent_cmd: if has_arsenal {
                     p.flag("plan").unwrap_or_default()
                 } else {
                     p.req_flag("plan")?
                 },
-                work_agent_cmd: if has_arsenal {
-                    p.flag("work").unwrap_or_default()
-                } else {
-                    p.req_flag("work")?
-                },
+                work_agent_cmd,
                 review_agent_cmd: p.flag("review"),
                 completion_policy: match p.flag("completion-policy") {
                     Some(s) => Some(
@@ -376,6 +385,9 @@ fn parse_issue(args: &[String]) -> Result<CliAction> {
             issue_id: p.int(0, "issue_id")?,
         },
         "merge" => Command::ApproveIssueMerge {
+            issue_id: p.int(0, "issue_id")?,
+        },
+        "apply-merge" => Command::ApplyIssueMerge {
             issue_id: p.int(0, "issue_id")?,
         },
         "absorb" => Command::AbsorbIssue {
@@ -806,10 +818,11 @@ fn print_response(resp: Response) -> bool {
             for p in presets {
                 let kind = if p.builtin { "builtin" } else { "custom" };
                 println!(
-                    "{}\t{}\tmain={}\tplan={}\twork={}\treview={}",
+                    "{}\t{}\tmain={}\troute={}\tplan={}\twork={}\treview={}",
                     p.name,
                     kind,
                     p.main_agent_cmd,
+                    p.route_agent_cmd,
                     p.plan_agent_cmd,
                     p.work_agent_cmd,
                     p.review_agent_cmd
@@ -864,8 +877,8 @@ fn print_response(resp: Response) -> bool {
                 p.arsenal_preset_name.as_deref().unwrap_or("(custom)")
             );
             println!(
-                "agents: main={} plan={} work={}",
-                p.main_agent_cmd, p.plan_agent_cmd, p.work_agent_cmd
+                "agents: main={} route={} plan={} work={}",
+                p.main_agent_cmd, p.route_agent_cmd, p.plan_agent_cmd, p.work_agent_cmd
             );
             println!(
                 "policy: completion={} plan_gate={}min completion_soft={}min concurrency={}",
@@ -1253,6 +1266,7 @@ mod tests {
             CliAction::Request(Command::UpsertArsenalPreset {
                 name: "local".to_string(),
                 main_agent_cmd: "mc".to_string(),
+                route_agent_cmd: "wc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
                 review_agent_cmd: None,
@@ -1271,6 +1285,7 @@ mod tests {
             CliAction::Request(Command::UpsertArsenalPreset {
                 name: "local".to_string(),
                 main_agent_cmd: "mc".to_string(),
+                route_agent_cmd: "wc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
                 review_agent_cmd: Some("rc".to_string()),
@@ -1380,6 +1395,7 @@ mod tests {
                 default_branch: "main".to_string(),
                 arsenal_preset_name: None,
                 main_agent_cmd: "mc".to_string(),
+                route_agent_cmd: "wc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
                 review_agent_cmd: None,
@@ -1406,6 +1422,7 @@ mod tests {
                 default_branch: "dev".to_string(),
                 arsenal_preset_name: None,
                 main_agent_cmd: "mc".to_string(),
+                route_agent_cmd: "wc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
                 review_agent_cmd: Some("rc".to_string()),
@@ -1441,6 +1458,7 @@ mod tests {
                 default_branch: "main".to_string(),
                 arsenal_preset_name: Some("codex".to_string()),
                 main_agent_cmd: String::new(),
+                route_agent_cmd: String::new(),
                 plan_agent_cmd: String::new(),
                 work_agent_cmd: String::new(),
                 review_agent_cmd: None,
@@ -1693,6 +1711,14 @@ mod tests {
     }
 
     #[test]
+    fn given_issue_apply_merge_when_parsed_then_apply_issue_merge() {
+        assert_eq!(
+            parse(&argv(&["issue", "apply-merge", "5"])).unwrap(),
+            CliAction::Request(Command::ApplyIssueMerge { issue_id: 5 })
+        );
+    }
+
+    #[test]
     fn given_issue_absorb_when_parsed_then_absorbissue() {
         assert_eq!(
             parse(&argv(&["issue", "absorb", "1", "2"])).unwrap(),
@@ -1920,6 +1946,7 @@ mod tests {
                 default_branch: "main".to_string(),
                 arsenal_preset_name: None,
                 main_agent_cmd: "mc".to_string(),
+                route_agent_cmd: "wc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
                 review_agent_cmd: None,
@@ -2427,6 +2454,7 @@ mod tests {
                 default_branch: "main".to_string(),
                 arsenal_preset_name: None,
                 main_agent_cmd: "mc".to_string(),
+                route_agent_cmd: "wc".to_string(),
                 plan_agent_cmd: "pc".to_string(),
                 work_agent_cmd: "wc".to_string(),
                 review_agent_cmd: None,

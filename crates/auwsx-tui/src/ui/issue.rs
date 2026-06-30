@@ -5,7 +5,7 @@ use crate::app::App;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
@@ -217,6 +217,7 @@ pub(super) fn log_block_with_title_focused(
 }
 
 fn log_block_inner(frame: &mut Frame, area: Rect, app: &App, section: Option<&str>, focused: bool) {
+    frame.render_widget(Clear, area);
     let base_title = app
         .log_tail_path
         .as_ref()
@@ -229,7 +230,8 @@ fn log_block_inner(frame: &mut Frame, area: Rect, app: &App, section: Option<&st
             Some(section) => format!(" {section} "),
             None => " Agent log ".to_string(),
         });
-    let lines = readable_log_lines(&app.log_tail);
+    let log_width = area.width.saturating_sub(4).max(20) as usize;
+    let lines = readable_log_lines(&app.log_tail, log_width);
     let body = if lines.is_empty() {
         vec![Line::styled("No agent log yet.", theme::dim())]
     } else {
@@ -248,7 +250,6 @@ fn log_block_inner(frame: &mut Frame, area: Rect, app: &App, section: Option<&st
     };
     frame.render_widget(
         Paragraph::new(body)
-            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -260,8 +261,11 @@ fn log_block_inner(frame: &mut Frame, area: Rect, app: &App, section: Option<&st
     );
 }
 
-fn readable_log_lines(text: &str) -> Vec<Line<'static>> {
-    let mut lines: Vec<_> = text.lines().flat_map(readable_log_event).collect();
+fn readable_log_lines(text: &str, max_chars: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<_> = text
+        .lines()
+        .flat_map(|line| readable_log_event(line, max_chars))
+        .collect();
     let overflow = lines.len().saturating_sub(600);
     if overflow > 0 {
         lines.drain(0..overflow);
@@ -276,13 +280,13 @@ fn readable_log_lines(text: &str) -> Vec<Line<'static>> {
     lines
 }
 
-fn readable_log_event(raw: &str) -> Vec<Line<'static>> {
+fn readable_log_event(raw: &str, max_chars: usize) -> Vec<Line<'static>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Vec::new();
     }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return text_block("raw", trimmed, 8);
+        return text_block("raw", trimmed, 8, max_chars);
     };
     let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let item = value.get("item");
@@ -304,7 +308,7 @@ fn readable_log_event(raw: &str) -> Vec<Line<'static>> {
         ("turn.completed", _) => vec![Line::styled("turn completed", theme::dim())],
         ("item.started", Some("command_execution")) => vec![Line::raw(format!(
             "cmd started: {}",
-            command_text(item, 140)
+            command_text(item, max_chars.saturating_sub(14).max(4))
         ))],
         ("item.completed", Some("command_execution")) => {
             let code = item
@@ -318,17 +322,20 @@ fn readable_log_event(raw: &str) -> Vec<Line<'static>> {
                 .map(first_useful_output_line)
                 .filter(|line| !line.is_empty());
             let suffix = output
-                .map(|line| format!(" | {}", truncate(&line, 100)))
+                .map(|line| format!(" | {}", truncate(&line, max_chars / 2)))
                 .unwrap_or_default();
             vec![Line::raw(format!(
                 "cmd exit {code}: {}{suffix}",
-                command_text(item, 100)
+                command_text(
+                    item,
+                    max_chars.saturating_sub(suffix.chars().count() + 16).max(4)
+                )
             ))]
         }
         ("item.completed", Some("agent_message")) => item
             .and_then(|v| v.get("text"))
             .and_then(|v| v.as_str())
-            .map(|text| text_block("agent", text, 24))
+            .map(|text| text_block("agent", text, 24, max_chars))
             .unwrap_or_default(),
         ("item.started", Some(item_type)) => {
             vec![Line::styled(format!("{item_type} started"), theme::dim())]
@@ -338,7 +345,7 @@ fn readable_log_event(raw: &str) -> Vec<Line<'static>> {
         }
         ("item.failed", Some(item_type)) => vec![Line::raw(format!("{item_type} failed"))],
         _ if !event_type.is_empty() => vec![Line::styled(event_type.to_string(), theme::dim())],
-        _ => text_block("json", trimmed, 8),
+        _ => text_block("json", trimmed, 8, max_chars),
     }
 }
 
@@ -497,7 +504,7 @@ fn strip_outer_quotes(text: &str) -> &str {
     }
 }
 
-fn text_block(label: &str, text: &str, max_lines: usize) -> Vec<Line<'static>> {
+fn text_block(label: &str, text: &str, max_lines: usize, max_chars: usize) -> Vec<Line<'static>> {
     let normalized = normalize_log_text(text);
     let mut source_lines: Vec<String> = normalized
         .lines()
@@ -524,7 +531,11 @@ fn text_block(label: &str, text: &str, max_lines: usize) -> Vec<Line<'static>> {
     let total = source_lines.len();
     let mut out = vec![Line::styled(format!("{label}:"), theme::dim())];
     for line in source_lines.iter().take(max_lines) {
-        out.extend(wrap_log_text_line(&redact_secrets(line), 180, "  "));
+        out.extend(wrap_log_text_line(
+            &redact_secrets(line),
+            max_chars.saturating_sub(2).max(4),
+            "  ",
+        ));
     }
     if total > max_lines {
         out.push(Line::styled(
@@ -536,9 +547,58 @@ fn text_block(label: &str, text: &str, max_lines: usize) -> Vec<Line<'static>> {
 }
 
 fn normalize_log_text(text: &str) -> String {
-    text.replace("\\r\\n", "\n")
+    let expanded = text
+        .replace("\\r\\n", "\n")
         .replace("\\n", "\n")
-        .replace("\\t", "    ")
+        .replace("\\t", "    ");
+    strip_terminal_sequences(&expanded)
+}
+
+fn strip_terminal_sequences(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while !rest.is_empty() {
+        match rest.find('\x1b') {
+            Some(0) if rest.starts_with("\x1b[") => {
+                let after = &rest[2..];
+                rest = if let Some(end) = after.find(|c: char| c.is_ascii_alphabetic()) {
+                    &after[end + 1..]
+                } else {
+                    ""
+                };
+            }
+            Some(0) if rest.starts_with("\x1b]") => {
+                let after = &rest[2..];
+                rest = if let Some(end) = after.find('\x07') {
+                    &after[end + 1..]
+                } else if let Some(end) = after.find("\x1b\\") {
+                    &after[end + 2..]
+                } else {
+                    ""
+                };
+            }
+            Some(0) => {
+                rest = &rest[1..];
+            }
+            Some(pos) => {
+                push_printable(&rest[..pos], &mut out);
+                rest = &rest[pos..];
+            }
+            None => {
+                push_printable(rest, &mut out);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn push_printable(text: &str, out: &mut String) {
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\t' || (ch >= ' ' && ch != '\x7f') {
+            out.push(ch);
+        }
+    }
 }
 
 fn redact_secrets(text: &str) -> String {
@@ -621,11 +681,15 @@ mod tests {
             .collect::<String>()
     }
 
+    fn readable(raw: &str) -> Vec<Line<'static>> {
+        readable_log_event(raw, 120)
+    }
+
     #[test]
     fn given_codex_thread_event_when_readable_log_line_then_short_label() {
         let raw = r#"{"type":"thread.started","thread_id":"abc"}"#;
 
-        let lines = readable_log_event(raw);
+        let lines = readable(raw);
         let text = line_text(&lines[0]);
 
         assert_eq!(text, "thread started abc");
@@ -635,7 +699,7 @@ mod tests {
     fn given_codex_command_event_when_readable_log_line_then_shell_wrapper_removed() {
         let raw = r#"{"type":"item.started","item":{"type":"command_execution","command":"/bin/zsh -lc 'cargo test'"}}"#;
 
-        let lines = readable_log_event(raw);
+        let lines = readable(raw);
         let text = line_text(&lines[0]);
 
         assert_eq!(text, "cmd started: cargo test");
@@ -645,7 +709,7 @@ mod tests {
     fn given_unknown_json_event_when_readable_log_line_then_not_raw_json() {
         let raw = r#"{"type":"session.updated","value":1}"#;
 
-        let lines = readable_log_event(raw);
+        let lines = readable(raw);
         let text = line_text(&lines[0]);
 
         assert_eq!(text, "session.updated");
@@ -655,7 +719,7 @@ mod tests {
     fn given_auwsx_spawn_event_when_readable_log_line_then_shows_command_and_socket() {
         let raw = r#"{"type":"auwsx.event","event":{"kind":"spawn","run_id":7,"role":"plan","phase":"NEW","cmd":"codex exec --sandbox workspace-write --json {prompt}","socket":"/cache/auwsx.sock","control_outbox":"/worktree/.auwsx/control/run-1.jsonl"}}"#;
 
-        let lines = readable_log_event(raw);
+        let lines = readable(raw);
         let text = line_text(&lines[0]);
 
         assert_eq!(
@@ -668,7 +732,7 @@ mod tests {
     fn given_auwsx_status_event_when_readable_log_line_then_shows_transition_result() {
         let raw = r#"{"type":"auwsx.event","event":{"kind":"status","from":"NEW","to":"PLAN_READY","force":false,"result":"ok"}}"#;
 
-        let lines = readable_log_event(raw);
+        let lines = readable(raw);
         let text = line_text(&lines[0]);
 
         assert_eq!(text, "auwsx status: NEW -> PLAN_READY ok");
@@ -678,7 +742,7 @@ mod tests {
     fn given_auwsx_finish_event_when_readable_log_line_then_shows_exit_and_status() {
         let raw = r#"{"type":"auwsx.event","event":{"kind":"finish","run_id":8,"exit_kind":"exited","exit_code":0,"status_after":"WORKING"}}"#;
 
-        let lines = readable_log_event(raw);
+        let lines = readable(raw);
         let text = line_text(&lines[0]);
 
         assert_eq!(text, "auwsx finish run #8: exited/0, status WORKING");
@@ -688,7 +752,7 @@ mod tests {
     fn given_agent_message_with_literal_newlines_when_readable_log_event_then_multiline_block() {
         let raw = r#"{"type":"item.completed","item":{"type":"agent_message","text":"first\\nsecond\\nthird"}}"#;
 
-        let lines = readable_log_event(raw);
+        let lines = readable(raw);
         let text: Vec<_> = lines.iter().map(line_text).collect();
 
         assert_eq!(text, vec!["agent:", "  first", "  second", "  third"]);
@@ -698,7 +762,7 @@ mod tests {
     fn given_long_agent_message_when_readable_log_event_then_omits_tail() {
         let raw = r#"{"type":"item.completed","item":{"type":"agent_message","text":"1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n11\\n12\\n13\\n14\\n15\\n16\\n17\\n18\\n19\\n20\\n21\\n22\\n23\\n24\\n25"}}"#;
 
-        let lines = readable_log_event(raw);
+        let lines = readable(raw);
         let last = line_text(lines.last().expect("last"));
 
         assert_eq!(last, "  ... 1 more lines");
@@ -708,9 +772,32 @@ mod tests {
     fn given_secret_env_line_when_readable_log_event_then_value_is_redacted() {
         let raw = r#"{"type":"item.completed","item":{"type":"command_execution","command":"env","aggregated_output":"ANTHROPIC_TOKEN=sk-ant-example\nSAFE=value"}}"#;
 
-        let lines = readable_log_event(raw);
+        let lines = readable(raw);
         let text = line_text(&lines[0]);
 
         assert_eq!(text, "cmd exit ?: env | ANTHROPIC_TOKEN=<redacted>");
+    }
+
+    #[test]
+    fn given_long_agent_line_when_readable_log_event_then_wraps_to_width() {
+        let raw = r#"{"type":"item.completed","item":{"type":"agent_message","text":"abcdefghijklmnopqrstuvwxyz"}}"#;
+
+        let lines = readable_log_event(raw, 12);
+        let text: Vec<_> = lines.iter().map(line_text).collect();
+
+        assert_eq!(
+            text,
+            vec!["agent:", "  abcdefghij", "  klmnopqrst", "  uvwxyz"]
+        );
+    }
+
+    #[test]
+    fn given_ansi_and_control_output_when_readable_log_event_then_strips_terminal_sequences() {
+        let raw = r#"{"type":"item.completed","item":{"type":"agent_message","text":"\u001b[31mred\u001b[0m\u0007\\n\u001b]0;title\u0007plain"}}"#;
+
+        let lines = readable(raw);
+        let text: Vec<_> = lines.iter().map(line_text).collect();
+
+        assert_eq!(text, vec!["agent:", "  red", "  plain"]);
     }
 }

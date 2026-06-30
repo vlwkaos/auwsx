@@ -5,7 +5,7 @@ title: auwsx good-to-go axes
 description: Project-specific verification axes for auwsx changes, including enum/SQL parity, TUI action/view wiring, theme constraints, singleton settings, IPC routes, and prompt-policy safety.
 keywords: [good-to-go axes, enum SQL CHECK parity, IssueStatus, AskMode, TUI action view exhaustiveness, render smoke tests, theme single source of truth, Color grep, cargo test no-run, struct signature change, test target coverage, singleton settings, IPC response coverage, prompt policy, issue-local proxy, TUI capability mismatch]
 created: 2026-06-09
-modified: 2026-06-24
+modified: 2026-06-29
 ---
 
 # auwsx good-to-go axes
@@ -182,3 +182,20 @@ perform. Check that read-only config rows do not show Enter edit/open, hidden
 project actions such as `p` are gated, and sectioned typed forms preserve
 select/completion behavior. Prefer focused buffer assertions for footer/action
 labels over broad render-only smoke tests.
+
+## Agent decision run observability
+
+When a scheduler phase adds a new agent-mediated decision path outside normal
+issue `agent_runs`, verify the decision has its own durable run record and that
+all fallback paths close that row with an inspectable reason. The test must cover
+invalid agent output and executor-level failure, not only successful decisions.
+
+## IPC model compatibility during development
+
+When adding a field to any type serialized over IPC (`Command`, `Response`
+payload structs such as `Project`, config preset rows, events), decide whether a
+new client may see an old daemon response or a new daemon may receive an old
+client command. For additive fields, prefer `#[serde(default)]` plus boundary
+normalization in dispatch, and add a legacy JSON regression test. Otherwise add
+an explicit protocol-version/restart path so stale daemons do not surface raw
+`missing field` serde errors.

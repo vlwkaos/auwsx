@@ -35,7 +35,8 @@ use auwsx_core::steering::Steering;
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -256,6 +257,7 @@ impl Form {
                 field("branch", "main", false),
                 field("arsenal", "", true),
                 field("main_cmd", &codex, true),
+                field("route_cmd", &codex, true),
                 field("plan_cmd", &codex, true),
                 field("work_cmd", &codex, true),
                 field("review_cmd", "", true),
@@ -290,6 +292,11 @@ impl Form {
                 field(
                     "main_cmd",
                     project.main_agent_cmd_override.as_deref().unwrap_or(""),
+                    true,
+                ),
+                field(
+                    "route_cmd",
+                    project.route_agent_cmd_override.as_deref().unwrap_or(""),
                     true,
                 ),
                 field(
@@ -372,6 +379,11 @@ impl Form {
                 field(
                     "main_cmd",
                     preset.map(|p| p.main_agent_cmd.as_str()).unwrap_or(&codex),
+                    false,
+                ),
+                field(
+                    "route_cmd",
+                    preset.map(|p| p.route_agent_cmd.as_str()).unwrap_or(&codex),
                     false,
                 ),
                 field(
@@ -882,6 +894,7 @@ fn project_archive_count_label(children: &ProjectChildren) -> String {
 struct ProjectAgentConfig {
     arsenal_preset_name: Option<String>,
     main: String,
+    route: String,
     plan: String,
     work: String,
     review: Option<String>,
@@ -912,6 +925,10 @@ fn project_agent_config_from_form(
             .opt("main_cmd")
             .or_else(|| has_preset.then(String::new))
             .or_else(|| required_cmd(form, "main_cmd", status))?,
+        route: form
+            .opt("route_cmd")
+            .or_else(|| has_preset.then(String::new))
+            .or_else(|| required_cmd(form, "route_cmd", status))?,
         plan: form
             .opt("plan_cmd")
             .or_else(|| has_preset.then(String::new))
@@ -937,6 +954,7 @@ fn add_project_command_from_form(
         default_branch: form.get("branch"),
         arsenal_preset_name: agent_config.arsenal_preset_name,
         main_agent_cmd: agent_config.main,
+        route_agent_cmd: agent_config.route,
         plan_agent_cmd: agent_config.plan,
         work_agent_cmd: agent_config.work,
         review_agent_cmd: agent_config.review,
@@ -1001,6 +1019,7 @@ pub struct App {
     pub kanban_lane_sel: usize,
     pub kanban_card_sel: usize,
     pub issue_section_sel: usize,
+    pub issue_section_interactive: bool,
     pub issue_return_focus: Focus,
     pub issue_return_tree_sel: Option<usize>,
     pub move_mode: bool,
@@ -1036,6 +1055,10 @@ pub struct App {
     /// Git repos discovered under `$HOME` (display paths), for the New-project
     /// form's `repo_path` completion. Populated once by a background scan.
     pub scanned_repos: Vec<String>,
+    /// Dirty flags for the terminal renderer. Normal events only redraw; layout
+    /// and terminal-width-sensitive changes force a clear first.
+    needs_redraw: bool,
+    force_redraw: bool,
 }
 
 const LOG_CAP: usize = 500;
@@ -1061,6 +1084,7 @@ impl App {
             kanban_lane_sel: 0,
             kanban_card_sel: 0,
             issue_section_sel: 0,
+            issue_section_interactive: false,
             issue_return_focus: Focus::Left,
             issue_return_tree_sel: None,
             move_mode: false,
@@ -1084,7 +1108,18 @@ impl App {
             confirm_quit: false,
             pending_project_delete: None,
             scanned_repos: Vec::new(),
+            needs_redraw: true,
+            force_redraw: false,
         }
+    }
+
+    fn request_redraw(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    fn request_force_redraw(&mut self) {
+        self.needs_redraw = true;
+        self.force_redraw = true;
     }
 
     /// Fuzzy-completion suggestions for the New-project `repo_path` field, based
@@ -1249,6 +1284,7 @@ impl App {
     fn select_arsenal_preset(form: &mut Form, preset: &ArsenalPreset) {
         form.set("arsenal", &preset.name);
         form.set("main_cmd", "");
+        form.set("route_cmd", "");
         form.set("plan_cmd", "");
         form.set("work_cmd", "");
         form.set("review_cmd", "");
@@ -1262,6 +1298,7 @@ impl App {
             .iter()
             .find(|preset| {
                 project.main_agent_cmd == preset.main_agent_cmd
+                    && project.route_agent_cmd == preset.route_agent_cmd
                     && project.plan_agent_cmd == preset.plan_agent_cmd
                     && project.work_agent_cmd == preset.work_agent_cmd
                     && project.review_agent_cmd == preset.review_agent_cmd
@@ -2215,6 +2252,11 @@ impl App {
                         if self.log_tail_path.as_deref() != Some(path.as_str()) {
                             self.issue_log_scroll = 0;
                         }
+                        if self.log_tail != text
+                            || self.log_tail_path.as_deref() != Some(path.as_str())
+                        {
+                            self.request_force_redraw();
+                        }
                         self.log_tail = text;
                         self.log_tail_path = Some(path);
                     }
@@ -2258,6 +2300,27 @@ impl App {
         self.config_scroll = self.config_scroll.saturating_add_signed(delta).min(10_000);
     }
 
+    async fn ui_tick(&mut self) -> Result<()> {
+        self.clear_expired_status();
+        self.refresh_last_auto_ticks().await?;
+        match self.view {
+            View::Overview => {
+                if let Some(project_id) = self.selected_project_id() {
+                    self.refresh_project_children(project_id).await?;
+                    self.refresh_activity().await?;
+                }
+                if self.focus == Focus::IssueDetail || self.selected_issue().is_some() {
+                    self.refresh_detail().await?;
+                }
+            }
+            View::Issue => {
+                self.refresh_detail().await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     // --- action handling ----------------------------------------------------
 
     /// Apply one decoded action. Returns `true` when the app should quit.
@@ -2282,7 +2345,7 @@ impl App {
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_card(1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
-                    if self.issue_section_sel == 3 {
+                    if self.issue_section_sel == 3 && self.issue_section_interactive {
                         self.scroll_issue_log(-1);
                     } else {
                         self.move_issue_section(1);
@@ -2301,7 +2364,7 @@ impl App {
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_card(-1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
-                    if self.issue_section_sel == 3 {
+                    if self.issue_section_sel == 3 && self.issue_section_interactive {
                         self.scroll_issue_log(1);
                     } else {
                         self.move_issue_section(-1);
@@ -2333,7 +2396,10 @@ impl App {
                     self.scroll_issue_log(-10);
                 } else if self.view == View::Config {
                     self.scroll_config(10);
-                } else if self.focus == Focus::IssueDetail && self.issue_section_sel == 3 {
+                } else if self.focus == Focus::IssueDetail
+                    && self.issue_section_sel == 3
+                    && self.issue_section_interactive
+                {
                     self.scroll_issue_log(-10);
                 }
             }
@@ -2342,7 +2408,10 @@ impl App {
                     self.scroll_issue_log(10);
                 } else if self.view == View::Config {
                     self.scroll_config(-10);
-                } else if self.focus == Focus::IssueDetail && self.issue_section_sel == 3 {
+                } else if self.focus == Focus::IssueDetail
+                    && self.issue_section_sel == 3
+                    && self.issue_section_interactive
+                {
                     self.scroll_issue_log(10);
                 }
             }
@@ -2351,7 +2420,10 @@ impl App {
                     self.jump_issue_log_top();
                 } else if self.view == View::Config {
                     self.jump_settings_top();
-                } else if self.focus == Focus::IssueDetail && self.issue_section_sel == 3 {
+                } else if self.focus == Focus::IssueDetail
+                    && self.issue_section_sel == 3
+                    && self.issue_section_interactive
+                {
                     self.jump_issue_log_top();
                 }
             }
@@ -2360,11 +2432,22 @@ impl App {
                     self.jump_issue_log_bottom();
                 } else if self.view == View::Config {
                     self.jump_settings_bottom();
-                } else if self.focus == Focus::IssueDetail && self.issue_section_sel == 3 {
+                } else if self.focus == Focus::IssueDetail
+                    && self.issue_section_sel == 3
+                    && self.issue_section_interactive
+                {
                     self.jump_issue_log_bottom();
                 }
             }
             Action::Drill => {
+                if self.view == View::Overview
+                    && self.focus == Focus::IssueDetail
+                    && self.issue_section_sel == 3
+                {
+                    self.issue_section_interactive = true;
+                    self.status = "log scroll active".into();
+                    return Ok(false);
+                }
                 if !self.capabilities().has(CapabilityAction::Drill) {
                     self.status = "nothing to open here".into();
                     return Ok(false);
@@ -2379,6 +2462,10 @@ impl App {
             Action::PrevView => self.set_view(self.view.step(-1)).await?,
             Action::Back => {
                 if self.view == View::Overview && self.focus == Focus::IssueDetail {
+                    if self.issue_section_interactive {
+                        self.issue_section_interactive = false;
+                        return Ok(false);
+                    }
                     if self.issue_return_focus == Focus::ProjectKanban {
                         if let Some(tree_sel) = self.issue_return_tree_sel.take() {
                             self.tree_sel = tree_sel;
@@ -2940,6 +3027,7 @@ impl App {
                         default_branch: form.get("branch"),
                         arsenal_preset_name: agent_config.arsenal_preset_name,
                         main_agent_cmd: agent_config.main,
+                        route_agent_cmd: agent_config.route,
                         plan_agent_cmd: agent_config.plan,
                         work_agent_cmd: agent_config.work,
                         review_agent_cmd: agent_config.review,
@@ -2974,6 +3062,7 @@ impl App {
                     Command::UpsertArsenalPreset {
                         name: form.get("name"),
                         main_agent_cmd: form.get("main_cmd"),
+                        route_agent_cmd: form.get("route_cmd"),
                         plan_agent_cmd: form.get("plan_cmd"),
                         work_agent_cmd: form.get("work_cmd"),
                         review_agent_cmd: form.opt("review_cmd"),
@@ -3215,12 +3304,14 @@ impl App {
 
     fn move_issue_section(&mut self, delta: isize) {
         step(&mut self.issue_section_sel, delta, 4);
+        self.issue_section_interactive = false;
     }
 
     fn enter_issue_detail(&mut self, return_focus: Focus, return_tree_sel: Option<usize>) {
         self.issue_return_focus = return_focus;
         self.issue_return_tree_sel = return_tree_sel;
         self.focus = Focus::IssueDetail;
+        self.issue_section_interactive = false;
     }
 
     fn enter_selected_issue_detail_from_left(&mut self) -> bool {
@@ -3610,15 +3701,21 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
     // Blocking key reader on its own OS thread → async channel. crossterm's
     // event::read is blocking; this keeps it off the runtime without needing
     // the optional event-stream feature.
-    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<CEvent>();
     std::thread::spawn(move || loop {
         match event::read() {
-            Ok(CEvent::Key(k)) if k.kind == KeyEventKind::Press => {
-                if key_tx.send(k).is_err() {
+            Ok(ev) => {
+                let keep = matches!(
+                    ev,
+                    CEvent::Key(KeyEvent {
+                        kind: KeyEventKind::Press,
+                        ..
+                    }) | CEvent::Resize(_, _)
+                );
+                if keep && event_tx.send(ev).is_err() {
                     break;
                 }
             }
-            Ok(_) => {}
             Err(_) => break,
         }
     });
@@ -3638,44 +3735,100 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
         crate::repo_scan::scan_git_repos,
     ));
 
-    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
-        terminal.draw(|f| ui::draw(f, app))?;
+        if app.needs_redraw {
+            let force = app.force_redraw;
+            app.force_redraw = false;
+            draw_sync(terminal, force, |f| ui::draw(f, app))?;
+            app.needs_redraw = false;
+        }
 
         tokio::select! {
-            maybe_key = key_rx.recv() => {
-                let Some(key) = maybe_key else { break }; // reader thread gone
-                if app.confirm_quit {
-                    if app.handle_confirm_key(key).await? {
-                        break;
+            maybe_event = event_rx.recv() => {
+                let Some(event) = maybe_event else { break }; // reader thread gone
+                match event {
+                    CEvent::Resize(_, _) => {
+                        app.request_force_redraw();
                     }
-                } else if let Some(action) = input::map_key(app.view, key) {
-                    if app.form.is_some() {
-                        app.handle_form_key(key).await?;
-                    } else if app.apply(action).await? {
-                        break;
+                    CEvent::Key(key) => {
+                        if app.confirm_quit {
+                            if app.handle_confirm_key(key).await? {
+                                break;
+                            }
+                            app.request_redraw();
+                        } else if app.form.is_some() {
+                            app.handle_form_key(key).await?;
+                            app.request_redraw();
+                        } else if let Some(action) = input::map_key(app.view, key) {
+                            let force = matches!(
+                                action,
+                                Action::Down
+                                    | Action::Up
+                                    | Action::Left
+                                    | Action::Right
+                                    | Action::Drill
+                                    | Action::Back
+                                    | Action::NextView
+                                    | Action::PrevView
+                            );
+                            if app.apply(action).await? {
+                                break;
+                            }
+                            if force {
+                                app.request_force_redraw();
+                            } else {
+                                app.request_redraw();
+                            }
+                        }
                     }
-                } else if app.form.is_some() {
-                    app.handle_form_key(key).await?;
+                    _ => {}
                 }
             }
             ev = next_event(&mut events) => match ev {
-                Some(Ok(e)) => app.on_event(e).await?,
+                Some(Ok(e)) => {
+                    app.on_event(e).await?;
+                    app.request_redraw();
+                }
                 _ => {
                     // Stream closed or errored: drop to poll-only mode.
                     events = None;
                     app.connected = false;
+                    app.request_redraw();
                 }
             },
             repos = drain_scan(&mut repo_scan) => {
                 app.scanned_repos = repos;
                 repo_scan = None; // consumed; never poll the finished handle again
+                app.request_redraw();
             }
-            _ = tick.tick() => app.clear_expired_status(),
+            _ = tick.tick() => {
+                app.ui_tick().await?;
+                app.request_redraw();
+            }
         }
     }
     Ok(())
+}
+
+fn draw_sync<F>(terminal: &mut Tui, clear: bool, f: F) -> Result<()>
+where
+    F: FnOnce(&mut ratatui::Frame),
+{
+    execute!(std::io::stdout(), BeginSynchronizedUpdate)
+        .context("beginning synchronized terminal update")?;
+    let result = (|| -> Result<()> {
+        if clear {
+            terminal.clear()?;
+            terminal.draw(|_| {})?;
+        }
+        terminal.draw(f)?;
+        Ok(())
+    })();
+    let end = execute!(std::io::stdout(), EndSynchronizedUpdate)
+        .context("ending synchronized terminal update");
+    result.and(end)
 }
 
 /// Await the repo-scan task if one is pending; an absent/finished handle parks
@@ -3753,6 +3906,56 @@ mod tests {
         assert_eq!(app.view, View::Overview);
         assert_eq!(app.focus, Focus::IssueDetail);
         assert_eq!(app.issue_return_focus, Focus::Left);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_issue_log_section_inactive_when_jk_then_moves_section_not_log(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.view = View::Overview;
+        app.focus = Focus::IssueDetail;
+        app.issue_section_sel = 3;
+        app.log_tail = "one\ntwo\nthree\n".to_string();
+
+        app.apply(Action::Up).await?;
+
+        assert_eq!(app.issue_section_sel, 2);
+        assert_eq!(app.issue_log_scroll, 0);
+        assert!(!app.issue_section_interactive);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_issue_log_section_entered_when_jk_then_scrolls_log() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.view = View::Overview;
+        app.focus = Focus::IssueDetail;
+        app.issue_section_sel = 3;
+        app.log_tail = "one\ntwo\nthree\n".to_string();
+
+        app.apply(Action::Drill).await?;
+        app.apply(Action::Up).await?;
+
+        assert_eq!(app.issue_section_sel, 3);
+        assert_eq!(app.issue_log_scroll, 1);
+        assert!(app.issue_section_interactive);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_issue_log_section_active_when_esc_then_exits_section_depth() -> anyhow::Result<()>
+    {
+        let mut app = test_app();
+        app.view = View::Overview;
+        app.focus = Focus::IssueDetail;
+        app.issue_section_sel = 3;
+        app.issue_section_interactive = true;
+
+        app.apply(Action::Back).await?;
+
+        assert_eq!(app.focus, Focus::IssueDetail);
+        assert!(!app.issue_section_interactive);
         Ok(())
     }
 
@@ -4578,6 +4781,7 @@ mod tests {
             id: 1,
             name: name.to_string(),
             main_agent_cmd: format!("{name}-main {{prompt}}"),
+            route_agent_cmd: format!("{name}-main {{prompt}}"),
             plan_agent_cmd: format!("{name}-plan {{prompt}}"),
             work_agent_cmd: format!("{name}-work {{prompt}}"),
             review_agent_cmd: review.map(str::to_string),
@@ -4597,10 +4801,12 @@ mod tests {
             default_branch: "main".to_string(),
             arsenal_preset_name: None,
             main_agent_cmd: "manual-main".to_string(),
+            route_agent_cmd: "manual-main".to_string(),
             plan_agent_cmd: "manual-plan".to_string(),
             work_agent_cmd: "manual-work".to_string(),
             review_agent_cmd: Some("manual-review".to_string()),
             main_agent_cmd_override: Some("manual-main".to_string()),
+            route_agent_cmd_override: Some("manual-main".to_string()),
             plan_agent_cmd_override: Some("manual-plan".to_string()),
             work_agent_cmd_override: Some("manual-work".to_string()),
             review_agent_cmd_override: Some("manual-review".to_string()),

@@ -130,7 +130,9 @@ async fn all_runtime_tables_exist() -> anyhow::Result<()> {
         "backlog_items",
         "main_jobs",
         "agent_runs",
+        "routing_runs",
         "scheduler_runs",
+        "project_route_locks",
     ];
     let actual_count: i64 = sqlx::query(
         "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name NOT LIKE '_sqlx%'",

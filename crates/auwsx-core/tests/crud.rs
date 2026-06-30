@@ -46,6 +46,7 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "claude {prompt}",
+            route_agent_cmd: "claude {prompt}",
             plan_agent_cmd: "claude-plan {prompt}",
             work_agent_cmd: "claude-work {prompt}",
             review_agent_cmd: None,
@@ -92,6 +93,7 @@ async fn upsert_preset(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
         NewArsenalPreset {
             name,
             main_agent_cmd: "main {prompt}",
+            route_agent_cmd: "main {prompt}",
             plan_agent_cmd: "plan {prompt}",
             work_agent_cmd: "work {prompt}",
             review_agent_cmd: Some("review {prompt}"),
@@ -158,6 +160,7 @@ async fn given_review_agent_cmd_some_when_created_then_review_agent_cmd_roundtri
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: Some("reviewer {prompt}"),
@@ -188,6 +191,7 @@ async fn given_project_with_arsenal_and_blank_overrides_when_get_then_effective_
             default_branch: "main",
             arsenal_preset_name: Some("local"),
             main_agent_cmd: "",
+            route_agent_cmd: "",
             plan_agent_cmd: "",
             work_agent_cmd: "",
             review_agent_cmd: None,
@@ -227,6 +231,7 @@ async fn given_linked_project_when_arsenal_updates_then_effective_commands_follo
             default_branch: "main",
             arsenal_preset_name: Some("local"),
             main_agent_cmd: "",
+            route_agent_cmd: "",
             plan_agent_cmd: "",
             work_agent_cmd: "",
             review_agent_cmd: None,
@@ -244,6 +249,7 @@ async fn given_linked_project_when_arsenal_updates_then_effective_commands_follo
         NewArsenalPreset {
             name: "local",
             main_agent_cmd: "main2 {prompt}",
+            route_agent_cmd: "main2 {prompt}",
             plan_agent_cmd: "plan2 {prompt}",
             work_agent_cmd: "work2 {prompt}",
             review_agent_cmd: Some("review2 {prompt}"),
@@ -274,6 +280,7 @@ async fn given_project_with_arsenal_and_manual_override_when_get_then_override_w
             default_branch: "main",
             arsenal_preset_name: Some("local"),
             main_agent_cmd: "manual-main {prompt}",
+            route_agent_cmd: "manual-main {prompt}",
             plan_agent_cmd: "",
             work_agent_cmd: "",
             review_agent_cmd: None,
@@ -310,6 +317,7 @@ async fn given_unknown_arsenal_when_project_created_then_err() -> anyhow::Result
             default_branch: "main",
             arsenal_preset_name: Some("missing"),
             main_agent_cmd: "",
+            route_agent_cmd: "",
             plan_agent_cmd: "",
             work_agent_cmd: "",
             review_agent_cmd: None,
@@ -1133,7 +1141,10 @@ async fn given_missing_issue_when_bump_conflict_attempts_then_err() -> anyhow::R
 async fn given_queue_eligible_statuses_when_accepts_queue_message_then_true() -> anyhow::Result<()>
 {
     for v in [
+        IssueStatus::New,
         IssueStatus::Planning,
+        IssueStatus::PlanReady,
+        IssueStatus::PlanBlocked,
         IssueStatus::Working,
         IssueStatus::Reviewing,
         IssueStatus::Fixing,
@@ -1151,7 +1162,7 @@ async fn given_queue_eligible_statuses_when_accepts_queue_message_then_true() ->
 #[tokio::test]
 async fn given_non_queue_eligible_status_when_accepts_queue_message_then_false(
 ) -> anyhow::Result<()> {
-    assert!(!IssueStatus::PlanReady.accepts_queue_message());
+    assert!(!IssueStatus::Merging.accepts_queue_message());
     Ok(())
 }
 
@@ -1927,6 +1938,26 @@ async fn given_item_when_mark_consumed_then_consumed_issue_id_set() -> anyhow::R
 }
 
 #[tokio::test]
+async fn given_consumed_item_when_mark_consumed_again_then_original_issue_stays(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let pid = insert_project(db.pool(), "p").await?;
+    let first_issue = issues::create(db.pool(), pid, "first", None, TS).await?;
+    let second_issue = issues::create(db.pool(), pid, "second", None, TS).await?;
+    let item_id = backlog::add(db.pool(), pid, "x", Source::Human, None, TS).await?;
+
+    backlog::mark_consumed(db.pool(), item_id, first_issue, TS).await?;
+    let res = backlog::mark_consumed(db.pool(), item_id, second_issue, TS + 1).await;
+
+    assert!(res.is_err(), "second consumption must lose the race");
+    let item = backlog::get(db.pool(), item_id)
+        .await?
+        .expect("item exists");
+    assert_eq!(item.consumed_issue_id, Some(first_issue));
+    Ok(())
+}
+
+#[tokio::test]
 async fn given_item_when_mark_consumed_then_resolved_at_is_now() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
@@ -2107,28 +2138,28 @@ async fn given_steering_added_when_issue_read_then_has_pending_steering_true() -
 }
 
 #[tokio::test]
-async fn given_plan_ready_issue_when_steering_added_then_err() -> anyhow::Result<()> {
-    // Structurally valid but semantically wrong: PLAN_READY is not a working phase,
-    // so the steering guard must reject it.
+async fn given_plan_ready_issue_when_steering_added_then_get_returns_note() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::PlanReady).await?;
-    let res = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await;
-    assert!(res.is_err(), "steering into a PLAN_READY issue must Err");
+    let sid = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await?;
+    let s = steering::get(db.pool(), sid)
+        .await?
+        .expect("steering exists");
+    assert_eq!(s.note, "go left");
     Ok(())
 }
 
 #[tokio::test]
-async fn given_plan_ready_issue_when_steering_add_fails_then_flag_stays_false() -> anyhow::Result<()>
-{
+async fn given_plan_ready_issue_when_steering_added_then_flag_is_true() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let iid = insert_issue_at(db.pool(), pid, IssueStatus::PlanReady).await?;
-    let _ = steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await;
+    steering::add(db.pool(), iid, SteeringSource::Human, "go left", TS).await?;
     let issue = issues::get(db.pool(), iid).await?.expect("issue exists");
     assert!(
-        !issue.has_pending_steering,
-        "rejected steering must not flip the flag"
+        issue.has_pending_steering,
+        "pre-work steering must mark the plan stale"
     );
     Ok(())
 }
@@ -2341,6 +2372,7 @@ async fn given_completion_policy_some_auto_when_created_then_completion_policy_i
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2370,6 +2402,7 @@ async fn given_completion_policy_some_auto_when_created_then_plan_gate_sibling_s
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2399,6 +2432,7 @@ async fn given_completion_policy_some_auto_when_created_then_soft_timeout_siblin
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2428,6 +2462,7 @@ async fn given_plan_gate_timeout_some_zero_when_created_then_plan_gate_is_0() ->
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2457,6 +2492,7 @@ async fn given_plan_gate_timeout_some_zero_when_created_then_completion_policy_s
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2486,6 +2522,7 @@ async fn given_soft_timeout_30_and_policy_soft_when_created_then_soft_timeout_is
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2515,6 +2552,7 @@ async fn given_soft_timeout_30_and_policy_soft_when_created_then_completion_poli
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2544,6 +2582,7 @@ async fn given_all_three_overrides_when_created_then_each_persists_independently
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2582,6 +2621,7 @@ async fn given_negative_plan_gate_timeout_override_when_created_then_stored_verb
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2614,6 +2654,7 @@ async fn given_soft_timeout_override_alone_when_created_then_persists_and_policy
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "m",
+            route_agent_cmd: "m",
             plan_agent_cmd: "p",
             work_agent_cmd: "w",
             review_agent_cmd: None,
@@ -2685,6 +2726,7 @@ async fn given_existing_custom_arsenal_preset_when_upserted_then_same_id_is_retu
         NewArsenalPreset {
             name: "local",
             main_agent_cmd: "main2",
+            route_agent_cmd: "main2",
             plan_agent_cmd: "plan2",
             work_agent_cmd: "work2",
             review_agent_cmd: None,
@@ -2706,6 +2748,7 @@ async fn given_existing_custom_arsenal_preset_when_upserted_then_command_is_upda
         NewArsenalPreset {
             name: "local",
             main_agent_cmd: "main2",
+            route_agent_cmd: "main2",
             plan_agent_cmd: "plan2",
             work_agent_cmd: "work2",
             review_agent_cmd: None,
@@ -2728,6 +2771,7 @@ async fn given_blank_trimmed_arsenal_name_when_upserted_then_err() -> anyhow::Re
         NewArsenalPreset {
             name: "  ",
             main_agent_cmd: "main",
+            route_agent_cmd: "main",
             plan_agent_cmd: "plan",
             work_agent_cmd: "work",
             review_agent_cmd: None,
@@ -2748,6 +2792,7 @@ async fn given_blank_trimmed_main_command_when_upserted_then_err() -> anyhow::Re
         NewArsenalPreset {
             name: "local",
             main_agent_cmd: " ",
+            route_agent_cmd: " ",
             plan_agent_cmd: "plan",
             work_agent_cmd: "work",
             review_agent_cmd: None,
@@ -2768,6 +2813,7 @@ async fn given_blank_trimmed_plan_command_when_upserted_then_err() -> anyhow::Re
         NewArsenalPreset {
             name: "local",
             main_agent_cmd: "main",
+            route_agent_cmd: "main",
             plan_agent_cmd: " ",
             work_agent_cmd: "work",
             review_agent_cmd: None,
@@ -2788,6 +2834,7 @@ async fn given_blank_trimmed_work_command_when_upserted_then_err() -> anyhow::Re
         NewArsenalPreset {
             name: "local",
             main_agent_cmd: "main",
+            route_agent_cmd: "main",
             plan_agent_cmd: "plan",
             work_agent_cmd: " ",
             review_agent_cmd: None,
@@ -2809,6 +2856,7 @@ async fn given_builtin_arsenal_name_when_upserted_then_builtin_becomes_false() -
         NewArsenalPreset {
             name: "codex",
             main_agent_cmd: "custom-main",
+            route_agent_cmd: "custom-main",
             plan_agent_cmd: "custom-plan",
             work_agent_cmd: "custom-work",
             review_agent_cmd: None,
@@ -2832,6 +2880,7 @@ async fn given_builtin_arsenal_name_when_upserted_then_new_command_persists() ->
         NewArsenalPreset {
             name: "codex",
             main_agent_cmd: "custom-main",
+            route_agent_cmd: "custom-main",
             plan_agent_cmd: "custom-plan",
             work_agent_cmd: "custom-work",
             review_agent_cmd: None,

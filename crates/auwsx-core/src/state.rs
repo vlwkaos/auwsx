@@ -147,7 +147,10 @@ impl IssueStatus {
     pub fn accepts_queue_message(self) -> bool {
         matches!(
             self,
-            Self::Planning
+            Self::New
+                | Self::Planning
+                | Self::PlanReady
+                | Self::PlanBlocked
                 | Self::Working
                 | Self::Reviewing
                 | Self::Fixing
@@ -243,6 +246,7 @@ pub fn is_legal_transition(from: IssueStatus, to: IssueStatus) -> bool {
             | (ReadyToMerge, Abandoned)
             | (Merging, Done)
             | (Merging, ResolvingConflict)
+            | (Merging, ConflictBlocked)
             | (Merging, Failed)
             | (Merging, Abandoned)
             | (ResolvingConflict, Merging)
@@ -365,7 +369,10 @@ mod tests {
     #[test]
     fn given_attachable_statuses_when_checked_then_only_expected_accept_messages() {
         let attachable: HashSet<IssueStatus> = [
+            IssueStatus::New,
             IssueStatus::Planning,
+            IssueStatus::PlanReady,
+            IssueStatus::PlanBlocked,
             IssueStatus::Working,
             IssueStatus::Reviewing,
             IssueStatus::Fixing,
@@ -431,6 +438,7 @@ mod tests {
             (ReadyToMerge, Merging),
             (Merging, Done),
             (Merging, ResolvingConflict),
+            (Merging, ConflictBlocked),
             (ResolvingConflict, ConflictBlocked),
             (ConflictBlocked, Merging),
             (Working, Abandoned),

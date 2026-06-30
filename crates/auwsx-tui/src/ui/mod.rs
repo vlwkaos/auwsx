@@ -31,6 +31,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
+    frame.render_widget(Clear, chunks[0]);
+    frame.render_widget(Clear, chunks[1]);
     match app.view {
         View::Overview => overview::render(frame, app, chunks[0]),
         View::Issue => issue::render(frame, app, chunks[0]),
@@ -109,12 +111,19 @@ fn footer_hint(app: &App) -> String {
         return format!("{prefix}{} · Esc left", parts.join(" · "));
     }
     if app.focus == crate::app::Focus::IssueDetail {
-        let mut parts = if app.issue_section_sel == 3 {
+        let mut parts = if app.issue_section_sel == 3 && app.issue_section_interactive {
             vec![
-                "issue log".to_string(),
+                "log active".to_string(),
                 "j/k scroll".to_string(),
                 "h/l section".to_string(),
                 "Pg page".to_string(),
+            ]
+        } else if app.issue_section_sel == 3 {
+            vec![
+                "issue detail".to_string(),
+                "j/k section".to_string(),
+                "h/l section".to_string(),
+                "Enter scroll log".to_string(),
             ]
         } else {
             vec![
@@ -124,7 +133,14 @@ fn footer_hint(app: &App) -> String {
             ]
         };
         parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-        parts.push("Esc kanban".to_string());
+        let esc = if app.issue_section_interactive {
+            "Esc section"
+        } else if app.issue_return_focus == crate::app::Focus::ProjectKanban {
+            "Esc kanban"
+        } else {
+            "Esc left"
+        };
+        parts.push(esc.to_string());
         return format!("{prefix}{}", parts.join(" · "));
     }
 
@@ -166,6 +182,8 @@ fn draw_form(frame: &mut Frame, app: &App) {
 
     let mut lines = Vec::new();
     let mut prev_section = "";
+    let mut active_field_line = None;
+    let mut active_field_prefix_chars = 0usize;
     for (idx, field) in form.fields.iter().enumerate() {
         if field.section != prev_section {
             if !prev_section.is_empty() {
@@ -185,10 +203,12 @@ fn draw_form(frame: &mut Frame, app: &App) {
         } else {
             theme::dim()
         };
-        let mut row = vec![Span::styled(
-            format!("{marker} {:>18}{optional}: ", field.display),
-            label_style,
-        )];
+        let label = format!("{marker} {:>18}{optional}: ", field.display);
+        if active && field_accepts_cursor(field) {
+            active_field_line = Some(lines.len());
+            active_field_prefix_chars = label.chars().count();
+        }
+        let mut row = vec![Span::styled(label, label_style)];
         row.extend(field_value_spans(field, form.cursor, active));
         row.push(Span::styled(
             format!("  {}", field_kind_tag(field)),
@@ -242,6 +262,19 @@ fn draw_form(frame: &mut Frame, app: &App) {
             .block(block),
         area,
     );
+    if let Some(line_idx) = active_field_line {
+        let x = area
+            .x
+            .saturating_add(1)
+            .saturating_add((active_field_prefix_chars + form.cursor) as u16)
+            .min(area.x.saturating_add(area.width.saturating_sub(2)));
+        let y = area
+            .y
+            .saturating_add(1)
+            .saturating_add(line_idx as u16)
+            .min(area.y.saturating_add(area.height.saturating_sub(2)));
+        frame.set_cursor_position((x, y));
+    }
 }
 
 fn field_kind_tag(field: &crate::app::FormField) -> String {
@@ -254,6 +287,13 @@ fn field_kind_tag(field: &crate::app::FormField) -> String {
         FieldKind::Combo { free_text: true } => "autocomplete".to_string(),
         FieldKind::Combo { free_text: false } => "preset".to_string(),
     }
+}
+
+fn field_accepts_cursor(field: &crate::app::FormField) -> bool {
+    !matches!(
+        field.kind,
+        FieldKind::Select { .. } | FieldKind::Combo { free_text: false }
+    )
 }
 
 fn field_value_spans(

@@ -14,7 +14,7 @@ use ratatui::Frame;
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
     let rows = app.tree_rows();
@@ -626,8 +626,17 @@ fn panel_with_focus(
     area: Rect,
     title: &str,
     focused: bool,
-    lines: Vec<Line<'static>>,
+    mut lines: Vec<Line<'static>>,
 ) {
+    let visible = area.height.saturating_sub(2) as usize;
+    if visible > 0 && lines.len() > visible {
+        let hidden = lines.len().saturating_sub(visible);
+        lines.truncate(visible.saturating_sub(1));
+        lines.push(Line::styled(
+            format!("... {hidden} more; focus/enter to inspect"),
+            theme::dim(),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()

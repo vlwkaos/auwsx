@@ -11,7 +11,7 @@ use crate::db::issues::Issue;
 use crate::db::subtasks::Subtask;
 use crate::events::Event;
 use crate::ipc::{self, Command, Response};
-use crate::state::is_legal_transition;
+use crate::state::{is_legal_transition, IssueStatus};
 use crate::steering::Steering;
 use crate::{Error, Result};
 use anyhow::{anyhow, bail, Context};
@@ -114,6 +114,7 @@ pub fn handle_local_command(cmd: &Command) -> Result<Option<Response>> {
         }
         Command::AddSubtask { issue_id: id, .. }
         | Command::SetIssueStatus { issue_id: id, .. }
+        | Command::ApplyIssueMerge { issue_id: id }
         | Command::AddFinding { issue_id: id, .. }
             if *id == issue_id =>
         {
@@ -238,6 +239,15 @@ fn validate_replay_commands(
                     status.as_str()
                 );
             }
+        } else if matches!(cmd, Command::ApplyIssueMerge { .. }) {
+            status_commands += 1;
+            if snapshot.issue.status != IssueStatus::Merging {
+                bail!(
+                    "control outbox line {} can apply merge only from MERGING, got {}",
+                    line_no,
+                    snapshot.issue.status.as_str()
+                );
+            }
         }
     }
     if commands.is_empty() {
@@ -352,6 +362,7 @@ fn is_recordable_for_issue(
     match cmd {
         Command::AddSubtask { issue_id: id, .. }
         | Command::SetIssueStatus { issue_id: id, .. }
+        | Command::ApplyIssueMerge { issue_id: id }
         | Command::AddFinding { issue_id: id, .. } => *id == issue_id,
         Command::CompleteSubtask { subtask_id } => allowed_subtasks.contains(subtask_id),
         Command::AcceptFinding { finding_id, .. }
@@ -530,6 +541,27 @@ mod tests {
             err.to_string().contains("too large"),
             "unexpected error: {err:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn given_local_control_env_when_apply_merge_then_records_command() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let snapshot_path = tmp.path().join("snapshot.json");
+        let outbox_path = tmp.path().join("outbox.jsonl");
+        let mut snapshot = snapshot();
+        snapshot.issue.status = IssueStatus::Merging;
+        write_snapshot(&snapshot_path, &snapshot)?;
+
+        let response = with_env(&snapshot_path, &outbox_path, || {
+            handle_local_command(&Command::ApplyIssueMerge { issue_id: 7 })
+        })?
+        .expect("local response");
+
+        assert!(matches!(response, Response::Ok));
+        let raw = std::fs::read_to_string(outbox_path)?;
+        let command: Command = serde_json::from_str(raw.trim())?;
+        assert_eq!(command, Command::ApplyIssueMerge { issue_id: 7 });
         Ok(())
     }
 
