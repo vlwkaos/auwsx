@@ -238,6 +238,43 @@ pub async fn enqueue_project_deepsleep(
     .await
 }
 
+pub async fn enqueue_project_reconcile(
+    pool: &SqlitePool,
+    project_id: i64,
+    prompt: &str,
+    queued_at: i64,
+) -> Result<i64> {
+    enqueue_project_job(
+        pool,
+        project_id,
+        None,
+        MainJobSource::UserOneoff,
+        "reconcile",
+        prompt,
+        queued_at,
+    )
+    .await
+}
+
+pub async fn has_active_project_kind(
+    pool: &SqlitePool,
+    project_id: i64,
+    kind: &str,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM main_jobs
+         WHERE project_id = ?
+           AND kind = ?
+           AND status IN ('QUEUED','RUNNING')",
+    )
+    .bind(project_id)
+    .bind(kind)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
 async fn enqueue_project_job(
     pool: &SqlitePool,
     project_id: i64,

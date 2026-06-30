@@ -46,6 +46,7 @@ pub mod notify;
 pub mod pipeline;
 pub mod project_setup;
 pub mod prompt;
+pub mod reconcile;
 pub mod routines;
 pub mod routing;
 pub mod schedule;

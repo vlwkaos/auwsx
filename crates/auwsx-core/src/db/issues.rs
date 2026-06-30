@@ -177,6 +177,57 @@ pub async fn force_status(pool: &SqlitePool, id: i64, to: IssueStatus, now: i64)
     write_status(pool, id, to, now).await
 }
 
+pub async fn transition_if_current_project(
+    pool: &SqlitePool,
+    id: i64,
+    project_id: i64,
+    from: IssueStatus,
+    to: IssueStatus,
+    now: i64,
+) -> Result<()> {
+    state::check_transition(from, to)?;
+    write_status_if_current_project(pool, id, project_id, from, to, now).await
+}
+
+pub async fn force_status_if_current_project(
+    pool: &SqlitePool,
+    id: i64,
+    project_id: i64,
+    from: IssueStatus,
+    to: IssueStatus,
+    now: i64,
+) -> Result<()> {
+    write_status_if_current_project(pool, id, project_id, from, to, now).await
+}
+
+async fn write_status_if_current_project(
+    pool: &SqlitePool,
+    id: i64,
+    project_id: i64,
+    from: IssueStatus,
+    to: IssueStatus,
+    now: i64,
+) -> Result<()> {
+    let n = sqlx::query(
+        "UPDATE issues SET status = ?, updated_at = ? WHERE id = ? AND project_id = ? AND status = ?",
+    )
+    .bind(to.as_str())
+    .bind(now)
+    .bind(id)
+    .bind(project_id)
+    .bind(from.as_str())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(anyhow!(
+            "stale_proposal: issue {id} is no longer {} in project {project_id}",
+            from.as_str()
+        ));
+    }
+    Ok(())
+}
+
 async fn write_status(pool: &SqlitePool, id: i64, to: IssueStatus, now: i64) -> Result<()> {
     let n = sqlx::query("UPDATE issues SET status = ?, updated_at = ? WHERE id = ?")
         .bind(to.as_str())

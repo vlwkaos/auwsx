@@ -36,6 +36,7 @@ use crate::issue_control::ControlOutcome;
 use crate::main_jobs::{self, MainJob};
 use crate::memory;
 use crate::project_setup;
+use crate::reconcile::ProjectReconcileReport;
 use crate::routines::{self, OutputRoute, Routine};
 use crate::routing;
 use crate::scheduler::Scheduler;
@@ -182,6 +183,16 @@ pub enum Command {
         /// Delete only DB registration/history, leaving any live agent process
         /// or worktree cleanup to the operator.
         shallow: bool,
+    },
+    DiagnoseProject {
+        project_id: i64,
+    },
+    ReconcileProject {
+        project_id: i64,
+        dry_run: bool,
+    },
+    ApplyReconcile {
+        main_job_id: i64,
     },
 
     // --- backlog ---
@@ -427,6 +438,7 @@ pub enum Response {
     Triaged { created_issue_ids: Vec<i64> },
     RanIssue { issue_id: i64 },
     ApprovedMerge { issue_ids: Vec<i64> },
+    ReconcileReport(ProjectReconcileReport),
     Event(Event),
 }
 
@@ -880,6 +892,9 @@ async fn dispatch_inner(
         }
         Command::RunSchedulerOnce { .. }
         | Command::ExecuteProject { .. }
+        | Command::DiagnoseProject { .. }
+        | Command::ReconcileProject { .. }
+        | Command::ApplyReconcile { .. }
         | Command::ExecuteIssue { .. }
         | Command::RunIssueNow { .. }
         | Command::RetryIssue { .. }
@@ -1343,6 +1358,9 @@ async fn handle_conn(
             | Command::RetryIssue { .. }
             | Command::ApproveIssueMerge { .. }
             | Command::ApproveProjectMerge { .. }
+            | Command::DiagnoseProject { .. }
+            | Command::ReconcileProject { .. }
+            | Command::ApplyReconcile { .. }
             | Command::RunBacklogNow { .. }
             | Command::RunRoutineNow { .. }
             | Command::RemoveIssue { .. }
@@ -1404,6 +1422,20 @@ async fn manual_inner(_db: &Db, scheduler: &Scheduler, now: i64, cmd: Command) -
         Command::ApproveProjectMerge { project_id } => {
             let issue_ids = scheduler.approve_project_merge(project_id, now).await?;
             Response::ApprovedMerge { issue_ids }
+        }
+        Command::DiagnoseProject { project_id } => {
+            Response::ReconcileReport(scheduler.diagnose_project(project_id, true).await?)
+        }
+        Command::ReconcileProject {
+            project_id,
+            dry_run: true,
+        } => Response::ReconcileReport(scheduler.diagnose_project(project_id, true).await?),
+        Command::ReconcileProject {
+            project_id,
+            dry_run: false,
+        } => Response::ReconcileReport(scheduler.reconcile_project(project_id, now).await?),
+        Command::ApplyReconcile { main_job_id } => {
+            Response::ReconcileReport(scheduler.apply_reconcile_job(main_job_id, now).await?)
         }
         Command::RunBacklogNow { item_id } => {
             let issue_id = scheduler.run_backlog_now(item_id, now).await?;

@@ -26,6 +26,7 @@ use crate::issue_control::{self, ControlOutcome, IssueExecutePlan, ProjectExecut
 use crate::main_job_runner;
 use crate::main_jobs::{self, MainJobStatus};
 use crate::pipeline::{self, Deps};
+use crate::reconcile::{self, AgentReconcileAction, ProjectReconcileReport, ReconcileActionKind};
 use crate::routines::{self, Routine};
 use crate::routing;
 use crate::state::{IssueStatus, SchedulerClass};
@@ -33,7 +34,7 @@ use crate::worktree::{
     branch_for_issue, prune_orphaned_issue_worktrees, WorktreeHandle, Worktrees,
 };
 use crate::Result;
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -208,6 +209,26 @@ Return only the final answer for the operator.
 {question}
 "
     )
+}
+
+fn reconcile_agent_prompt(report: &ProjectReconcileReport) -> Result<String> {
+    let json = serde_json::to_string_pretty(report)?;
+    Ok(format!(
+        "\
+ROUTE: report. You are auwsx's queued reconcile advisor.
+
+Review the deterministic reconcile report below and propose only safe, minimal recovery actions.
+Do not edit source files unless the report proves a manual conflict-resolution path is required.
+Output JSON with keys: proposal, rationale, actions, verification, risk.
+Wrap the final proposal in one final ```json fenced block and put no text after it.
+The JSON object must include schema_version: 1 and kind: \"auwsx_reconcile_proposal\".
+Allowed action names: mark_done, cleanup_worktree, retry_issue, apply_merge, manual_required.
+The daemon will reject any action that does not pass deterministic validation at apply time.
+
+## Deterministic Reconcile Report
+{json}
+"
+    ))
 }
 
 fn extract_answer_from_log(text: &str) -> Option<String> {
@@ -649,6 +670,28 @@ impl Scheduler {
             .ok_or_else(|| anyhow!("project {project_id} not found"))?;
         self.ensure_local_merge_not_conflict_blocked(project_id)
             .await?;
+        let preflight = self.diagnose_project(project_id, true).await?;
+        if let Some(done_elsewhere) = preflight.issues.iter().find(|issue| {
+            issue.status == IssueStatus::ReadyToMerge
+                && issue.proposed_action == ReconcileActionKind::MarkDone
+        }) {
+            bail!(
+                "project {project_id} issue {} is already represented in main; run `auwsx project reconcile {project_id}` before project merge",
+                done_elsewhere.issue_id
+            );
+        }
+        let blocker = preflight.issues.iter().find(|issue| {
+            issue.status == IssueStatus::ReadyToMerge
+                && issue.proposed_action != ReconcileActionKind::ApplyMerge
+        });
+        if let Some(blocker) = blocker {
+            bail!(
+                "project {project_id} has reconcile blocker on issue {}: {} ({})",
+                blocker.issue_id,
+                blocker.diagnosis.as_str(),
+                blocker.blocking_reason.as_deref().unwrap_or("no detail")
+            );
+        }
 
         let ready =
             issues::list_by_status(self.db.pool(), project_id, IssueStatus::ReadyToMerge).await?;
@@ -692,11 +735,292 @@ impl Scheduler {
         Ok(())
     }
 
+    pub async fn diagnose_project(
+        &self,
+        project_id: i64,
+        dry_run: bool,
+    ) -> Result<ProjectReconcileReport> {
+        self.prune_inflight();
+        let project = projects::get(self.db.pool(), project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {project_id} not found"))?;
+        let issues = issues::list_by_project(self.db.pool(), project_id).await?;
+        let running = self
+            .running
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let known_paths = self
+            .known_issue_worktree_paths_for_project(Path::new(&project.repo_path), project.id)
+            .await?;
+        reconcile::diagnose_project(&project, &issues, &running, &known_paths, dry_run).await
+    }
+
+    pub async fn reconcile_project(
+        &self,
+        project_id: i64,
+        now: i64,
+    ) -> Result<ProjectReconcileReport> {
+        let Some(_tick_guard) = self.try_project_tick(project_id) else {
+            bail!("project {project_id} is already reconciling or ticking");
+        };
+        self.prune_inflight();
+        let mut report = self.diagnose_project(project_id, false).await?;
+
+        let project = projects::get(self.db.pool(), project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {project_id} not found"))?;
+        let repo_path = Path::new(&project.repo_path);
+        if !report.orphans.is_empty() {
+            let known_paths = self
+                .known_issue_worktree_paths_for_project(repo_path, project.id)
+                .await?;
+            let removed = prune_orphaned_issue_worktrees(repo_path, &known_paths).await?;
+            report.applied_count += removed.len();
+        }
+
+        for item in report.issues.clone() {
+            match item.proposed_action {
+                ReconcileActionKind::MarkDone => {
+                    self.apply_validated_reconcile_action(
+                        project_id,
+                        AgentReconcileAction {
+                            action: ReconcileActionKind::MarkDone,
+                            issue_id: Some(item.issue_id),
+                            rationale: None,
+                            command: None,
+                        },
+                        now,
+                    )
+                    .await?;
+                    report.applied_count += 1;
+                }
+                ReconcileActionKind::ApplyMerge => {
+                    self.apply_validated_reconcile_action(
+                        project_id,
+                        AgentReconcileAction {
+                            action: ReconcileActionKind::ApplyMerge,
+                            issue_id: Some(item.issue_id),
+                            rationale: None,
+                            command: None,
+                        },
+                        now,
+                    )
+                    .await?;
+                    report.applied_count += 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let refreshed = self.diagnose_project(project_id, true).await?;
+        if refreshed.agentic_count > 0
+            && !main_jobs::has_active_project_kind(self.db.pool(), project_id, "reconcile").await?
+        {
+            let prompt = reconcile_agent_prompt(&refreshed)?;
+            let id = main_jobs::enqueue_project_reconcile(self.db.pool(), project_id, &prompt, now)
+                .await?;
+            report.queued_main_job_id = Some(id);
+            let job = main_job_runner::RoutineJob {
+                main_job_id: id,
+                routine_id: None,
+                output_route: routines::OutputRoute::Report,
+                project,
+                prompt,
+                phase: "reconcile",
+            };
+            self.spawn_main_job(job);
+        }
+        Ok(report)
+    }
+
+    pub async fn apply_reconcile_job(
+        &self,
+        main_job_id: i64,
+        now: i64,
+    ) -> Result<ProjectReconcileReport> {
+        let job = main_jobs::get(self.db.pool(), main_job_id)
+            .await?
+            .ok_or_else(|| anyhow!("main job {main_job_id} not found"))?;
+        if job.kind != "reconcile" {
+            bail!("main job {main_job_id} is kind {}, not reconcile", job.kind);
+        }
+        if job.status != MainJobStatus::Done {
+            bail!(
+                "main job {main_job_id} is {}, not DONE",
+                job.status.as_str()
+            );
+        }
+        let Some(_tick_guard) = self.try_project_tick(job.project_id) else {
+            bail!(
+                "project {} is already reconciling or ticking",
+                job.project_id
+            );
+        };
+        let log_path = job
+            .log_path
+            .as_deref()
+            .ok_or_else(|| anyhow!("main job {main_job_id} has no log path"))?;
+        let started_at = job
+            .started_at
+            .ok_or_else(|| anyhow!("main job {main_job_id} has no started_at"))?;
+        let expected_log_path = artifacts::main_job_log_path(job.project_id, job.id, started_at)?;
+        ensure_expected_artifact_path(Path::new(log_path), &expected_log_path)
+            .with_context(|| format!("validating reconcile proposal log {log_path}"))?;
+        let text = artifacts::tail_file(PathBuf::from(log_path), 256 * 1024)
+            .await
+            .with_context(|| format!("reading reconcile proposal log {log_path}"))?;
+        let proposal = reconcile::parse_agent_proposal(&text)?;
+        let mut report = ProjectReconcileReport::empty(job.project_id, true);
+        for action in proposal.actions {
+            let applied = action.action != ReconcileActionKind::ManualRequired;
+            self.apply_validated_reconcile_action(job.project_id, action, now)
+                .await?;
+            if applied {
+                report.applied_count += 1;
+            }
+        }
+        report.refresh_counts();
+        Ok(report)
+    }
+
+    fn validate_reconcile_action(
+        &self,
+        report: &ProjectReconcileReport,
+        action: &AgentReconcileAction,
+    ) -> Result<()> {
+        match action.action {
+            ReconcileActionKind::ManualRequired => Ok(()),
+            ReconcileActionKind::MarkDone
+            | ReconcileActionKind::CleanupWorktree
+            | ReconcileActionKind::RetryIssue
+            | ReconcileActionKind::ApplyMerge => {
+                let issue_id = action.issue_id.ok_or_else(|| {
+                    anyhow!("{} action requires issue_id", action.action.as_str())
+                })?;
+                reconcile::validate_agent_action(report, issue_id, action.action)
+                    .with_context(|| format!("stale_proposal: issue {issue_id}"))?;
+                if action.action == ReconcileActionKind::RetryIssue && self.is_running(issue_id) {
+                    bail!("stale_proposal: issue {issue_id} has an active worker");
+                }
+                Ok(())
+            }
+            other => bail!(
+                "agent action {} is not accepted from proposals",
+                other.as_str()
+            ),
+        }
+    }
+
+    async fn apply_validated_reconcile_action(
+        &self,
+        project_id: i64,
+        action: AgentReconcileAction,
+        now: i64,
+    ) -> Result<()> {
+        let latest = self.diagnose_project(project_id, true).await?;
+        self.validate_reconcile_action(&latest, &action)?;
+        let Some(issue_id) = action.issue_id else {
+            return Ok(());
+        };
+        match action.action {
+            ReconcileActionKind::ManualRequired => Ok(()),
+            ReconcileActionKind::MarkDone => {
+                let project = projects::get(self.db.pool(), project_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("project {project_id} not found"))?;
+                let latest_item = latest_reconcile_issue(&latest, issue_id)?;
+                let issue = self.issue_in_project(project_id, issue_id).await?;
+                if issue.status != latest_item.status {
+                    bail!(
+                        "stale_proposal: issue {issue_id} is {}, not {}",
+                        issue.status.as_str(),
+                        latest_item.status.as_str()
+                    );
+                }
+                self.mark_reconciled_done(&project, &issue, now).await
+            }
+            ReconcileActionKind::CleanupWorktree => {
+                let project = projects::get(self.db.pool(), project_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("project {project_id} not found"))?;
+                let issue = self.issue_in_project(project_id, issue_id).await?;
+                self.cleanup_issue_worktree(&project, &issue).await
+            }
+            ReconcileActionKind::RetryIssue => {
+                let issue = self.issue_in_project(project_id, issue_id).await?;
+                if issue.status != IssueStatus::Failed {
+                    bail!(
+                        "stale_proposal: issue {issue_id} is {}, not FAILED",
+                        issue.status.as_str()
+                    );
+                }
+                self.retry_failed_issue(issue_id, now).await
+            }
+            ReconcileActionKind::ApplyMerge => {
+                self.release_reconcile_merge(project_id, issue_id, now)
+                    .await
+            }
+            other => bail!("agent action {} is not applyable", other.as_str()),
+        }
+    }
+
     fn ensure_issue_idle(&self, issue_id: i64) -> Result<()> {
         if self.running.lock().unwrap().contains(&issue_id) {
             bail!("issue {issue_id} is already running");
         }
         Ok(())
+    }
+
+    async fn issue_in_project(&self, project_id: i64, issue_id: i64) -> Result<Issue> {
+        let issue = issues::get(self.db.pool(), issue_id)
+            .await?
+            .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
+        if issue.project_id != project_id {
+            bail!("stale_proposal: issue {issue_id} moved to another project");
+        }
+        Ok(issue)
+    }
+
+    async fn mark_reconciled_done(&self, project: &Project, issue: &Issue, now: i64) -> Result<()> {
+        issues::force_status_if_current_project(
+            self.db.pool(),
+            issue.id,
+            project.id,
+            issue.status,
+            IssueStatus::Done,
+            now,
+        )
+        .await?;
+        self.emit_issue_status(issue.id, IssueStatus::Done);
+        self.cleanup_issue_worktree(project, issue).await
+    }
+
+    async fn release_reconcile_merge(
+        &self,
+        project_id: i64,
+        issue_id: i64,
+        now: i64,
+    ) -> Result<()> {
+        self.issue_in_project(project_id, issue_id).await?;
+        issues::transition_if_current_project(
+            self.db.pool(),
+            issue_id,
+            project_id,
+            IssueStatus::ReadyToMerge,
+            IssueStatus::Merging,
+            now,
+        )
+        .await?;
+        self.emit_issue_status(issue_id, IssueStatus::Merging);
+        Ok(())
+    }
+
+    fn emit_issue_status(&self, issue_id: i64, status: IssueStatus) {
+        let _ = self.events.send(Event::IssueStatus { issue_id, status });
     }
 
     pub async fn run_backlog_now(&self, item_id: i64, now: i64) -> Result<i64> {
@@ -1282,6 +1606,22 @@ impl Scheduler {
         Ok(known)
     }
 
+    async fn known_issue_worktree_paths_for_project(
+        &self,
+        repo_path: &Path,
+        project_id: i64,
+    ) -> Result<HashMap<i64, PathBuf>> {
+        let mut known = self
+            .known_issue_worktree_paths_for_repo(repo_path, -1)
+            .await?;
+        for issue in issues::list_by_project(self.db.pool(), project_id).await? {
+            if let Some(path) = issue.worktree_path {
+                known.insert(issue.id, PathBuf::from(path));
+            }
+        }
+        Ok(known)
+    }
+
     async fn cleanup_issue_worktree(&self, project: &Project, issue: &Issue) -> Result<()> {
         let Some(path) = issue.worktree_path.clone() else {
             return Ok(());
@@ -1325,6 +1665,37 @@ fn same_repo_path(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+fn ensure_expected_artifact_path(actual: &Path, expected: &Path) -> Result<()> {
+    let actual = actual
+        .canonicalize()
+        .with_context(|| format!("canonicalizing artifact path {}", actual.display()))?;
+    let expected = expected.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing expected artifact path {}",
+            expected.display()
+        )
+    })?;
+    if actual != expected {
+        bail!(
+            "main job log path {} does not match expected artifact path {}",
+            actual.display(),
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
+fn latest_reconcile_issue(
+    report: &ProjectReconcileReport,
+    issue_id: i64,
+) -> Result<&reconcile::ReconcileIssueReport> {
+    report
+        .issues
+        .iter()
+        .find(|issue| issue.issue_id == issue_id)
+        .ok_or_else(|| anyhow!("stale_proposal: issue {issue_id} is absent"))
 }
 
 fn picked_summary(
