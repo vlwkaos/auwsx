@@ -290,6 +290,57 @@ async fn given_manual_run_command_without_scheduler_when_dispatched_then_err() -
     Ok(())
 }
 
+#[tokio::test]
+async fn given_reconcile_manual_commands_without_scheduler_when_dispatched_then_err(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let commands = [
+        Command::DiagnoseProject { project_id: 1 },
+        Command::ReconcileProject {
+            project_id: 1,
+            dry_run: true,
+        },
+        Command::ReconcileProject {
+            project_id: 1,
+            dry_run: false,
+        },
+        Command::ApplyReconcile { main_job_id: 1 },
+    ];
+
+    for command in commands {
+        let resp = ipc::dispatch(&db, &bus, TS, command).await;
+        assert!(
+            want_err(resp).contains("daemon runtime"),
+            "reconcile manual dispatch without scheduler must explain missing runtime"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn given_reconcile_commands_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
+    let commands = [
+        Command::DiagnoseProject { project_id: 7 },
+        Command::ReconcileProject {
+            project_id: 7,
+            dry_run: true,
+        },
+        Command::ReconcileProject {
+            project_id: 7,
+            dry_run: false,
+        },
+        Command::ApplyReconcile { main_job_id: 11 },
+    ];
+
+    for command in commands {
+        let json = serde_json::to_string(&command)?;
+        let got: Command = serde_json::from_str(&json)?;
+        assert_eq!(got, command);
+    }
+    Ok(())
+}
+
 #[test]
 fn given_list_arsenal_command_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
     let command = Command::ListArsenalPresets;

@@ -920,6 +920,41 @@ impl Worktrees for FailingWorktrees {
     }
 }
 
+struct FailingTeardownWorktrees;
+#[async_trait]
+impl Worktrees for FailingTeardownWorktrees {
+    async fn create(&self, _p: &Project, branch: &str) -> anyhow::Result<WorktreeHandle> {
+        Ok(WorktreeHandle {
+            branch: branch.to_string(),
+            path: PathBuf::from("/tmp/unused"),
+        })
+    }
+
+    async fn teardown(&self, _p: &Project, _h: &WorktreeHandle) -> anyhow::Result<()> {
+        anyhow::bail!("teardown failed")
+    }
+}
+
+struct BlockingTeardownWorktrees {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+#[async_trait]
+impl Worktrees for BlockingTeardownWorktrees {
+    async fn create(&self, _p: &Project, branch: &str) -> anyhow::Result<WorktreeHandle> {
+        Ok(WorktreeHandle {
+            branch: branch.to_string(),
+            path: PathBuf::from("/tmp/unused"),
+        })
+    }
+
+    async fn teardown(&self, _p: &Project, _h: &WorktreeHandle) -> anyhow::Result<()> {
+        self.started.notify_waiters();
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
 /// Reads `AUWSX_ISSUE_ID` from the spec env, applies the single transition a
 /// real agent would request via the control CLI for the current phase, then
 /// "exits" cleanly. PLAN_READY->WORKING and READY_TO_MERGE->MERGING are
@@ -1054,11 +1089,15 @@ impl AgentExecutor for BlockingAgent {
 /// Create a project whose gates auto-release with no time travel:
 /// completion_policy='auto', plan_gate_timeout_min=0.
 async fn drive_project(pool: &SqlitePool) -> anyhow::Result<i64> {
+    drive_project_with_repo(pool, "/repo").await
+}
+
+async fn drive_project_with_repo(pool: &SqlitePool, repo_path: &str) -> anyhow::Result<i64> {
     let id = projects::create(
         pool,
         NewProject {
             name: "drive",
-            repo_path: "/repo",
+            repo_path,
             default_branch: "main",
             arsenal_preset_name: None,
             main_agent_cmd: "main {prompt}",
@@ -1076,6 +1115,40 @@ async fn drive_project(pool: &SqlitePool) -> anyhow::Result<i64> {
     )
     .await?;
     Ok(id)
+}
+
+async fn attach_clean_issue_branch(
+    pool: &SqlitePool,
+    repo: &Path,
+    issue_id: i64,
+    file_name: &str,
+) -> anyhow::Result<()> {
+    let branch = branch_for_issue(issue_id);
+    git(repo, &["checkout", "-b", &branch])?;
+    std::fs::write(repo.join(file_name), format!("issue {issue_id}\n"))?;
+    git(repo, &["add", file_name])?;
+    git(repo, &["commit", "-m", &format!("issue {issue_id}")])?;
+    git(repo, &["checkout", "main"])?;
+    issues::set_worktree(pool, issue_id, Some(&branch), None, None, TS).await?;
+    Ok(())
+}
+
+async fn attach_conflicting_issue_branch(
+    pool: &SqlitePool,
+    repo: &Path,
+    issue_id: i64,
+) -> anyhow::Result<()> {
+    let branch = branch_for_issue(issue_id);
+    git(repo, &["checkout", "-b", &branch])?;
+    std::fs::write(repo.join("README.md"), format!("issue {issue_id}\n"))?;
+    git(repo, &["add", "README.md"])?;
+    git(repo, &["commit", "-m", &format!("issue {issue_id}")])?;
+    git(repo, &["checkout", "main"])?;
+    std::fs::write(repo.join("README.md"), "main change\n")?;
+    git(repo, &["add", "README.md"])?;
+    git(repo, &["commit", "-m", "main change"])?;
+    issues::set_worktree(pool, issue_id, Some(&branch), None, None, TS).await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -1225,17 +1298,46 @@ async fn set_project_deepsleep_interval(
     Ok(())
 }
 
+async fn finished_reconcile_job_with_log(
+    pool: &SqlitePool,
+    project_id: i64,
+    log: impl AsRef<str>,
+) -> anyhow::Result<(i64, PathBuf)> {
+    let main_job_id = main_jobs::enqueue_project_reconcile(pool, project_id, "prompt", TS).await?;
+    let log_path = artifacts::main_job_log_path(project_id, main_job_id, TS + 1)?;
+    std::fs::write(&log_path, log.as_ref())?;
+    main_jobs::mark_running(pool, main_job_id, TS + 1, &log_path.to_string_lossy()).await?;
+    main_jobs::finish(pool, main_job_id, MainJobStatus::Done, TS + 2, None).await?;
+    Ok((main_job_id, log_path))
+}
+
 fn scheduler_with(
     db: Db,
     clock: Arc<dyn Clock>,
     executor: Arc<dyn AgentExecutor>,
     tick_interval: Duration,
 ) -> Scheduler {
-    Scheduler::new(
+    scheduler_with_worktrees(
         db,
         clock,
         executor,
         Arc::new(FakeWorktrees(PathBuf::from("/tmp/auwsx-test-worktree"))),
+        tick_interval,
+    )
+}
+
+fn scheduler_with_worktrees(
+    db: Db,
+    clock: Arc<dyn Clock>,
+    executor: Arc<dyn AgentExecutor>,
+    worktrees: Arc<dyn Worktrees>,
+    tick_interval: Duration,
+) -> Scheduler {
+    Scheduler::new(
+        db,
+        clock,
+        executor,
+        worktrees,
         events::channel(),
         PathBuf::from("/tmp/unused.sock"),
         tick_interval,
@@ -1245,10 +1347,18 @@ fn scheduler_with(
 #[tokio::test]
 async fn given_ready_project_issues_when_project_merge_approved_then_all_release_oldest_first(
 ) -> anyhow::Result<()> {
+    std::fs::create_dir_all(".tmp")?;
+    let tmp = tempfile::Builder::new()
+        .prefix("project-merge-")
+        .tempdir_in(".tmp")?;
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo)?;
     let db = Db::open_memory().await?;
-    let project_id = drive_project(db.pool()).await?;
+    let project_id = drive_project_with_repo(db.pool(), &repo.display().to_string()).await?;
     let first = issues::create(db.pool(), project_id, "first ready", None, TS).await?;
     let second = issues::create(db.pool(), project_id, "second ready", None, TS).await?;
+    attach_clean_issue_branch(db.pool(), &repo, first, "first.txt").await?;
+    attach_clean_issue_branch(db.pool(), &repo, second, "second.txt").await?;
     issues::force_status(db.pool(), first, IssueStatus::ReadyToMerge, TS).await?;
     issues::force_status(db.pool(), second, IssueStatus::ReadyToMerge, TS).await?;
     let release = Arc::new(Notify::new());
@@ -1316,6 +1426,623 @@ async fn given_conflict_blocked_local_merge_when_project_merge_approved_then_rea
 }
 
 #[tokio::test]
+async fn given_represented_ready_issue_when_reconcile_project_then_marks_done() -> anyhow::Result<()>
+{
+    std::fs::create_dir_all(".tmp")?;
+    let tmp = tempfile::Builder::new()
+        .prefix("reconcile-represented-")
+        .tempdir_in(".tmp")?;
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo)?;
+    let db = Db::open_memory().await?;
+    let project_id = drive_project_with_repo(db.pool(), &repo.display().to_string()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "represented", None, TS).await?;
+    attach_clean_issue_branch(db.pool(), &repo, issue_id, "represented.txt").await?;
+    git(
+        &repo,
+        &[
+            "merge",
+            "--no-ff",
+            &branch_for_issue(issue_id),
+            "-m",
+            "represented",
+        ],
+    )?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let report = scheduler.reconcile_project(project_id, TS + 1).await?;
+
+    assert_eq!(report.applied_count, 1);
+    assert_eq!(
+        issues::get(db.pool(), issue_id)
+            .await?
+            .expect("issue exists")
+            .status,
+        IssueStatus::Done
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_represented_ready_issue_when_cleanup_fails_then_mark_done_claim_happens_first(
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(".tmp")?;
+    let tmp = tempfile::Builder::new()
+        .prefix("reconcile-markdone-order-")
+        .tempdir_in(".tmp")?;
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo)?;
+    let db = Db::open_memory().await?;
+    let project_id = drive_project_with_repo(db.pool(), &repo.display().to_string()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "represented", None, TS).await?;
+    attach_clean_issue_branch(db.pool(), &repo, issue_id, "represented-order.txt").await?;
+    issues::set_worktree(
+        db.pool(),
+        issue_id,
+        Some(&branch_for_issue(issue_id)),
+        Some("/tmp/auwsx-represented-order"),
+        None,
+        TS,
+    )
+    .await?;
+    git(
+        &repo,
+        &[
+            "merge",
+            "--no-ff",
+            &branch_for_issue(issue_id),
+            "-m",
+            "represented",
+        ],
+    )?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
+    let scheduler = scheduler_with_worktrees(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Arc::new(FailingTeardownWorktrees),
+        Duration::from_secs(60),
+    );
+
+    let err = scheduler
+        .reconcile_project(project_id, TS + 1)
+        .await
+        .expect_err("teardown failure should surface after DB claim");
+    let issue = issues::get(db.pool(), issue_id)
+        .await?
+        .expect("issue exists");
+
+    assert!(
+        err.to_string().contains("teardown failed"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(issue.status, IssueStatus::Done);
+    assert_eq!(
+        issue.worktree_path.as_deref(),
+        Some("/tmp/auwsx-represented-order")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_two_clean_ready_issues_when_reconcile_project_then_releases_one_merge(
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(".tmp")?;
+    let tmp = tempfile::Builder::new()
+        .prefix("reconcile-one-merge-")
+        .tempdir_in(".tmp")?;
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo)?;
+    let db = Db::open_memory().await?;
+    let project_id = drive_project_with_repo(db.pool(), &repo.display().to_string()).await?;
+    let first = issues::create(db.pool(), project_id, "first", None, TS).await?;
+    let second = issues::create(db.pool(), project_id, "second", None, TS).await?;
+    attach_clean_issue_branch(db.pool(), &repo, first, "first.txt").await?;
+    attach_clean_issue_branch(db.pool(), &repo, second, "second.txt").await?;
+    issues::force_status(db.pool(), first, IssueStatus::ReadyToMerge, TS).await?;
+    issues::force_status(db.pool(), second, IssueStatus::ReadyToMerge, TS).await?;
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let report = scheduler.reconcile_project(project_id, TS + 1).await?;
+    let first_status = issues::get(db.pool(), first).await?.expect("first").status;
+    let second_status = issues::get(db.pool(), second)
+        .await?
+        .expect("second")
+        .status;
+
+    assert_eq!(report.applied_count, 1);
+    assert_eq!(
+        [first_status, second_status]
+            .into_iter()
+            .filter(|status| *status == IssueStatus::Merging)
+            .count(),
+        1
+    );
+    assert_eq!(
+        [first_status, second_status]
+            .into_iter()
+            .filter(|status| *status == IssueStatus::ReadyToMerge)
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_reconcile_dry_run_when_clean_issue_exists_then_no_mutation_or_job(
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(".tmp")?;
+    let tmp = tempfile::Builder::new()
+        .prefix("reconcile-dry-run-")
+        .tempdir_in(".tmp")?;
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo)?;
+    let db = Db::open_memory().await?;
+    let project_id = drive_project_with_repo(db.pool(), &repo.display().to_string()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "dry run", None, TS).await?;
+    attach_clean_issue_branch(db.pool(), &repo, issue_id, "dry-run.txt").await?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let report = scheduler.diagnose_project(project_id, true).await?;
+
+    assert_eq!(report.applied_count, 0);
+    assert_eq!(
+        issues::get(db.pool(), issue_id)
+            .await?
+            .expect("issue exists")
+            .status,
+        IssueStatus::ReadyToMerge
+    );
+    assert!(main_jobs::recent_by_project(db.pool(), project_id, 10)
+        .await?
+        .is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_conflicting_ready_issue_when_reconcile_twice_then_one_active_reconcile_job(
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(".tmp")?;
+    let tmp = tempfile::Builder::new()
+        .prefix("reconcile-agentic-")
+        .tempdir_in(".tmp")?;
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo)?;
+    let db = Db::open_memory().await?;
+    let project_id = drive_project_with_repo(db.pool(), &repo.display().to_string()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "conflict", None, TS).await?;
+    attach_conflicting_issue_branch(db.pool(), &repo, issue_id).await?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(BlockingAgent {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+        Duration::from_secs(60),
+    );
+
+    scheduler.reconcile_project(project_id, TS + 1).await?;
+    started.notified().await;
+    scheduler.reconcile_project(project_id, TS + 2).await?;
+
+    let jobs = main_jobs::recent_by_project(db.pool(), project_id, 10).await?;
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.kind == "reconcile"
+                && matches!(job.status, MainJobStatus::Queued | MainJobStatus::Running))
+            .count(),
+        1
+    );
+    release.notify_waiters();
+    scheduler.join_inflight().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_conflicting_ready_issue_when_project_merge_approved_then_reconcile_blocks_release(
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(".tmp")?;
+    let tmp = tempfile::Builder::new()
+        .prefix("project-merge-conflict-")
+        .tempdir_in(".tmp")?;
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo)?;
+    let db = Db::open_memory().await?;
+    let project_id = drive_project_with_repo(db.pool(), &repo.display().to_string()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "conflict", None, TS).await?;
+    attach_conflicting_issue_branch(db.pool(), &repo, issue_id).await?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let err = scheduler
+        .approve_project_merge(project_id, TS + 1)
+        .await
+        .expect_err("merge preflight must block predicted conflicts");
+
+    assert!(
+        err.to_string().contains("reconcile blocker"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        issues::get(db.pool(), issue_id)
+            .await?
+            .expect("issue exists")
+            .status,
+        IssueStatus::ReadyToMerge
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_done_reconcile_job_with_retry_proposal_when_applied_then_issue_retries(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    std::fs::create_dir_all(".tmp")?;
+    let data_tmp = tempfile::Builder::new()
+        .prefix("reconcile-apply-data-")
+        .tempdir_in(".tmp")?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "retry", None, TS).await?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::Failed, TS).await?;
+    agent_runs::start(
+        db.pool(),
+        StartRun {
+            issue_id: Some(issue_id),
+            main_job_id: None,
+            role: Role::Plan,
+            phase: "plan",
+            agent_cmd: "plan {prompt}",
+            status_before: Some(IssueStatus::Planning.as_str()),
+            pid: None,
+            prompt_path: None,
+            log_path: None,
+        },
+        TS,
+    )
+    .await?;
+    let proposal = format!(
+        r#"```json
+{{
+  "schema_version": 1,
+  "kind": "auwsx_reconcile_proposal",
+  "actions": [
+    {{
+      "action": "retry_issue",
+      "issue_id": {issue_id}
+    }}
+  ]
+}}
+```"#
+    );
+    let (main_job_id, _) = finished_reconcile_job_with_log(db.pool(), project_id, proposal).await?;
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ScriptedAgent {
+            db: db.clone(),
+            now: TS + 4,
+        }),
+        Duration::from_secs(60),
+    );
+
+    let report = scheduler.apply_reconcile_job(main_job_id, TS + 3).await?;
+    scheduler.join_inflight().await;
+
+    assert_eq!(report.applied_count, 1);
+    assert_eq!(
+        issues::get(db.pool(), issue_id)
+            .await?
+            .expect("issue exists")
+            .status,
+        IssueStatus::PlanReady
+    );
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_reconcile_apply_running_for_project_when_apply_again_then_project_guard_rejects(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    std::fs::create_dir_all(".tmp")?;
+    let data_tmp = tempfile::Builder::new()
+        .prefix("reconcile-apply-guard-data-")
+        .tempdir_in(".tmp")?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+    let repo_tmp = tempfile::Builder::new()
+        .prefix("reconcile-apply-guard-repo-")
+        .tempdir_in(".tmp")?;
+    let repo = repo_tmp.path().join("repo");
+    init_git_repo(&repo)?;
+    let db = Db::open_memory().await?;
+    let project_id = drive_project_with_repo(db.pool(), &repo.display().to_string()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "mark done guarded", None, TS).await?;
+    attach_clean_issue_branch(db.pool(), &repo, issue_id, "guarded.txt").await?;
+    issues::set_worktree(
+        db.pool(),
+        issue_id,
+        Some(&branch_for_issue(issue_id)),
+        Some("/tmp/auwsx-apply-guard"),
+        None,
+        TS,
+    )
+    .await?;
+    git(
+        &repo,
+        &[
+            "merge",
+            "--no-ff",
+            &branch_for_issue(issue_id),
+            "-m",
+            "guarded",
+        ],
+    )?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
+    let (main_job_id, _) = finished_reconcile_job_with_log(
+        db.pool(),
+        project_id,
+        format!(
+            r#"```json
+{{
+  "schema_version": 1,
+  "kind": "auwsx_reconcile_proposal",
+  "actions": [{{ "action": "mark_done", "issue_id": {issue_id} }}]
+}}
+```"#
+        ),
+    )
+    .await?;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let scheduler = Arc::new(scheduler_with_worktrees(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Arc::new(BlockingTeardownWorktrees {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+        Duration::from_secs(60),
+    ));
+    let first = {
+        let scheduler = Arc::clone(&scheduler);
+        tokio::spawn(async move { scheduler.apply_reconcile_job(main_job_id, TS + 3).await })
+    };
+    started.notified().await;
+
+    let err = scheduler
+        .apply_reconcile_job(main_job_id, TS + 4)
+        .await
+        .expect_err("second apply must be serialized by project guard");
+
+    assert!(
+        err.to_string().contains("already reconciling or ticking"),
+        "unexpected error: {err:#}"
+    );
+    release.notify_waiters();
+    first.await??;
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_reconcile_retry_proposal_for_moved_issue_when_applied_then_rejected(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    std::fs::create_dir_all(".tmp")?;
+    let data_tmp = tempfile::Builder::new()
+        .prefix("reconcile-moved-data-")
+        .tempdir_in(".tmp")?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    let other_project_id = projects::create(
+        db.pool(),
+        NewProject {
+            name: "other",
+            repo_path: "/other",
+            default_branch: "main",
+            arsenal_preset_name: None,
+            main_agent_cmd: "main {prompt}",
+            route_agent_cmd: "main {prompt}",
+            plan_agent_cmd: "plan {prompt}",
+            work_agent_cmd: "work {prompt}",
+            review_agent_cmd: None,
+            completion_policy: Some(CompletionPolicy::Auto),
+            plan_gate_timeout_min: Some(0),
+            completion_soft_timeout_min: None,
+            schedule_interval_min: None,
+            schedule_cron: None,
+        },
+        TS,
+    )
+    .await?;
+    let issue_id = issues::create(db.pool(), project_id, "moved", None, TS).await?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::Failed, TS).await?;
+    let (main_job_id, _) = finished_reconcile_job_with_log(
+        db.pool(),
+        project_id,
+        format!(
+            r#"```json
+{{
+  "schema_version": 1,
+  "kind": "auwsx_reconcile_proposal",
+  "actions": [{{ "action": "retry_issue", "issue_id": {issue_id} }}]
+}}
+```"#
+        ),
+    )
+    .await?;
+    sqlx::query("UPDATE issues SET project_id = ? WHERE id = ?")
+        .bind(other_project_id)
+        .bind(issue_id)
+        .execute(db.pool())
+        .await?;
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let err = scheduler
+        .apply_reconcile_job(main_job_id, TS + 3)
+        .await
+        .expect_err("moved issue proposal must be stale");
+
+    assert!(
+        err.to_string().contains("stale_proposal"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        issues::get(db.pool(), issue_id)
+            .await?
+            .expect("issue exists")
+            .status,
+        IssueStatus::Failed
+    );
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_unfenced_reconcile_job_log_when_applied_then_rejected_without_mutation(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    std::fs::create_dir_all(".tmp")?;
+    let data_tmp = tempfile::Builder::new()
+        .prefix("reconcile-unfenced-data-")
+        .tempdir_in(".tmp")?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "unfenced", None, TS).await?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::Failed, TS).await?;
+    let (main_job_id, _) = finished_reconcile_job_with_log(
+        db.pool(),
+        project_id,
+        format!(
+            r#"{{ "schema_version": 1, "kind": "auwsx_reconcile_proposal", "actions": [{{ "action": "retry_issue", "issue_id": {issue_id} }}] }}"#
+        ),
+    )
+    .await?;
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    scheduler
+        .apply_reconcile_job(main_job_id, TS + 3)
+        .await
+        .expect_err("unfenced proposal must be rejected");
+
+    assert_eq!(
+        issues::get(db.pool(), issue_id)
+            .await?
+            .expect("issue exists")
+            .status,
+        IssueStatus::Failed
+    );
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_reconcile_job_with_unexpected_log_path_when_applied_then_rejected(
+) -> anyhow::Result<()> {
+    let _env_guard = ENV_LOCK.lock().await;
+    std::fs::create_dir_all(".tmp")?;
+    let data_tmp = tempfile::Builder::new()
+        .prefix("reconcile-log-path-data-")
+        .tempdir_in(".tmp")?;
+    std::env::set_var("AUWSX_DATA_DIR", data_tmp.path());
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    let issue_id = issues::create(db.pool(), project_id, "log path", None, TS).await?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::Failed, TS).await?;
+    let main_job_id =
+        main_jobs::enqueue_project_reconcile(db.pool(), project_id, "prompt", TS).await?;
+    let expected_log_path = artifacts::main_job_log_path(project_id, main_job_id, TS + 1)?;
+    std::fs::write(&expected_log_path, "expected")?;
+    let other_log_path = data_tmp.path().join("other.log");
+    std::fs::write(
+        &other_log_path,
+        format!(
+            r#"```json
+{{
+  "schema_version": 1,
+  "kind": "auwsx_reconcile_proposal",
+  "actions": [{{ "action": "retry_issue", "issue_id": {issue_id} }}]
+}}
+```"#
+        ),
+    )?;
+    main_jobs::mark_running(
+        db.pool(),
+        main_job_id,
+        TS + 1,
+        &other_log_path.to_string_lossy(),
+    )
+    .await?;
+    main_jobs::finish(db.pool(), main_job_id, MainJobStatus::Done, TS + 2, None).await?;
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let err = scheduler
+        .apply_reconcile_job(main_job_id, TS + 3)
+        .await
+        .expect_err("unexpected artifact path must be rejected");
+
+    assert!(
+        format!("{err:#}").contains("expected artifact path"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        issues::get(db.pool(), issue_id)
+            .await?
+            .expect("issue exists")
+            .status,
+        IssueStatus::Failed
+    );
+    std::env::remove_var("AUWSX_DATA_DIR");
+    Ok(())
+}
+
+#[tokio::test]
 async fn given_conflict_blocked_local_merge_when_auto_policy_ticks_then_ready_item_stays_queued(
 ) -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
@@ -1343,9 +2070,16 @@ async fn given_conflict_blocked_local_merge_when_auto_policy_ticks_then_ready_it
 #[tokio::test]
 async fn given_ready_project_when_executed_then_ready_merge_queue_is_approved() -> anyhow::Result<()>
 {
+    std::fs::create_dir_all(".tmp")?;
+    let tmp = tempfile::Builder::new()
+        .prefix("project-execute-")
+        .tempdir_in(".tmp")?;
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo)?;
     let db = Db::open_memory().await?;
-    let project_id = drive_project(db.pool()).await?;
+    let project_id = drive_project_with_repo(db.pool(), &repo.display().to_string()).await?;
     let issue_id = issues::create(db.pool(), project_id, "project execute ready", None, TS).await?;
+    attach_clean_issue_branch(db.pool(), &repo, issue_id, "execute.txt").await?;
     issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
     let release = Arc::new(Notify::new());
     let scheduler = scheduler_with(
