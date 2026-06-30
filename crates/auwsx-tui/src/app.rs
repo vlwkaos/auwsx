@@ -29,6 +29,7 @@ use auwsx_core::db::subtasks::Subtask;
 use auwsx_core::events::Event;
 use auwsx_core::ipc::{self, Command, Response};
 use auwsx_core::main_jobs::MainJob;
+use auwsx_core::reconcile::ProjectReconcileReport;
 use auwsx_core::routines::{OutputRoute, Routine};
 use auwsx_core::state::IssueStatus;
 use auwsx_core::steering::Steering;
@@ -1027,6 +1028,7 @@ pub struct App {
     pub recent_agent_runs: Vec<AgentRun>,
     pub recent_main_jobs: Vec<MainJob>,
     pub recent_scheduler_runs: Vec<SchedulerRun>,
+    pub reconcile_reports: HashMap<i64, ProjectReconcileReport>,
     pub ask_answers: Vec<AskAnswer>,
     pub daemon_tick_secs: i64,
     /// Per-project epoch ms of the most recent AUTO scheduler tick.
@@ -1092,6 +1094,7 @@ impl App {
             recent_agent_runs: Vec::new(),
             recent_main_jobs: Vec::new(),
             recent_scheduler_runs: Vec::new(),
+            reconcile_reports: HashMap::new(),
             ask_answers: Vec::new(),
             daemon_tick_secs: daemon_tick_secs(),
             last_auto_tick: HashMap::new(),
@@ -1802,7 +1805,7 @@ impl App {
                 caps.push(CapabilityAction::Drill, "Enter kanban");
                 caps.push(CapabilityAction::Edit, "e edit");
                 caps.push(CapabilityAction::NewContext, "n backlog");
-                caps.push(CapabilityAction::Execute, "E run schedule");
+                caps.push(CapabilityAction::Execute, "E reconcile/merge");
                 caps.push(CapabilityAction::Settings, "S settings");
                 caps.push(CapabilityAction::MoveMode, "m move");
                 caps.push(CapabilityAction::Delete, "d unregister");
@@ -2102,6 +2105,14 @@ impl App {
             archived.sort_by_key(|issue| std::cmp::Reverse(issue.updated_at));
             kids.issues = active;
             kids.archived_issues = archived;
+        }
+        match self.req(Command::DiagnoseProject { project_id }).await {
+            Ok(Response::ReconcileReport(report)) => {
+                self.reconcile_reports.insert(project_id, report);
+            }
+            _ => {
+                self.reconcile_reports.remove(&project_id);
+            }
         }
         self.children.insert(project_id, kids);
         Ok(())
@@ -2683,8 +2694,11 @@ impl App {
     async fn execute_selected(&mut self) -> Result<()> {
         match self.selected_context_item() {
             Some(TreeItem::Project(project_id)) => {
-                self.execute_control(Command::ExecuteProject { project_id })
-                    .await;
+                self.execute_control(Command::ReconcileProject {
+                    project_id,
+                    dry_run: false,
+                })
+                .await;
             }
             Some(TreeItem::Backlog { id: item_id, .. }) => {
                 self.run_now(Command::RunBacklogNow { item_id }).await;
@@ -2726,6 +2740,18 @@ impl App {
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.status = format!("approved merge for {joined}");
+            }
+            Ok(Response::ReconcileReport(report)) => {
+                self.status = format!(
+                    "reconcile: applied {} queued {} manual {} agentic {}",
+                    report.applied_count,
+                    report
+                        .queued_main_job_id
+                        .map(|id| format!("#{id}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    report.manual_count,
+                    report.agentic_count
+                );
             }
             Ok(Response::Err { message }) => self.status = format!("execute failed: {message}"),
             Ok(_) => self.status = "execute failed: unexpected response".into(),

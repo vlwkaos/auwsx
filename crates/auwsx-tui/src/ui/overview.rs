@@ -3,7 +3,10 @@
 use super::{render_list, theme, ACCENT};
 use crate::app::{App, TreeItem};
 use auwsx_core::backlog::Approval;
+use auwsx_core::db::agent_runs::AgentRun;
 use auwsx_core::db::scheduler_runs::SchedulerRunSource;
+use auwsx_core::main_jobs::{MainJob, MainJobStatus};
+use auwsx_core::reconcile::{ProjectReconcileReport, ReconcileActionKind};
 use auwsx_core::state::{IssueStatus, ProgressLane};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -93,6 +96,7 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(8),
+            Constraint::Length(7),
             Constraint::Min(8),
             Constraint::Length(7),
             Constraint::Length(5),
@@ -165,9 +169,307 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ];
     panel(frame, rows[0], &format!("Project {}", p.name), lines);
-    render_kanban(frame, app, rows[1]);
-    render_kanban_preview(frame, app, rows[2]);
-    render_archive_summary(frame, app, rows[3]);
+    render_recovery(frame, app, p.id, rows[1]);
+    render_kanban(frame, app, rows[2]);
+    render_kanban_preview(frame, app, rows[3]);
+    render_archive_summary(frame, app, rows[4]);
+}
+
+fn render_recovery(frame: &mut Frame, app: &App, project_id: i64, area: Rect) {
+    let Some(report) = app.reconcile_reports.get(&project_id) else {
+        panel(
+            frame,
+            area,
+            "Recovery",
+            vec![Line::styled("diagnostics unavailable", theme::dim())],
+        );
+        return;
+    };
+    panel(
+        frame,
+        area,
+        "Recovery",
+        recovery_lines(report, &app.recent_main_jobs, &app.recent_agent_runs),
+    );
+}
+
+fn recovery_lines(
+    report: &ProjectReconcileReport,
+    recent_main_jobs: &[MainJob],
+    recent_agent_runs: &[AgentRun],
+) -> Vec<Line<'static>> {
+    let counts = report.diagnosis_counts();
+    let mut lines = vec![kv(
+        "counts",
+        &format!(
+            "safe {}  represented {}  conflict {}  stale {}  unknown {}",
+            counts.safe, counts.represented, counts.conflict, counts.stale, counts.unknown
+        ),
+    )];
+    if let Some(job) = active_reconcile_job(report.project_id, recent_main_jobs) {
+        lines.push(kv(
+            "agent",
+            &format!(
+                "reconcile #{} {}",
+                job.id,
+                job.status.as_str().to_lowercase()
+            ),
+        ));
+    }
+    let running_issues = running_issue_agents(recent_agent_runs);
+    if running_issues > 0 {
+        lines.push(kv("issues", &format!("{running_issues} running")));
+    }
+    for item in report
+        .issues
+        .iter()
+        .filter(|item| item.proposed_action != ReconcileActionKind::None)
+        .take(2)
+    {
+        lines.push(kv(
+            &format!("#{}", item.issue_id),
+            &format!(
+                "{} -> {}",
+                item.diagnosis.as_str(),
+                item.proposed_action.as_str()
+            ),
+        ));
+    }
+    for orphan in report.orphans.iter().take(1) {
+        lines.push(kv(
+            &format!("orphan #{}", orphan.issue_id),
+            orphan.proposed_action.as_str(),
+        ));
+    }
+    if lines.len() == 1 {
+        lines.push(Line::styled("no recovery actions pending", theme::dim()));
+    }
+    lines
+}
+
+fn active_reconcile_job(project_id: i64, jobs: &[MainJob]) -> Option<&MainJob> {
+    jobs.iter().find(|job| {
+        job.project_id == project_id
+            && job.kind == "reconcile"
+            && matches!(job.status, MainJobStatus::Queued | MainJobStatus::Running)
+    })
+}
+
+fn running_issue_agents(runs: &[AgentRun]) -> usize {
+    runs.iter()
+        .filter(|run| run.issue_id.is_some() && run.exited_at.is_none())
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use auwsx_core::agent::ExitKind;
+    use auwsx_core::db::agent_runs::Role;
+    use auwsx_core::main_jobs::MainJobSource;
+    use auwsx_core::reconcile::ReconcileDiagnosis;
+    use auwsx_core::reconcile::{ReconcileIssueReport, ReconcileOrphanReport};
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn issue(
+        issue_id: i64,
+        diagnosis: ReconcileDiagnosis,
+        action: ReconcileActionKind,
+    ) -> ReconcileIssueReport {
+        ReconcileIssueReport {
+            issue_id,
+            status: IssueStatus::ReadyToMerge,
+            branch: Some(format!("auwsx/issue-{issue_id}")),
+            worktree_path: None,
+            diagnosis,
+            confidence: 90,
+            proposed_action: action,
+            blocking_reason: None,
+            manual_command: None,
+        }
+    }
+
+    fn main_job(id: i64, project_id: i64, kind: &str, status: MainJobStatus) -> MainJob {
+        MainJob {
+            id,
+            project_id,
+            routine_id: None,
+            source: MainJobSource::UserOneoff,
+            kind: kind.to_string(),
+            prompt: String::new(),
+            status,
+            worktree_path: None,
+            report_path: None,
+            scope_violation: None,
+            queued_at: 0,
+            started_at: None,
+            ended_at: None,
+            log_path: None,
+            outcome: None,
+        }
+    }
+
+    fn agent_run(id: i64, issue_id: Option<i64>, exited_at: Option<i64>) -> AgentRun {
+        AgentRun {
+            id,
+            issue_id,
+            main_job_id: None,
+            role: Role::Work,
+            phase: "WORKING".to_string(),
+            agent_cmd: "agent".to_string(),
+            status_before: None,
+            status_after: None,
+            pid: None,
+            exit_code: None,
+            exit_kind: exited_at.map(|_| ExitKind::Exited),
+            prompt_path: None,
+            log_path: None,
+            phase_report: None,
+            spawned_at: 0,
+            exited_at,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn given_recovery_report_when_lines_built_then_counts_actions_and_truncates() {
+        let mut report = ProjectReconcileReport::empty(1, true);
+        report.issues = vec![
+            issue(
+                1,
+                ReconcileDiagnosis::SafeToMerge,
+                ReconcileActionKind::ApplyMerge,
+            ),
+            issue(
+                2,
+                ReconcileDiagnosis::RepresentedInMain,
+                ReconcileActionKind::MarkDone,
+            ),
+            issue(
+                3,
+                ReconcileDiagnosis::MergeConflict,
+                ReconcileActionKind::QueueAgenticReconcile,
+            ),
+            issue(
+                4,
+                ReconcileDiagnosis::StaleNoDiffBranch,
+                ReconcileActionKind::MarkDone,
+            ),
+            issue(
+                5,
+                ReconcileDiagnosis::Unknown,
+                ReconcileActionKind::ManualRequired,
+            ),
+        ];
+        report.orphans = vec![
+            ReconcileOrphanReport {
+                issue_id: 10,
+                branch: "auwsx/issue-10".to_string(),
+                path: "/repo-issue-10".into(),
+                diagnosis: ReconcileDiagnosis::OrphanWorktree,
+                proposed_action: ReconcileActionKind::PruneOrphanWorktree,
+            },
+            ReconcileOrphanReport {
+                issue_id: 11,
+                branch: "auwsx/issue-11".to_string(),
+                path: "/repo-issue-11".into(),
+                diagnosis: ReconcileDiagnosis::OrphanWorktree,
+                proposed_action: ReconcileActionKind::PruneOrphanWorktree,
+            },
+        ];
+
+        let text = recovery_lines(&report, &[], &[])
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text[0].contains("safe 1"));
+        assert!(text[0].contains("represented 1"));
+        assert!(text[0].contains("conflict 1"));
+        assert!(text[0].contains("stale 1"));
+        assert!(text[0].contains("unknown 1"));
+        assert!(text.iter().any(|line| line.contains("#1")));
+        assert!(text.iter().any(|line| line.contains("#2")));
+        assert!(!text.iter().any(|line| line.contains("#3")));
+        assert!(text.iter().any(|line| line.contains("orphan #10")));
+        assert!(!text.iter().any(|line| line.contains("orphan #11")));
+    }
+
+    #[test]
+    fn given_recovery_report_without_actions_when_lines_built_then_empty_message() {
+        let mut report = ProjectReconcileReport::empty(1, true);
+        report.issues = vec![issue(
+            1,
+            ReconcileDiagnosis::SafeToMerge,
+            ReconcileActionKind::None,
+        )];
+
+        let text = recovery_lines(&report, &[], &[])
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text
+            .iter()
+            .any(|line| line == "no recovery actions pending"));
+    }
+
+    #[test]
+    fn given_active_reconcile_job_when_lines_built_then_agent_indicator_is_visible() {
+        let report = ProjectReconcileReport::empty(1, true);
+        let jobs = vec![
+            main_job(12, 1, "dream", MainJobStatus::Running),
+            main_job(11, 2, "reconcile", MainJobStatus::Running),
+            main_job(10, 1, "reconcile", MainJobStatus::Running),
+        ];
+
+        let text = recovery_lines(&report, &jobs, &[])
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text
+            .iter()
+            .any(|line| line.contains("agent") && line.contains("reconcile #10 running")));
+    }
+
+    #[test]
+    fn given_terminal_reconcile_job_when_lines_built_then_agent_indicator_is_hidden() {
+        let report = ProjectReconcileReport::empty(1, true);
+        let jobs = vec![main_job(10, 1, "reconcile", MainJobStatus::Done)];
+
+        let text = recovery_lines(&report, &jobs, &[])
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(!text.iter().any(|line| line.contains("agent")));
+    }
+
+    #[test]
+    fn given_running_issue_agents_when_lines_built_then_issue_indicator_is_visible() {
+        let report = ProjectReconcileReport::empty(1, true);
+        let runs = vec![
+            agent_run(1, Some(10), None),
+            agent_run(2, Some(11), Some(2)),
+            agent_run(3, None, None),
+        ];
+
+        let text = recovery_lines(&report, &[], &runs)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text
+            .iter()
+            .any(|line| line.contains("issues") && line.contains("1 running")));
+    }
 }
 
 fn render_routines(frame: &mut Frame, app: &App, area: Rect) {

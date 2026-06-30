@@ -16,10 +16,11 @@ use auwsx_core::ipc::{self, Command, Response};
 use auwsx_core::state::IssueStatus;
 use auwsx_core::steering::SteeringSource;
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// What the parsed argv asks `auwsx` to do.
@@ -71,6 +72,9 @@ USAGE:
   auwsx project ls
   auwsx project get <project_id>           show one project incl. resolved policy
   auwsx project merge <project_id>         approve all READY_TO_MERGE issues
+  auwsx project diagnose <project_id>      inspect merge/worktree recovery state
+  auwsx project reconcile <project_id> [--dry-run]  apply safe recovery, queue hard cases
+  auwsx reconcile apply <main_job_id>      apply a validated reconcile proposal
 
   auwsx backlog add <project_id> <text...> [--source human|agent|routine|inbox]
   auwsx backlog ls <project_id> [--approval pending|approved|dismissed]
@@ -118,6 +122,7 @@ pub fn parse(args: &[String]) -> Result<CliAction> {
         "ask" => parse_ask(&args[1..]),
         "memory" => parse_memory(&args[1..]),
         "project" => parse_project(&args[1..]),
+        "reconcile" => parse_reconcile(&args[1..]),
         "backlog" => parse_backlog(&args[1..]),
         "triage" => {
             let p = Parsed::new(&args[1..]);
@@ -256,6 +261,22 @@ fn parse_arsenal(args: &[String]) -> Result<CliAction> {
     Ok(CliAction::Request(cmd))
 }
 
+fn parse_reconcile(args: &[String]) -> Result<CliAction> {
+    let (verb, rest) = split_verb(args, "reconcile")?;
+    let p = Parsed::new(rest);
+    let cmd = match verb {
+        "apply" => {
+            p.exact_positionals(1, "reconcile apply")?;
+            p.exact_flags(&[], "reconcile apply")?;
+            Command::ApplyReconcile {
+                main_job_id: p.int(0, "main_job_id")?,
+            }
+        }
+        other => bail!("unknown `reconcile` subcommand: {other}"),
+    };
+    Ok(CliAction::Request(cmd))
+}
+
 fn parse_project(args: &[String]) -> Result<CliAction> {
     let (verb, rest) = split_verb(args, "project")?;
     let p = Parsed::new(rest);
@@ -317,6 +338,21 @@ fn parse_project(args: &[String]) -> Result<CliAction> {
         "merge" => Command::ApproveProjectMerge {
             project_id: p.int(0, "project_id")?,
         },
+        "diagnose" => {
+            p.exact_positionals(1, "project diagnose")?;
+            p.exact_flags(&[], "project diagnose")?;
+            Command::DiagnoseProject {
+                project_id: p.int(0, "project_id")?,
+            }
+        }
+        "reconcile" => {
+            p.exact_positionals(1, "project reconcile")?;
+            p.exact_bool_flags(&["dry-run"], "project reconcile")?;
+            Command::ReconcileProject {
+                project_id: p.int(0, "project_id")?,
+                dry_run: p.has("dry-run"),
+            }
+        }
         other => bail!("unknown `project` subcommand: {other}"),
     };
     Ok(CliAction::Request(cmd))
@@ -570,6 +606,27 @@ impl Parsed {
         Ok(())
     }
 
+    fn exact_flags(&self, allowed: &[&str], context: &str) -> Result<()> {
+        for key in self.flags.keys() {
+            if !allowed.iter().any(|allowed| allowed == key) {
+                bail!("`{context}` does not accept --{key}");
+            }
+        }
+        for key in &self.bools {
+            if !allowed.iter().any(|allowed| allowed == key) {
+                bail!("`{context}` does not accept --{key}");
+            }
+        }
+        Ok(())
+    }
+
+    fn exact_bool_flags(&self, allowed: &[&str], context: &str) -> Result<()> {
+        if let Some(key) = self.flags.keys().next() {
+            bail!("`{context}` option --{key} does not take a value");
+        }
+        self.exact_flags(allowed, context)
+    }
+
     /// Parse an optional `--key <int>` flag. Absent ⇒ `None`; present-but-not-an
     /// integer ⇒ `Err` (so `--plan-gate-timeout abc` is rejected, not silently
     /// dropped).
@@ -756,6 +813,11 @@ pub async fn ensure_daemon(socket: &std::path::Path) -> Result<()> {
         return Ok(());
     }
 
+    let _lock = acquire_daemon_start_lock(socket).await?;
+    if ipc::request(socket, &Command::Ping).await.is_ok() {
+        return Ok(());
+    }
+
     let exe = std::env::current_exe()?;
     let mut child = std::process::Command::new(exe)
         .arg("daemon")
@@ -783,6 +845,69 @@ pub async fn ensure_daemon(socket: &std::path::Path) -> Result<()> {
         Some(e) => Err(e).context("daemon did not become ready"),
         None => anyhow::bail!("daemon did not become ready"),
     }
+}
+
+struct DaemonStartLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl Drop for DaemonStartLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+async fn acquire_daemon_start_lock(socket: &std::path::Path) -> Result<DaemonStartLock> {
+    let lock_path = socket.with_extension("start.lock");
+    if let Some(parent) = lock_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating daemon socket directory {}", parent.display()))?;
+    }
+    let started = Instant::now();
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => {
+                return Ok(DaemonStartLock {
+                    path: lock_path,
+                    _file: file,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_is_stale(&lock_path, Duration::from_secs(15)) {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                if started.elapsed() > Duration::from_secs(20) {
+                    anyhow::bail!(
+                        "timed out waiting for daemon startup lock {}",
+                        lock_path.display()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("creating daemon startup lock {}", lock_path.display())
+                });
+            }
+        }
+    }
+}
+
+fn lock_is_stale(path: &Path, max_age: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified.elapsed().is_ok_and(|age| age > max_age)
 }
 
 /// Print a response in a compact human form. Returns true if it was an error
@@ -889,6 +1014,41 @@ fn print_response(resp: Response) -> bool {
             );
         }
         Response::Project(None) => println!("not found"),
+        Response::ReconcileReport(report) => {
+            println!(
+                "project {}\tdry_run={}\tsafe={}\tmanual={}\tagentic={}\tapplied={}\tqueued={}",
+                report.project_id,
+                report.dry_run,
+                report.safe_count,
+                report.manual_count,
+                report.agentic_count,
+                report.applied_count,
+                report
+                    .queued_main_job_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+            for issue in report.issues {
+                println!(
+                    "issue\t{}\t{}\t{}\t{}\t{}\t{}",
+                    issue.issue_id,
+                    issue.status.as_str(),
+                    issue.diagnosis.as_str(),
+                    issue.proposed_action.as_str(),
+                    issue.confidence,
+                    issue.blocking_reason.unwrap_or_default()
+                );
+            }
+            for orphan in report.orphans {
+                println!(
+                    "orphan\t{}\t{}\t{}\t{}",
+                    orphan.issue_id,
+                    orphan.diagnosis.as_str(),
+                    orphan.proposed_action.as_str(),
+                    orphan.path
+                );
+            }
+        }
         Response::Backlog(items) => {
             for i in items {
                 println!(
@@ -1238,6 +1398,17 @@ mod tests {
         assert!(parse(&argv(&["daemon", "bogus"])).is_err());
     }
 
+    #[tokio::test]
+    async fn given_missing_socket_parent_when_start_lock_acquired_then_parent_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("missing").join("auwsx.sock");
+
+        let lock = acquire_daemon_start_lock(&socket).await.unwrap();
+
+        assert!(socket.parent().unwrap().is_dir());
+        assert!(lock.path.exists());
+    }
+
     // --- arsenal ------------------------------------------------------------
 
     #[test]
@@ -1522,6 +1693,84 @@ mod tests {
             parse(&argv(&["project", "merge", "7"])).unwrap(),
             CliAction::Request(Command::ApproveProjectMerge { project_id: 7 })
         );
+    }
+
+    #[test]
+    fn given_project_diagnose_when_parsed_then_diagnose_project() {
+        assert_eq!(
+            parse(&argv(&["project", "diagnose", "7"])).unwrap(),
+            CliAction::Request(Command::DiagnoseProject { project_id: 7 })
+        );
+    }
+
+    #[test]
+    fn given_project_reconcile_when_parsed_then_reconcile_project_apply() {
+        assert_eq!(
+            parse(&argv(&["project", "reconcile", "7"])).unwrap(),
+            CliAction::Request(Command::ReconcileProject {
+                project_id: 7,
+                dry_run: false
+            })
+        );
+    }
+
+    #[test]
+    fn given_project_reconcile_dry_run_when_parsed_then_reconcile_project_dry_run() {
+        assert_eq!(
+            parse(&argv(&["project", "reconcile", "7", "--dry-run"])).unwrap(),
+            CliAction::Request(Command::ReconcileProject {
+                project_id: 7,
+                dry_run: true
+            })
+        );
+    }
+
+    #[test]
+    fn given_reconcile_apply_when_parsed_then_apply_reconcile() {
+        assert_eq!(
+            parse(&argv(&["reconcile", "apply", "11"])).unwrap(),
+            CliAction::Request(Command::ApplyReconcile { main_job_id: 11 })
+        );
+    }
+
+    #[test]
+    fn given_reconcile_apply_extra_arg_when_parsed_then_err() {
+        assert!(parse(&argv(&["reconcile", "apply", "11", "extra"])).is_err());
+    }
+
+    #[test]
+    fn given_reconcile_apply_unexpected_flag_when_parsed_then_err() {
+        assert!(parse(&argv(&["reconcile", "apply", "11", "--dry-run"])).is_err());
+    }
+
+    #[test]
+    fn given_reconcile_apply_missing_id_when_parsed_then_err() {
+        assert!(parse(&argv(&["reconcile", "apply"])).is_err());
+    }
+
+    #[test]
+    fn given_project_diagnose_extra_arg_when_parsed_then_err() {
+        assert!(parse(&argv(&["project", "diagnose", "7", "extra"])).is_err());
+    }
+
+    #[test]
+    fn given_project_diagnose_unexpected_flag_when_parsed_then_err() {
+        assert!(parse(&argv(&["project", "diagnose", "7", "--dry-run"])).is_err());
+    }
+
+    #[test]
+    fn given_project_reconcile_extra_arg_when_parsed_then_err() {
+        assert!(parse(&argv(&["project", "reconcile", "7", "extra"])).is_err());
+    }
+
+    #[test]
+    fn given_project_reconcile_unknown_flag_when_parsed_then_err() {
+        assert!(parse(&argv(&["project", "reconcile", "7", "--force"])).is_err());
+    }
+
+    #[test]
+    fn given_project_reconcile_dry_run_value_when_parsed_then_err() {
+        assert!(parse(&argv(&["project", "reconcile", "7", "--dry-run=false"])).is_err());
     }
 
     #[test]
