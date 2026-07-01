@@ -54,6 +54,7 @@ pub(crate) enum KanbanCard {
         status: IssueStatus,
         title: String,
         needs_attention: bool,
+        activity: Option<&'static str>,
     },
 }
 
@@ -113,6 +114,14 @@ impl KanbanCard {
 }
 
 pub(crate) fn kanban_cards(backlog: &[BacklogItem], issues: &[Issue]) -> Vec<KanbanCard> {
+    kanban_cards_with_runs(backlog, issues, &[])
+}
+
+pub(crate) fn kanban_cards_with_runs(
+    backlog: &[BacklogItem],
+    issues: &[Issue],
+    runs: &[AgentRun],
+) -> Vec<KanbanCard> {
     let mut cards = Vec::new();
     for item in backlog {
         if item.approval == Approval::Dismissed {
@@ -137,6 +146,7 @@ pub(crate) fn kanban_cards(backlog: &[BacklogItem], issues: &[Issue]) -> Vec<Kan
             status: issue.status,
             title: first_line(&issue.title),
             needs_attention: issue.status.needs_attention(),
+            activity: issue_activity_label(issue, runs),
         });
     }
     cards.sort_by_key(card_sort_key);
@@ -180,6 +190,10 @@ pub(crate) fn issue_status_chip(status: IssueStatus) -> String {
 }
 
 pub(crate) fn issue_tree_label(issue: &Issue) -> String {
+    issue_tree_label_with_runs(issue, &[])
+}
+
+pub(crate) fn issue_tree_label_with_runs(issue: &Issue, runs: &[AgentRun]) -> String {
     let title = first_line(&issue.title);
     let summary = issue
         .description
@@ -188,12 +202,17 @@ pub(crate) fn issue_tree_label(issue: &Issue) -> String {
         .filter(|desc| !desc.is_empty() && desc != &title)
         .map(|desc| format!("{title} - {desc}"))
         .unwrap_or(title);
-    format!(
+    let mut label = format!(
         "{} #{:<3} {}",
         issue_status_chip(issue.status),
         issue.id,
         summary
-    )
+    );
+    if let Some(activity) = issue_activity_label(issue, runs) {
+        label.push_str("  ");
+        label.push_str(activity);
+    }
+    label
 }
 
 pub(crate) fn issue_summary_rows(
@@ -297,6 +316,32 @@ fn remote_pr_summary(link: &RemotePrLink) -> String {
     }
     parts.push(link.remote_url.clone());
     parts.join(" · ")
+}
+
+pub(crate) fn issue_activity_label(issue: &Issue, runs: &[AgentRun]) -> Option<&'static str> {
+    if runs
+        .iter()
+        .any(|run| run.issue_id == Some(issue.id) && run.exited_at.is_none())
+    {
+        return Some("agent");
+    }
+    if issue_is_processing(issue.status) {
+        return Some("active");
+    }
+    None
+}
+
+fn issue_is_processing(status: IssueStatus) -> bool {
+    matches!(
+        status,
+        IssueStatus::Planning
+            | IssueStatus::Working
+            | IssueStatus::Reviewing
+            | IssueStatus::Fixing
+            | IssueStatus::Auditing
+            | IssueStatus::Merging
+            | IssueStatus::ResolvingConflict
+    )
 }
 
 pub(crate) fn remote_sync_summary(runs: &[RemoteSyncRun], limit: usize) -> RemoteSyncSummary {
@@ -591,6 +636,28 @@ mod tests {
         }
     }
 
+    fn agent_run(id: i64, issue_id: i64, exited_at: Option<i64>) -> AgentRun {
+        AgentRun {
+            id,
+            issue_id: Some(issue_id),
+            main_job_id: None,
+            role: Role::Work,
+            phase: "WORKING".to_string(),
+            agent_cmd: "codex".to_string(),
+            status_before: Some("WORKING".to_string()),
+            status_after: exited_at.map(|_| "REVIEWING".to_string()),
+            pid: if exited_at.is_none() { Some(123) } else { None },
+            exit_code: exited_at.map(|_| 0),
+            exit_kind: exited_at.map(|_| ExitKind::Exited),
+            prompt_path: None,
+            log_path: None,
+            phase_report: None,
+            spawned_at: TS,
+            exited_at,
+            note: None,
+        }
+    }
+
     #[test]
     fn given_dismissed_backlog_when_projected_then_excluded() {
         let cards = kanban_cards(
@@ -647,6 +714,44 @@ mod tests {
     }
 
     #[test]
+    fn given_open_issue_run_when_projected_then_card_marks_agent_activity() {
+        let cards = kanban_cards_with_runs(
+            &[],
+            &[issue(7, IssueStatus::Working)],
+            &[agent_run(1, 7, None)],
+        );
+
+        match &cards[0] {
+            KanbanCard::Issue { activity, .. } => assert_eq!(*activity, Some("agent")),
+            other => panic!("expected issue card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_processing_issue_without_open_run_when_projected_then_card_marks_active() {
+        let cards = kanban_cards_with_runs(
+            &[],
+            &[issue(7, IssueStatus::Working)],
+            &[agent_run(1, 7, Some(TS + 1))],
+        );
+
+        match &cards[0] {
+            KanbanCard::Issue { activity, .. } => assert_eq!(*activity, Some("active")),
+            other => panic!("expected issue card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_waiting_issue_when_projected_then_card_has_no_activity_marker() {
+        let cards = kanban_cards_with_runs(&[], &[issue(7, IssueStatus::ReadyToMerge)], &[]);
+
+        match &cards[0] {
+            KanbanCard::Issue { activity, .. } => assert_eq!(*activity, None),
+            other => panic!("expected issue card, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn given_attention_status_when_indicator_requested_then_bang() {
         assert_eq!(issue_indicator(IssueStatus::PlanBlocked), "!");
     }
@@ -697,6 +802,16 @@ mod tests {
         assert_eq!(
             issue_tree_label(&issue),
             "! MERG #7   input cursor - left/right movement is missing"
+        );
+    }
+
+    #[test]
+    fn given_open_issue_run_when_tree_label_requested_then_agent_marker_is_visible() {
+        let issue = issue(7, IssueStatus::Working);
+
+        assert_eq!(
+            issue_tree_label_with_runs(&issue, &[agent_run(1, 7, None)]),
+            "◉ WORK #7   issue 7  agent"
         );
     }
 

@@ -987,7 +987,8 @@ fn render_kanban(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Percentage(25),
         ])
         .split(area);
-    let cards = super::vm::kanban_cards(app.backlog(), app.issues());
+    let cards =
+        super::vm::kanban_cards_with_runs(app.backlog(), app.issues(), &app.recent_agent_runs);
     for (idx, lane) in super::vm::KanbanLane::ALL.iter().copied().enumerate() {
         let title = if app.focus == crate::app::Focus::ProjectKanban && app.kanban_lane_sel == idx {
             format!("{} *", lane.title())
@@ -1042,6 +1043,7 @@ fn kanban_lines(
                 status,
                 title,
                 needs_attention,
+                activity,
             } => {
                 let selected = app.is_kanban_item_selected(card.item());
                 let chip = super::vm::issue_status_chip(*status);
@@ -1053,7 +1055,7 @@ fn kanban_lines(
                 } else {
                     status_style
                 };
-                lines.push(Line::from(vec![
+                let mut row = vec![
                     Span::styled(
                         if selected {
                             format!(">{chip} ")
@@ -1068,7 +1070,14 @@ fn kanban_lines(
                     ),
                     Span::styled(format!("#{} ", id), theme::dim()),
                     Span::styled(title.clone(), Style::default().fg(theme::TEXT)),
-                ]));
+                ];
+                if let Some(activity) = activity {
+                    row.extend([
+                        Span::styled("  ", theme::dim()),
+                        Span::styled(format!("({activity})"), theme::hint()),
+                    ]);
+                }
+                lines.push(Line::from(row));
             }
         }
     }

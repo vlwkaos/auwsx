@@ -1910,7 +1910,7 @@ impl App {
                         project_id: p.id,
                         id: i.id,
                     },
-                    label: crate::ui::vm::issue_tree_label(i),
+                    label: crate::ui::vm::issue_tree_label_with_runs(i, &self.recent_agent_runs),
                     depth: 2,
                 });
             }
@@ -1927,7 +1927,10 @@ impl App {
                             project_id: p.id,
                             id: i.id,
                         },
-                        label: crate::ui::vm::issue_tree_label(i),
+                        label: crate::ui::vm::issue_tree_label_with_runs(
+                            i,
+                            &self.recent_agent_runs,
+                        ),
                         depth: 2,
                     });
                 }
@@ -4752,7 +4755,7 @@ mod tests {
 
         assert_eq!(
             label,
-            "◉ PLAN #7   cursor - left/right movement in input fields"
+            "◉ PLAN #7   cursor - left/right movement in input fields  active"
         );
     }
 
