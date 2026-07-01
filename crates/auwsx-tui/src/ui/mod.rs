@@ -74,18 +74,57 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FooterModel {
-    context: Vec<String>,
-    global: Vec<String>,
+    context: Vec<FooterHint>,
+    global: Vec<FooterHint>,
 }
 
 impl FooterModel {
     fn context_text(&self) -> String {
-        self.context.join(" · ")
+        render_footer_hints(&self.context)
     }
 
     fn global_text(&self) -> String {
-        format!(" {} ", self.global.join(" · "))
+        format!(" {} ", render_footer_hints(&self.global))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FooterHint {
+    Text(String),
+    Key { key: String, label: String },
+    Rendered(String),
+}
+
+impl FooterHint {
+    fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    fn key(key: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::Key {
+            key: key.into(),
+            label: label.into(),
+        }
+    }
+
+    fn rendered(text: impl Into<String>) -> Self {
+        Self::Rendered(text.into())
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Text(text) | Self::Rendered(text) => text.clone(),
+            Self::Key { key, label } => key_hint(key, label),
+        }
+    }
+}
+
+fn render_footer_hints(hints: &[FooterHint]) -> String {
+    hints
+        .iter()
+        .map(FooterHint::render)
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn footer_model(app: &App) -> FooterModel {
@@ -94,7 +133,7 @@ fn footer_model(app: &App) -> FooterModel {
         global: global_footer_hints(),
     };
     if !app.connected {
-        model.context.push("offline".to_string());
+        model.context.push(FooterHint::text("offline"));
     }
     model.context.extend(footer_context(app).hints(app));
     model
@@ -150,59 +189,76 @@ impl FooterContext {
         Self::Overview
     }
 
-    fn hints(self, app: &App) -> Vec<String> {
+    fn hints(self, app: &App) -> Vec<FooterHint> {
         match self {
             Self::ConfirmQuit => vec![
-                key_hint("y/Enter", "stop daemon"),
-                key_hint("n/Esc", "cancel"),
-                key_hint("Ctrl-C", "quit only"),
+                FooterHint::key("y/Enter", "stop daemon"),
+                FooterHint::key("n/Esc", "cancel"),
+                FooterHint::key("Ctrl-C", "quit only"),
             ],
             Self::Form(FormMode::Navigate) => vec![
-                "form nav".to_string(),
-                key_hint("j/k", "field"),
-                key_hint("Enter", "edit"),
-                key_hint("E", "submit"),
-                key_hint("Esc", "cancel"),
+                FooterHint::text("form nav"),
+                FooterHint::key("j/k", "field"),
+                FooterHint::key("Enter", "edit"),
+                FooterHint::key("E", "submit"),
+                FooterHint::key("Esc", "cancel"),
             ],
             Self::Form(FormMode::Edit) => vec![
-                "form edit".to_string(),
-                key_hint("Tab", "complete"),
-                key_hint("Enter", "done"),
-                key_hint("Esc", "done"),
+                FooterHint::text("form edit"),
+                FooterHint::key("Tab", "complete"),
+                FooterHint::key("Enter", "done"),
+                FooterHint::key("Esc", "done"),
             ],
             Self::IssueView => with_capabilities(
                 vec![
-                    key_hint("k", "older"),
-                    key_hint("j", "newer"),
-                    key_hint("PgUp/PgDn", "page"),
-                    key_hint("Home", "oldest"),
-                    key_hint("End", "newest"),
+                    FooterHint::key("k", "older"),
+                    FooterHint::key("j", "newer"),
+                    FooterHint::key("PgUp/PgDn", "page"),
+                    FooterHint::key("Home", "oldest"),
+                    FooterHint::key("End", "newest"),
                 ],
                 app,
-                Some(key_hint("Esc", "back")),
+                Some(FooterHint::key("Esc", "back")),
             ),
             Self::Config => {
-                let mut hints = vec!["settings".to_string(), key_hint("j/k", "select")];
-                hints.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-                hints.extend([key_hint("Pg", "scroll detail"), key_hint("Esc", "main")]);
+                let mut hints = vec![
+                    FooterHint::text("settings"),
+                    FooterHint::key("j/k", "select"),
+                ];
+                hints.extend(
+                    app.capabilities()
+                        .hints
+                        .into_iter()
+                        .map(|hint| FooterHint::rendered(hint.label)),
+                );
+                hints.extend([
+                    FooterHint::key("Pg", "scroll detail"),
+                    FooterHint::key("Esc", "main"),
+                ]);
                 hints
             }
             Self::MoveMode { project_scope } => {
-                let mut hints = vec!["move mode".to_string(), key_hint("j/k", "reorder")];
+                let mut hints = vec![
+                    FooterHint::text("move mode"),
+                    FooterHint::key("j/k", "reorder"),
+                ];
                 if project_scope {
-                    hints.push(key_hint("h/l", "move profile"));
+                    hints.push(FooterHint::key("h/l", "move profile"));
                 }
-                hints.extend([key_hint("m", "move exit"), key_hint("Esc", "cancel")]);
+                hints.extend([
+                    FooterHint::key("m", "move exit"),
+                    FooterHint::key("Esc", "cancel"),
+                ]);
                 hints
             }
             Self::ProjectKanban => with_capabilities(
                 vec![
-                    "kanban".to_string(),
-                    key_hint("h/l", "column"),
-                    key_hint("j/k", "item"),
+                    FooterHint::text("kanban"),
+                    FooterHint::key("h/l", "column"),
+                    FooterHint::key("j/k", "item"),
                 ],
                 app,
-                Some(key_hint("Esc", "left")),
+                Some(FooterHint::key("Esc", "left")),
             ),
             Self::IssueDetail {
                 section,
@@ -210,12 +266,20 @@ impl FooterContext {
                 return_to_kanban,
             } => {
                 let mut hints = issue_detail_hints(section, active);
-                hints.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
+                hints.extend(
+                    app.capabilities()
+                        .hints
+                        .into_iter()
+                        .map(|hint| FooterHint::rendered(hint.label)),
+                );
                 hints.push(issue_detail_escape_hint(active, return_to_kanban));
                 hints
             }
             Self::Overview => with_capabilities(
-                vec![key_hint("j/k", "move"), key_hint("[/]", "project")],
+                vec![
+                    FooterHint::key("j/k", "move"),
+                    FooterHint::key("[/]", "project"),
+                ],
                 app,
                 None,
             ),
@@ -227,55 +291,64 @@ fn footer_context(app: &App) -> FooterContext {
     FooterContext::from_app(app)
 }
 
-fn with_capabilities(mut hints: Vec<String>, app: &App, trailing: Option<String>) -> Vec<String> {
-    hints.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
+fn with_capabilities(
+    mut hints: Vec<FooterHint>,
+    app: &App,
+    trailing: Option<FooterHint>,
+) -> Vec<FooterHint> {
+    hints.extend(
+        app.capabilities()
+            .hints
+            .into_iter()
+            .map(|hint| FooterHint::rendered(hint.label)),
+    );
     if let Some(trailing) = trailing {
         hints.push(trailing);
     }
     hints
 }
 
-fn issue_detail_hints(section: IssueDetailSection, active: bool) -> Vec<String> {
+fn issue_detail_hints(section: IssueDetailSection, active: bool) -> Vec<FooterHint> {
     if section.is_interactive() && active {
         vec![
-            format!("{} active", section.title().to_ascii_lowercase()),
-            key_hint("j/k", "scroll"),
-            key_hint("h/l", "section"),
-            key_hint("Pg", "page"),
+            FooterHint::text(format!("{} active", section.title().to_ascii_lowercase())),
+            FooterHint::key("j/k", "scroll"),
+            FooterHint::key("h/l", "section"),
+            FooterHint::key("Pg", "page"),
         ]
     } else if section.is_interactive() {
         vec![
-            "issue detail".to_string(),
-            key_hint("j/k", "section"),
-            key_hint("h/l", "section"),
-            key_hint("Enter", "scroll log"),
+            FooterHint::text("issue detail"),
+            FooterHint::key("j/k", "section"),
+            FooterHint::key("h/l", "section"),
+            FooterHint::key("Enter", "scroll log"),
         ]
     } else {
         vec![
-            "issue detail".to_string(),
-            key_hint("j/k", "section"),
-            key_hint("h/l", "section"),
+            FooterHint::text("issue detail"),
+            FooterHint::key("j/k", "section"),
+            FooterHint::key("h/l", "section"),
         ]
     }
 }
 
-fn issue_detail_escape_hint(active: bool, return_to_kanban: bool) -> String {
+fn issue_detail_escape_hint(active: bool, return_to_kanban: bool) -> FooterHint {
     if active {
-        key_hint("Esc", "section")
+        FooterHint::key("Esc", "section")
     } else if return_to_kanban {
-        key_hint("Esc", "kanban")
+        FooterHint::key("Esc", "kanban")
     } else {
-        key_hint("Esc", "left")
+        FooterHint::key("Esc", "left")
     }
 }
 
-fn global_footer_hints() -> Vec<String> {
+fn global_footer_hints() -> Vec<FooterHint> {
     vec![
-        key_hint("Tab", "view"),
-        key_hint("Ctrl-,", "config"),
-        key_hint("q", "quit"),
-        key_hint("Q", "stop+quit"),
-        format!("v{}", env!("CARGO_PKG_VERSION")),
+        FooterHint::key("Tab", "view"),
+        FooterHint::key("Ctrl-,", "config"),
+        FooterHint::key("q", "quit"),
+        FooterHint::key("Q", "stop+quit"),
+        FooterHint::text(format!("v{}", env!("CARGO_PKG_VERSION"))),
     ]
 }
 
@@ -592,7 +665,7 @@ pub(crate) fn render_list(
 mod tests {
     use super::{
         footer_context, footer_model, form_controls_label, form_extra_rows, form_label_width,
-        key_hint, FooterContext,
+        key_hint, FooterContext, FooterHint,
     };
     use crate::app::{App, FieldKind, Focus, Form, FormField, FormKind, IssueDetailSection, View};
     use crate::ui::draw;
@@ -807,6 +880,27 @@ mod tests {
         assert!(global.contains("(q)uit"));
         assert!(global.contains("(Tab) view"));
         assert!(global.contains("(Ctrl-,) config"));
+    }
+
+    #[test]
+    fn given_footer_when_modeled_then_global_hints_keep_key_structure() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.connected = true;
+
+        let model = footer_model(&app);
+
+        assert!(model.global.iter().any(|hint| matches!(
+            hint,
+            FooterHint::Key { key, label } if key == "Ctrl-," && label == "config"
+        )));
+        assert!(model.global.iter().any(|hint| matches!(
+            hint,
+            FooterHint::Key { key, label } if key == "q" && label == "quit"
+        )));
+        assert!(!model.context.iter().any(|hint| matches!(
+            hint,
+            FooterHint::Key { key, .. } if key == "q"
+        )));
     }
 
     #[test]
