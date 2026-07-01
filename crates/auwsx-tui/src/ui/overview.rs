@@ -1195,7 +1195,7 @@ fn panel_with_focus(
         let hidden = lines.len().saturating_sub(visible);
         lines.truncate(visible.saturating_sub(1));
         lines.push(Line::styled(
-            format!("... {hidden} more; focus/enter to inspect"),
+            format!("... {hidden} more; select section to inspect"),
             theme::dim(),
         ));
     }
