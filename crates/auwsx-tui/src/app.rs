@@ -4183,25 +4183,10 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
                             app.handle_form_key(key).await?;
                             app.request_redraw();
                         } else if let Some(action) = input::map_key(app.view, key) {
-                            let force = matches!(
-                                action,
-                                Action::Down
-                                    | Action::Up
-                                    | Action::Left
-                                    | Action::Right
-                                    | Action::Drill
-                                    | Action::Back
-                                    | Action::NextView
-                                    | Action::PrevView
-                            );
                             if app.apply(action).await? {
                                 break;
                             }
-                            if force {
-                                app.request_force_redraw();
-                            } else {
-                                app.request_redraw();
-                            }
+                            app.request_redraw();
                         }
                     }
                     _ => {}

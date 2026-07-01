@@ -31,8 +31,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    frame.render_widget(Clear, chunks[0]);
-    frame.render_widget(Clear, chunks[1]);
     match app.view {
         View::Overview => overview::render(frame, app, chunks[0]),
         View::Issue => issue::render(frame, app, chunks[0]),
