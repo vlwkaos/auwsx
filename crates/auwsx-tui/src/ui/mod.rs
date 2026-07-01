@@ -51,11 +51,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    // Version pinned to the right; hint/status fills the remaining left space.
-    let version = format!(" v{} ", env!("CARGO_PKG_VERSION"));
+    // Global hints and version stay pinned right; contextual hints use the left.
+    let global = format!(
+        " (Ctrl-,) config · (q)uit · v{} ",
+        env!("CARGO_PKG_VERSION")
+    );
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(version.len() as u16)])
+        .constraints([Constraint::Min(0), Constraint::Length(global.len() as u16)])
         .split(area);
 
     // A status/error message preempts the hint line when present.
@@ -65,88 +68,88 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         (footer_hint(app), theme::hint())
     };
     frame.render_widget(Paragraph::new(Span::styled(text, style)), cols[0]);
-    frame.render_widget(Paragraph::new(Span::styled(version, theme::dim())), cols[1]);
+    frame.render_widget(Paragraph::new(Span::styled(global, theme::dim())), cols[1]);
 }
 
 fn footer_hint(app: &App) -> String {
     let prefix = footer_prefix(app);
     if app.confirm_quit {
-        return format!("{prefix}y/Enter stop daemon · n/Esc cancel · Ctrl-C quit only");
+        return format!("{prefix}(y/Enter) stop daemon · (n/Esc) cancel · (Ctrl-C) quit only");
     }
     if app.form.is_some() {
-        return format!("{prefix}Tab/Enter next · Shift-Tab previous · Esc cancel");
+        return format!("{prefix}(Tab/Enter) next · (Shift-Tab) previous · (Esc) cancel");
     }
     if app.view == View::Issue {
         let mut parts = vec![
-            "k older".to_string(),
-            "j newer".to_string(),
+            "(k) older".to_string(),
+            "(j) newer".to_string(),
             "PgUp/PgDn page".to_string(),
             "Home oldest".to_string(),
             "End newest".to_string(),
         ];
         parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-        parts.extend(["Esc back", "Tab view", "q quit"].map(str::to_string));
+        parts.extend(["(Esc) back", "(Tab) view"].map(str::to_string));
         return format!("{prefix}{}", parts.join(" · "));
     }
     if app.view == View::Config {
-        let mut parts = vec!["settings".to_string(), "j/k select".to_string()];
+        let mut parts = vec!["settings".to_string(), "(j/k) select".to_string()];
         parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-        parts.extend(["Pg scroll detail", "Esc main", "q quit"].map(str::to_string));
+        parts.extend(["Pg scroll detail", "(Esc) main"].map(str::to_string));
         return format!("{prefix}{}", parts.join(" · "));
     }
     if app.move_mode {
         return format!(
-            "{prefix}move mode · j/k local reorder · h/l move profile · m exit · Esc cancel"
+            "{prefix}move mode · (j/k) local reorder · (h/l) move profile · (m)ove exit · (Esc) cancel"
         );
     }
     if app.focus == crate::app::Focus::ProjectKanban {
         let caps = app.capabilities();
         let mut parts = vec![
             "kanban".to_string(),
-            "h/l column".to_string(),
-            "j/k item".to_string(),
-            "Enter open".to_string(),
+            "(h/l) column".to_string(),
+            "(j/k) item".to_string(),
+            "(Enter) open".to_string(),
         ];
         parts.extend(caps.hints.into_iter().map(|hint| hint.label));
-        return format!("{prefix}{} · Esc left", parts.join(" · "));
+        return format!("{prefix}{} · (Esc) left", parts.join(" · "));
     }
     if app.focus == crate::app::Focus::IssueDetail {
         let mut parts = if app.issue_section_sel == 3 && app.issue_section_interactive {
             vec![
                 "log active".to_string(),
-                "j/k scroll".to_string(),
-                "h/l section".to_string(),
+                "(j/k) scroll".to_string(),
+                "(h/l) section".to_string(),
                 "Pg page".to_string(),
             ]
         } else if app.issue_section_sel == 3 {
             vec![
                 "issue detail".to_string(),
-                "j/k section".to_string(),
-                "h/l section".to_string(),
-                "Enter scroll log".to_string(),
+                "(j/k) section".to_string(),
+                "(h/l) section".to_string(),
+                "(Enter) scroll log".to_string(),
             ]
         } else {
             vec![
                 "issue detail".to_string(),
-                "j/k section".to_string(),
-                "h/l section".to_string(),
+                "(j/k) section".to_string(),
+                "(h/l) section".to_string(),
             ]
         };
         parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
         let esc = if app.issue_section_interactive {
-            "Esc section"
+            "(Esc) section"
         } else if app.issue_return_focus == crate::app::Focus::ProjectKanban {
-            "Esc kanban"
+            "(Esc) kanban"
         } else {
-            "Esc left"
+            "(Esc) left"
         };
         parts.push(esc.to_string());
         return format!("{prefix}{}", parts.join(" · "));
     }
 
-    let mut parts = footer_parts(app, ["j/k move"]);
+    let mut parts = footer_parts(app, ["(j/k) move", "([/]) project"]);
     parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-    parts.extend(["Tab view", "q quit", "Q stop+quit"].map(str::to_string));
+    parts.extend(["(Tab) view", "(Q) stop+quit"].map(str::to_string));
     parts.join(" · ")
 }
 

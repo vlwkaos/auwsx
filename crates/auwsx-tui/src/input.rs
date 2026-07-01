@@ -26,15 +26,16 @@ pub enum Action {
     NextView,
     PrevView,
     /// Open create/data-entry forms.
-    NewProject,
-    NewContext,
+    Add,
     EditSelected,
     Ask,
     Settings,
     RemoteConfig,
     MoveMode,
+    PrevProject,
+    NextProject,
     /// Context actions.
-    ToggleApproveOrRoutine,
+    ApproveOrToggle,
     DeleteSelected,
     Execute,
 }
@@ -46,6 +47,9 @@ pub fn map_key(_view: View, key: KeyEvent) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Some(Action::Quit);
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(',') {
+        return Some(Action::Settings);
+    }
     if !key.modifiers.is_empty() && key.modifiers != KeyModifiers::SHIFT {
         return None;
     }
@@ -53,16 +57,16 @@ pub fn map_key(_view: View, key: KeyEvent) -> Option<Action> {
     Some(match key.code {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Char('Q') => Action::QuitWithDaemon,
-        KeyCode::Char('p') => Action::NewProject,
-        KeyCode::Char('n') => Action::NewContext,
+        KeyCode::Char('a') => Action::Add,
+        KeyCode::Char('A') => Action::ApproveOrToggle,
         KeyCode::Char('?') => Action::Ask,
         KeyCode::Char('e') => Action::EditSelected,
-        KeyCode::Char('S') => Action::Settings,
         KeyCode::Char('R') => Action::RemoteConfig,
         KeyCode::Char('m') => Action::MoveMode,
-        KeyCode::Char('a') => Action::ToggleApproveOrRoutine,
         KeyCode::Char('d') => Action::DeleteSelected,
         KeyCode::Char('E') => Action::Execute,
+        KeyCode::Char('[') => Action::PrevProject,
+        KeyCode::Char(']') => Action::NextProject,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
         KeyCode::Left | KeyCode::Char('h') => Action::Left,
@@ -112,18 +116,18 @@ mod tests {
     }
 
     #[test]
-    fn given_p_when_mapped_then_new_project() {
+    fn given_a_when_mapped_then_add() {
         assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('p'))),
-            Some(Action::NewProject)
+            map_key(View::Overview, key(KeyCode::Char('a'))),
+            Some(Action::Add)
         );
     }
 
     #[test]
-    fn given_n_when_mapped_then_new_context() {
+    fn given_capital_a_when_mapped_then_approve_or_toggle() {
         assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('n'))),
-            Some(Action::NewContext)
+            map_key(View::Overview, key(KeyCode::Char('A'))),
+            Some(Action::ApproveOrToggle)
         );
     }
 
@@ -144,10 +148,13 @@ mod tests {
     }
 
     #[test]
-    fn given_a_when_mapped_then_toggle_approve_or_routine() {
+    fn given_ctrl_comma_when_mapped_then_settings() {
         assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('a'))),
-            Some(Action::ToggleApproveOrRoutine)
+            map_key(
+                View::Overview,
+                modified(KeyCode::Char(','), KeyModifiers::CONTROL)
+            ),
+            Some(Action::Settings)
         );
     }
 
@@ -160,10 +167,14 @@ mod tests {
     }
 
     #[test]
-    fn given_capital_s_when_mapped_then_settings() {
+    fn given_brackets_when_mapped_then_project_jump() {
         assert_eq!(
-            map_key(View::Overview, key(KeyCode::Char('S'))),
-            Some(Action::Settings)
+            map_key(View::Overview, key(KeyCode::Char('['))),
+            Some(Action::PrevProject)
+        );
+        assert_eq!(
+            map_key(View::Overview, key(KeyCode::Char(']'))),
+            Some(Action::NextProject)
         );
     }
 
@@ -315,7 +326,9 @@ mod tests {
             KeyCode::Char('s'),
             KeyCode::Char('f'),
             KeyCode::Char('T'),
-            KeyCode::Char('A'),
+            KeyCode::Char('p'),
+            KeyCode::Char('n'),
+            KeyCode::Char('S'),
             KeyCode::Char('x'),
             KeyCode::Char(' '),
         ] {

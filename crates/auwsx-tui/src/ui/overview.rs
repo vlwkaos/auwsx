@@ -712,7 +712,7 @@ fn render_backlog(frame: &mut Frame, app: &App, area: Rect) {
     } else if b.approval == Approval::Dismissed {
         "Dismissed backlog item will not run."
     } else if b.approval == Approval::Pending {
-        "Waiting for approval. Automatic scheduler will ignore it; a approves or E approves and runs now."
+        "Waiting for approval. Automatic scheduler will ignore it; A approves or E approves and runs now."
     } else {
         "Suggested next action: E promotes this item and runs the first issue phase."
     };

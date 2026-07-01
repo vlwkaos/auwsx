@@ -156,14 +156,13 @@ pub enum SettingsRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityAction {
     Drill,
-    NewProject,
-    NewContext,
+    Add,
     Edit,
     Ask,
     Settings,
     Remote,
     MoveMode,
-    Toggle,
+    Approve,
     Delete,
     Execute,
 }
@@ -171,6 +170,7 @@ pub enum CapabilityAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionHint {
     pub action: CapabilityAction,
+    pub key: String,
     pub label: String,
 }
 
@@ -180,15 +180,31 @@ pub struct ContextCapabilities {
 }
 
 impl ContextCapabilities {
-    fn push(&mut self, action: CapabilityAction, label: impl Into<String>) {
+    fn push(&mut self, action: CapabilityAction, key: impl Into<String>, label: impl Into<String>) {
+        let key = key.into();
+        let label = format_key_hint(&key, &label.into());
         self.hints.push(ActionHint {
             action,
+            key,
             label: label.into(),
         });
     }
 
     pub fn has(&self, action: CapabilityAction) -> bool {
         self.hints.iter().any(|hint| hint.action == action)
+    }
+}
+
+fn format_key_hint(key: &str, label: &str) -> String {
+    let mut chars = label.chars();
+    if key.chars().count() == 1
+        && chars
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(&key.chars().next().unwrap()))
+    {
+        format!("({key}){}", chars.as_str())
+    } else {
+        format!("({key}) {label}")
     }
 }
 
@@ -1252,6 +1268,10 @@ fn issue_delete_hint(status: IssueStatus) -> &'static str {
     }
 }
 
+fn selected_issue_delete_hint_parts(hint: &str) -> (&str, &str) {
+    hint.split_once(' ').unwrap_or(("d", "issue"))
+}
+
 pub struct App {
     pub socket: PathBuf,
     pub view: View,
@@ -2026,20 +2046,20 @@ impl App {
         if self.view == View::Config {
             match self.selected_settings_row() {
                 SettingsRow::ArsenalOverview => {
-                    caps.push(CapabilityAction::Drill, "Enter new preset");
-                    caps.push(CapabilityAction::NewContext, "n preset");
+                    caps.push(CapabilityAction::Drill, "Enter", "new preset");
+                    caps.push(CapabilityAction::Add, "a", "add preset");
                 }
                 SettingsRow::ArsenalPreset(_) => {
-                    caps.push(CapabilityAction::Drill, "Enter edit");
-                    caps.push(CapabilityAction::Edit, "e edit");
+                    caps.push(CapabilityAction::Drill, "Enter", "edit");
+                    caps.push(CapabilityAction::Edit, "e", "edit");
                 }
                 SettingsRow::MemoryOverview | SettingsRow::MemoryPreset(_) => {
-                    caps.push(CapabilityAction::Drill, "Enter select");
-                    caps.push(CapabilityAction::Edit, "e select");
+                    caps.push(CapabilityAction::Drill, "Enter", "select");
+                    caps.push(CapabilityAction::Edit, "e", "select");
                 }
                 SettingsRow::PipelineUxStandard => {
-                    caps.push(CapabilityAction::Drill, "Enter edit");
-                    caps.push(CapabilityAction::Edit, "e edit");
+                    caps.push(CapabilityAction::Drill, "Enter", "edit");
+                    caps.push(CapabilityAction::Edit, "e", "edit");
                 }
                 _ => {}
             }
@@ -2047,10 +2067,10 @@ impl App {
         }
         if self.view == View::Issue {
             if self.selected_project_id().is_some() {
-                caps.push(CapabilityAction::Ask, "? ask");
+                caps.push(CapabilityAction::Ask, "?", "ask");
             }
             if self.selected_issue_accepts_queue_message() {
-                caps.push(CapabilityAction::NewContext, "n queue message");
+                caps.push(CapabilityAction::Add, "a", "steer");
             }
             return caps;
         }
@@ -2059,89 +2079,103 @@ impl App {
         }
         if self.focus == Focus::IssueDetail {
             if self.selected_issue_accepts_queue_message() {
-                caps.push(CapabilityAction::NewContext, "n queue message");
+                caps.push(CapabilityAction::Add, "a", "steer");
             }
             if self.selected_issue_can_execute() {
-                caps.push(CapabilityAction::Execute, "E run");
+                caps.push(CapabilityAction::Execute, "E", "execute");
             }
             if self.selected_issue().is_some() {
-                caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
+                let (key, label) =
+                    selected_issue_delete_hint_parts(self.selected_issue_delete_hint());
+                caps.push(CapabilityAction::Delete, key, label);
             }
             return caps;
         }
         if self.focus == Focus::ProjectKanban {
             if self.selected_backlog().is_some() {
-                caps.push(CapabilityAction::Execute, "E run");
-                caps.push(CapabilityAction::Delete, "d dismiss");
+                caps.push(CapabilityAction::Add, "a", "add backlog");
+                caps.push(CapabilityAction::Execute, "E", "execute");
+                caps.push(CapabilityAction::Delete, "d", "dismiss");
             } else if self.selected_issue().is_some() {
-                if self.selected_issue_can_execute() {
-                    caps.push(CapabilityAction::Execute, "E run");
+                if self.selected_issue_accepts_queue_message() {
+                    caps.push(CapabilityAction::Add, "a", "steer");
                 }
-                caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
+                if self.selected_issue_can_execute() {
+                    caps.push(CapabilityAction::Execute, "E", "execute");
+                }
+                let (key, label) =
+                    selected_issue_delete_hint_parts(self.selected_issue_delete_hint());
+                caps.push(CapabilityAction::Delete, key, label);
             }
             return caps;
         }
         if self.selected_project_id().is_some() {
-            caps.push(CapabilityAction::Ask, "? ask");
+            caps.push(CapabilityAction::Ask, "?", "ask");
         }
-        caps.push(CapabilityAction::NewProject, "p project");
         match self.selected_tree_item() {
             Some(TreeItem::Project(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter kanban");
-                caps.push(CapabilityAction::Edit, "e edit");
-                caps.push(CapabilityAction::NewContext, "n backlog");
-                caps.push(CapabilityAction::Execute, "E reconcile/merge");
-                caps.push(CapabilityAction::Remote, "R remote");
-                caps.push(CapabilityAction::Settings, "S settings");
-                caps.push(CapabilityAction::MoveMode, "m move");
-                caps.push(CapabilityAction::Delete, "d unregister");
+                caps.push(CapabilityAction::Drill, "Enter", "kanban");
+                caps.push(CapabilityAction::Add, "a", "add project");
+                caps.push(CapabilityAction::Edit, "e", "edit");
+                caps.push(CapabilityAction::Execute, "E", "execute");
+                caps.push(CapabilityAction::Remote, "R", "remote");
+                caps.push(CapabilityAction::Settings, "Ctrl-,", "config");
+                caps.push(CapabilityAction::MoveMode, "m", "move");
+                caps.push(CapabilityAction::Delete, "d", "unregister");
             }
             Some(TreeItem::RoutinesRoot(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter fold");
-                caps.push(CapabilityAction::NewContext, "n routine");
+                caps.push(CapabilityAction::Drill, "Enter", "fold");
+                caps.push(CapabilityAction::Add, "a", "add routine");
             }
             Some(TreeItem::Routine { .. }) => {
-                caps.push(CapabilityAction::Toggle, "a toggle");
-                caps.push(CapabilityAction::Edit, "e edit");
-                caps.push(CapabilityAction::Delete, "d delete");
-                caps.push(CapabilityAction::Execute, "E run");
+                caps.push(CapabilityAction::Approve, "A", "toggle");
+                caps.push(CapabilityAction::Edit, "e", "edit");
+                caps.push(CapabilityAction::Delete, "d", "delete");
+                caps.push(CapabilityAction::Execute, "E", "execute");
             }
             Some(TreeItem::BacklogRoot(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter fold");
-                caps.push(CapabilityAction::NewContext, "n backlog");
+                caps.push(CapabilityAction::Drill, "Enter", "fold");
+                caps.push(CapabilityAction::Add, "a", "add backlog");
             }
             Some(TreeItem::Backlog { .. }) => {
-                caps.push(CapabilityAction::Toggle, "a approve");
+                caps.push(CapabilityAction::Add, "a", "add backlog");
+                caps.push(CapabilityAction::Approve, "A", "approve");
                 if self
                     .selected_backlog()
                     .is_some_and(|item| item.consumed_issue_id.is_none())
                 {
-                    caps.push(CapabilityAction::Edit, "e edit");
-                    caps.push(CapabilityAction::Execute, "E run");
+                    caps.push(CapabilityAction::Edit, "e", "edit");
+                    caps.push(CapabilityAction::Execute, "E", "execute");
                 }
-                caps.push(CapabilityAction::Delete, "d dismiss");
+                caps.push(CapabilityAction::Delete, "d", "dismiss");
             }
             Some(TreeItem::IssuesRoot(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter fold");
+                caps.push(CapabilityAction::Drill, "Enter", "fold");
             }
             Some(TreeItem::ArchiveRoot(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter fold");
+                caps.push(CapabilityAction::Drill, "Enter", "fold");
             }
             Some(TreeItem::Issue { .. }) => {
-                caps.push(CapabilityAction::Drill, "Enter detail");
+                caps.push(CapabilityAction::Drill, "Enter", "detail");
                 if self.selected_issue_accepts_queue_message() {
-                    caps.push(CapabilityAction::NewContext, "n queue message");
+                    caps.push(CapabilityAction::Add, "a", "steer");
                 }
                 if self.selected_issue_can_execute() {
-                    caps.push(CapabilityAction::Execute, "E run");
+                    caps.push(CapabilityAction::Execute, "E", "execute");
                 }
-                caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
+                let (key, label) =
+                    selected_issue_delete_hint_parts(self.selected_issue_delete_hint());
+                caps.push(CapabilityAction::Delete, key, label);
             }
             Some(TreeItem::ArchivedIssue { .. }) => {
-                caps.push(CapabilityAction::Drill, "Enter detail");
-                caps.push(CapabilityAction::Delete, self.selected_issue_delete_hint());
+                caps.push(CapabilityAction::Drill, "Enter", "detail");
+                let (key, label) =
+                    selected_issue_delete_hint_parts(self.selected_issue_delete_hint());
+                caps.push(CapabilityAction::Delete, key, label);
             }
-            None => {}
+            None => {
+                caps.push(CapabilityAction::Add, "a", "add project");
+            }
         }
         caps
     }
@@ -2817,13 +2851,7 @@ impl App {
                     self.set_view(View::Overview).await?;
                 }
             }
-            Action::NewProject => {
-                if !self.capabilities().has(CapabilityAction::NewProject) {
-                    self.status = "project registration is available from the main list".into();
-                    return Ok(false);
-                }
-                self.form = Some(self.new_project_form());
-            }
+            Action::Add => self.open_context_add_form(),
             Action::Ask => {
                 if !self.capabilities().has(CapabilityAction::Ask) {
                     self.status = "select a project context before asking".into();
@@ -2871,45 +2899,6 @@ impl App {
                     }
                 }
             }
-            Action::NewContext => {
-                if !self.capabilities().has(CapabilityAction::NewContext) {
-                    self.status = match self.selected_issue() {
-                        Some(issue) => {
-                            format!(
-                                "issue cannot receive queue messages in {}",
-                                issue.status.as_str()
-                            )
-                        }
-                        None => "nothing can be created here".into(),
-                    };
-                    return Ok(false);
-                }
-                if self.view == View::Config {
-                    self.form = Some(Form::arsenal_preset(None));
-                    return Ok(false);
-                }
-                let context = self.selected_context_item();
-                if matches!(context, Some(TreeItem::Issue { .. })) {
-                    if self.selected_issue_id().is_some() {
-                        self.form = Some(Form::steering());
-                    } else {
-                        self.status = "select an issue first".into();
-                    }
-                } else if matches!(
-                    context,
-                    Some(TreeItem::RoutinesRoot(_) | TreeItem::Routine { .. })
-                ) {
-                    if self.selected_project_id().is_some() {
-                        self.form = Some(Form::routine());
-                    } else {
-                        self.status = "select or create a project first".into();
-                    }
-                } else if self.selected_project_id().is_some() {
-                    self.form = Some(Form::backlog());
-                } else {
-                    self.status = "select or create a project first".into();
-                }
-            }
             Action::Settings => self.set_view(View::Config).await?,
             Action::RemoteConfig => {
                 if !self.capabilities().has(CapabilityAction::Remote) {
@@ -2935,9 +2924,11 @@ impl App {
                     self.status = "select a project first".into();
                 }
             }
-            Action::ToggleApproveOrRoutine => {
-                if !self.capabilities().has(CapabilityAction::Toggle) {
-                    self.status = "nothing toggleable here".into();
+            Action::PrevProject => self.select_adjacent_project(-1).await?,
+            Action::NextProject => self.select_adjacent_project(1).await?,
+            Action::ApproveOrToggle => {
+                if !self.capabilities().has(CapabilityAction::Approve) {
+                    self.status = "nothing approvable here".into();
                     return Ok(false);
                 }
                 match self.selected_context_item() {
@@ -3729,6 +3720,20 @@ impl App {
         Ok(())
     }
 
+    async fn select_adjacent_project(&mut self, delta: isize) -> Result<()> {
+        if self.projects.is_empty() {
+            self.status = "no projects".into();
+            return Ok(());
+        }
+        step(&mut self.proj_sel, delta, self.projects.len());
+        let Some(project_id) = self.projects.get(self.proj_sel).map(|project| project.id) else {
+            return Ok(());
+        };
+        self.select_tree_project(project_id);
+        self.focus = Focus::Left;
+        Ok(())
+    }
+
     fn move_kanban_lane(&mut self, delta: isize) {
         step(
             &mut self.kanban_lane_sel,
@@ -3761,6 +3766,47 @@ impl App {
         }
         self.enter_issue_detail(Focus::Left, None);
         true
+    }
+
+    fn open_context_add_form(&mut self) {
+        if !self.capabilities().has(CapabilityAction::Add) {
+            self.status = match self.selected_issue() {
+                Some(issue) => {
+                    format!("issue cannot receive steering in {}", issue.status.as_str())
+                }
+                None => "nothing addable here".into(),
+            };
+            return;
+        }
+        if self.view == View::Config {
+            self.form = Some(Form::arsenal_preset(None));
+            return;
+        }
+
+        match self.selected_context_item() {
+            Some(TreeItem::Project(_)) | None => {
+                self.form = Some(self.new_project_form());
+            }
+            Some(TreeItem::BacklogRoot(_) | TreeItem::Backlog { .. }) => {
+                self.form = Some(Form::backlog());
+            }
+            Some(TreeItem::Issue { .. }) => {
+                if self.selected_issue_id().is_some() {
+                    self.form = Some(Form::steering());
+                } else {
+                    self.status = "select an issue first".into();
+                }
+            }
+            Some(TreeItem::RoutinesRoot(_) | TreeItem::Routine { .. }) => {
+                self.form = Some(Form::routine());
+            }
+            Some(TreeItem::ArchivedIssue { .. }) => {
+                self.status = "archived issue cannot receive steering".into();
+            }
+            Some(TreeItem::IssuesRoot(_) | TreeItem::ArchiveRoot(_)) => {
+                self.status = "select backlog or issue context first".into();
+            }
+        }
     }
 
     async fn move_project_order(&mut self, delta: isize) -> Result<()> {
@@ -4483,6 +4529,79 @@ mod tests {
         assert!(app.selected_issue().is_none());
     }
 
+    #[tokio::test]
+    async fn given_backlog_item_when_add_then_opens_backlog_form() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                backlog: vec![backlog_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Backlog { id: 1, .. }))
+            .expect("backlog row exists");
+
+        app.apply(Action::Add).await?;
+
+        assert!(matches!(
+            app.form.as_ref().map(|form| &form.kind),
+            Some(FormKind::Backlog)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_issue_item_when_add_then_opens_steering_form() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Issue { id: 7, .. }))
+            .expect("issue row exists");
+
+        app.apply(Action::Add).await?;
+
+        assert!(matches!(
+            app.form.as_ref().map(|form| &form.kind),
+            Some(FormKind::QueueMessage)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_bracket_project_jump_when_applied_then_selects_adjacent_project(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        let mut first = project_fixture();
+        first.id = 1;
+        first.name = "first".into();
+        let mut second = project_fixture();
+        second.id = 2;
+        second.name = "second".into();
+        app.projects = vec![first, second];
+
+        app.apply(Action::NextProject).await?;
+
+        assert_eq!(app.proj_sel, 1);
+        assert_eq!(app.selected_tree_item(), Some(TreeItem::Project(2)));
+        Ok(())
+    }
+
     #[test]
     fn given_full_issue_view_when_no_issue_row_selected_then_issue_sel_remains_legacy_selection() {
         let mut app = test_app();
@@ -4903,10 +5022,10 @@ mod tests {
             .position(|r| matches!(r.item, TreeItem::ArchivedIssue { id: 2, .. }))
             .unwrap();
 
-        app.apply(Action::NewContext).await.unwrap();
+        app.apply(Action::Add).await.unwrap();
 
         assert!(app.form.is_none());
-        assert_eq!(app.status, "issue cannot receive queue messages in DONE");
+        assert_eq!(app.status, "issue cannot receive steering in DONE");
     }
 
     #[tokio::test]
@@ -5165,6 +5284,20 @@ mod tests {
         issue
     }
 
+    fn backlog_fixture() -> BacklogItem {
+        BacklogItem {
+            id: 1,
+            project_id: 1,
+            text: "queued work".into(),
+            source: Source::Human,
+            approval: auwsx_core::backlog::Approval::Approved,
+            origin_routine_id: None,
+            consumed_issue_id: None,
+            created_at: 1,
+            resolved_at: None,
+        }
+    }
+
     #[tokio::test]
     async fn given_issue_detail_entered_from_left_when_returning_then_focus_goes_left(
     ) -> anyhow::Result<()> {
@@ -5230,7 +5363,7 @@ mod tests {
             .capabilities()
             .hints
             .iter()
-            .any(|hint| hint.label == "R remote"));
+            .any(|hint| hint.label == "(R)emote"));
     }
 
     #[test]
