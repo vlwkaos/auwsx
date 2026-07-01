@@ -1408,6 +1408,33 @@ impl App {
         self.force_redraw = true;
     }
 
+    fn render_revision(&self) -> String {
+        format!(
+            "{:?}|{:?}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}",
+            self.view,
+            self.focus,
+            self.proj_sel,
+            self.tree_sel,
+            self.issue_sel,
+            self.backlog_sel,
+            self.kanban_lane_sel,
+            self.kanban_card_sel,
+            self.issue_section,
+            self.issue_section_mode,
+            self.issue_return_focus,
+            self.move_mode,
+            self.issue_log_scroll,
+            self.selected_text_scroll_key.as_deref().unwrap_or(""),
+            self.selected_text_scroll_offset,
+            self.config_scroll,
+            self.settings_sel,
+            self.connected,
+            self.status,
+            self.form,
+            self.confirm_quit,
+        )
+    }
+
     /// Fuzzy-completion suggestions for the New-project `repo_path` field, based
     /// on the current field text. Empty unless a Project form is open on that
     /// field. Capped to keep the dropdown short.
@@ -4453,18 +4480,27 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
                     }
                     CEvent::Key(key) => {
                         if app.confirm_quit {
+                            let before = app.render_revision();
                             if app.handle_confirm_key(key).await? {
                                 break;
                             }
-                            app.request_redraw();
+                            if app.render_revision() != before {
+                                app.request_redraw();
+                            }
                         } else if app.form.is_some() {
+                            let before = app.render_revision();
                             app.handle_form_key(key).await?;
-                            app.request_redraw();
+                            if app.render_revision() != before {
+                                app.request_redraw();
+                            }
                         } else if let Some(action) = input::map_key(app.view, key) {
+                            let before = app.render_revision();
                             if app.apply(action).await? {
                                 break;
                             }
-                            app.request_redraw();
+                            if app.render_revision() != before {
+                                app.request_redraw();
+                            }
                         }
                     }
                     _ => {}
@@ -6372,6 +6408,36 @@ mod tests {
         app.last_poll_at = Instant::now();
 
         assert!(app.ui_tick().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_noop_movement_when_applied_then_render_revision_is_unchanged(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.focus = Focus::ProjectKanban;
+        app.kanban_lane_sel = 0;
+        app.kanban_card_sel = 0;
+        let before = app.render_revision();
+
+        app.apply(Action::Down).await?;
+
+        assert_eq!(app.render_revision(), before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_form_input_when_handled_then_render_revision_changes() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.form = Some(Form::backlog());
+        let before = app.render_revision();
+
+        app.handle_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await?;
+        app.handle_form_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await?;
+
+        assert_ne!(app.render_revision(), before);
         Ok(())
     }
 
