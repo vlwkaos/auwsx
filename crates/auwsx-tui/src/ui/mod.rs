@@ -697,7 +697,11 @@ mod tests {
             exit_kind: Some(ExitKind::Exited),
             prompt_path: None,
             log_path: None,
-            phase_report: Some("Implemented archive view and verified it.".to_string()),
+            phase_report: Some(
+                "Implemented archive view.\n\
+                 - Verification: cargo test --package auwsx-tui"
+                    .to_string(),
+            ),
             spawned_at: 1,
             exited_at: Some(2),
             note: None,
@@ -705,8 +709,9 @@ mod tests {
 
         let rendered = rendered_app(app, 120, 40);
 
-        assert!(rendered.contains("Phase reports"));
+        assert!(rendered.contains("Phase notes"));
         assert!(rendered.contains("Implemented archive view"));
+        assert!(rendered.contains("cargo test --package auwsx-tui"));
     }
 
     #[test]

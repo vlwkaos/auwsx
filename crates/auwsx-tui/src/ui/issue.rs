@@ -129,31 +129,27 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
         .split(cols[1]);
 
-    let phase_reports: Vec<ListItem> = app
-        .detail
-        .runs
+    let phase_notes = super::vm::phase_notes(&app.detail.runs, 5);
+    let phase_reports: Vec<ListItem> = phase_notes
         .iter()
-        .filter_map(|run| {
-            run.phase_report.as_deref().map(|report| {
-                let first = report
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .unwrap_or("(empty report)");
-                ListItem::new(format!(
-                    "#{} {} {} -> {}",
-                    run.id,
-                    run.role.as_str(),
-                    run.phase,
-                    truncate_text(first, 140)
-                ))
-            })
+        .map(|note| {
+            let mut lines = vec![Line::from(vec![
+                Span::styled(note.run_label.clone(), theme::dim()),
+                Span::raw(format!(" -> {}", truncate_text(&note.outcome, 120))),
+            ])];
+            for detail in note.details.iter().take(4) {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:>6}: ", detail.label), theme::dim()),
+                    Span::raw(truncate_text(&detail.value, 120)),
+                ]));
+            }
+            ListItem::new(lines)
         })
         .collect();
     list_block(
         frame,
         right_rows[0],
-        &format!("Phase reports ({})", phase_reports.len()),
+        &format!("Phase notes ({})", phase_reports.len()),
         phase_reports,
     );
 
