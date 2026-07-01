@@ -11,8 +11,10 @@ use auwsx_core::control_outbox;
 use auwsx_core::db::ask_answers::AskMode;
 use auwsx_core::db::findings::Severity;
 use auwsx_core::db::projects::CompletionPolicy;
+use auwsx_core::db::remote::{RemoteAuthKind, RemoteProvider, RequiredChecksPolicy};
 use auwsx_core::events;
 use auwsx_core::ipc::{self, Command, Response};
+use auwsx_core::remote_plan::{RemoteCommentTarget, RemotePlannedAction};
 use auwsx_core::state::IssueStatus;
 use auwsx_core::steering::SteeringSource;
 use std::collections::HashMap;
@@ -74,6 +76,16 @@ USAGE:
   auwsx project merge <project_id>         approve all READY_TO_MERGE issues
   auwsx project diagnose <project_id>      inspect merge/worktree recovery state
   auwsx project reconcile <project_id> [--dry-run]  apply safe recovery, queue hard cases
+  auwsx project remote get <project_id>
+  auwsx project remote set <project_id> --url <url> --owner <owner> --repo <repo> \\
+        [--api-base-url <url>] [--auth-kind none|token_env|github_app] [--auth-ref <ref>] \\
+        [--webhook-secret-ref <ref>] [--inbound-auwsx-run] [--outbound-issue-create] \\
+        [--remote-pr-merge] [--agent-comments] [--subtask-comments] [--finding-comments] \\
+        [--draft-pr] [--required-checks observe|require_green] [--labels <csv>] \\
+        [--assignees <csv>] [--pr-base <branch>]
+  auwsx project remote delete <project_id>
+  auwsx project remote sync-runs <project_id> [--limit <n>]
+  auwsx project remote plan <issue_id>
   auwsx reconcile apply <main_job_id>      apply a validated reconcile proposal
 
   auwsx backlog add <project_id> <text...> [--source human|agent|routine|inbox]
@@ -353,7 +365,112 @@ fn parse_project(args: &[String]) -> Result<CliAction> {
                 dry_run: p.has("dry-run"),
             }
         }
+        "remote" => return parse_project_remote(rest),
         other => bail!("unknown `project` subcommand: {other}"),
+    };
+    Ok(CliAction::Request(cmd))
+}
+
+fn parse_project_remote(args: &[String]) -> Result<CliAction> {
+    let (verb, rest) = split_verb(args, "project remote")?;
+    let p = Parsed::new(rest);
+    let cmd = match verb {
+        "get" => {
+            p.exact_positionals(1, "project remote get")?;
+            p.exact_flags(&[], "project remote get")?;
+            Command::GetProjectRemoteConfig {
+                project_id: p.int(0, "project_id")?,
+            }
+        }
+        "set" => {
+            p.exact_positionals(1, "project remote set")?;
+            p.exact_flags(
+                &[
+                    "provider",
+                    "url",
+                    "owner",
+                    "repo",
+                    "api-base-url",
+                    "auth-kind",
+                    "auth-ref",
+                    "webhook-secret-ref",
+                    "inbound-auwsx-run",
+                    "outbound-issue-create",
+                    "remote-pr-merge",
+                    "agent-comments",
+                    "subtask-comments",
+                    "finding-comments",
+                    "draft-pr",
+                    "required-checks",
+                    "labels",
+                    "assignees",
+                    "pr-base",
+                ],
+                "project remote set",
+            )?;
+            let provider = match p.flag("provider").as_deref().unwrap_or("github") {
+                "github" => RemoteProvider::Github,
+                other => bail!("invalid --provider {other:?}"),
+            };
+            let auth_kind = match p.flag("auth-kind").as_deref().unwrap_or("token_env") {
+                "none" => RemoteAuthKind::None,
+                "token_env" => RemoteAuthKind::TokenEnv,
+                "github_app" => RemoteAuthKind::GithubApp,
+                other => bail!("invalid --auth-kind {other:?}"),
+            };
+            let required_checks = match p.flag("required-checks").as_deref().unwrap_or("observe") {
+                "observe" => RequiredChecksPolicy::Observe,
+                "require_green" => RequiredChecksPolicy::RequireGreen,
+                other => bail!("invalid --required-checks {other:?}"),
+            };
+            Command::UpsertProjectRemoteConfig {
+                project_id: p.int(0, "project_id")?,
+                provider,
+                remote_url: p.req_flag("url")?,
+                owner: p.req_flag("owner")?,
+                repo: p.req_flag("repo")?,
+                api_base_url: p
+                    .flag("api-base-url")
+                    .unwrap_or_else(|| "https://api.github.com".to_string()),
+                auth_kind,
+                auth_ref: p.flag("auth-ref"),
+                webhook_secret_ref: p.flag("webhook-secret-ref"),
+                inbound_auwsx_run_enabled: p.has("inbound-auwsx-run"),
+                outbound_issue_create_enabled: p.has("outbound-issue-create"),
+                remote_pr_merge_enabled: p.has("remote-pr-merge"),
+                agent_comment_sync_enabled: p.has("agent-comments"),
+                subtask_comment_sync_enabled: p.has("subtask-comments"),
+                finding_comment_sync_enabled: p.has("finding-comments"),
+                draft_pr_enabled: p.has("draft-pr"),
+                required_checks_policy: required_checks,
+                default_labels: p.flag("labels"),
+                default_assignees: p.flag("assignees"),
+                pr_base_branch: p.flag("pr-base"),
+            }
+        }
+        "delete" | "rm" => {
+            p.exact_positionals(1, "project remote delete")?;
+            p.exact_flags(&[], "project remote delete")?;
+            Command::DeleteProjectRemoteConfig {
+                project_id: p.int(0, "project_id")?,
+            }
+        }
+        "sync-runs" => {
+            p.exact_positionals(1, "project remote sync-runs")?;
+            p.exact_flags(&["limit"], "project remote sync-runs")?;
+            Command::RecentRemoteSyncRuns {
+                project_id: p.int(0, "project_id")?,
+                limit: p.opt_int("limit")?.unwrap_or(20),
+            }
+        }
+        "plan" => {
+            p.exact_positionals(1, "project remote plan")?;
+            p.exact_flags(&[], "project remote plan")?;
+            Command::PlanIssueRemoteWorkflow {
+                issue_id: p.int(0, "issue_id")?,
+            }
+        }
+        other => bail!("unknown `project remote` subcommand: {other}"),
     };
     Ok(CliAction::Request(cmd))
 }
@@ -1014,6 +1131,40 @@ fn print_response(resp: Response) -> bool {
             );
         }
         Response::Project(None) => println!("not found"),
+        Response::ProjectRemoteConfig(Some(c)) => {
+            println!("project: {}", c.project_id);
+            println!("provider: {}", c.provider.as_str());
+            println!("remote: {}", c.remote_url);
+            println!("repo: {}/{}", c.owner, c.repo);
+            println!("api: {}", c.api_base_url);
+            println!(
+                "auth: {} {}",
+                c.auth_kind.as_str(),
+                redact_opt(c.auth_ref.as_deref())
+            );
+            println!(
+                "webhook_secret: {}",
+                redact_opt(c.webhook_secret_ref.as_deref())
+            );
+            println!(
+                "toggles: inbound_auwsx_run={} outbound_issue_create={} remote_pr_merge={} agent_comments={} subtask_comments={} finding_comments={} draft_pr={}",
+                c.inbound_auwsx_run_enabled,
+                c.outbound_issue_create_enabled,
+                c.remote_pr_merge_enabled,
+                c.agent_comment_sync_enabled,
+                c.subtask_comment_sync_enabled,
+                c.finding_comment_sync_enabled,
+                c.draft_pr_enabled
+            );
+            println!("required_checks: {}", c.required_checks_policy.as_str());
+            println!(
+                "defaults: labels={} assignees={} pr_base={}",
+                c.default_labels.as_deref().unwrap_or("-"),
+                c.default_assignees.as_deref().unwrap_or("-"),
+                c.pr_base_branch.as_deref().unwrap_or("-")
+            );
+        }
+        Response::ProjectRemoteConfig(None) => println!("not configured"),
         Response::ReconcileReport(report) => {
             println!(
                 "project {}\tdry_run={}\tsafe={}\tmanual={}\tagentic={}\tapplied={}\tqueued={}",
@@ -1152,6 +1303,69 @@ fn print_response(resp: Response) -> bool {
                 );
             }
         }
+        Response::RemoteSyncRuns(runs) => {
+            for r in runs {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    r.id,
+                    r.direction.as_str(),
+                    r.kind.as_str(),
+                    r.status.as_str(),
+                    r.summary.unwrap_or_default()
+                );
+            }
+        }
+        Response::IssueRemoteWorkflowPlan(plan) => {
+            println!(
+                "actions: {}\tblockers: {}",
+                plan.actions.len(),
+                plan.blockers.len()
+            );
+            for action in plan.actions {
+                match action {
+                    RemotePlannedAction::CreateIssue {
+                        issue_id,
+                        title,
+                        labels,
+                        assignees,
+                        ..
+                    } => println!(
+                        "action\tcreate_issue\tissue={issue_id}\ttitle={title}\tlabels={}\tassignees={}",
+                        labels.join(","),
+                        assignees.join(",")
+                    ),
+                    RemotePlannedAction::CreateOrUpdatePullRequest {
+                        issue_id,
+                        title,
+                        head_branch,
+                        base_branch,
+                        draft,
+                        require_green_checks,
+                        ..
+                    } => println!(
+                        "action\tcreate_or_update_pr\tissue={issue_id}\ttitle={title}\thead={head_branch}\tbase={base_branch}\tdraft={draft}\trequire_green={require_green_checks}"
+                    ),
+                    RemotePlannedAction::PostProgressComment {
+                        issue_id,
+                        target,
+                        remote_link_id,
+                        marker,
+                        ..
+                    } => {
+                        let target = match target {
+                            RemoteCommentTarget::Issue => "issue",
+                            RemoteCommentTarget::PullRequest => "pr",
+                        };
+                        println!(
+                            "action\tpost_progress_comment\tissue={issue_id}\ttarget={target}\tlink={remote_link_id}\tmarker={marker}"
+                        );
+                    }
+                }
+            }
+            for blocker in plan.blockers {
+                println!("blocker\t{blocker:?}");
+            }
+        }
         Response::LogTail { path, text } => {
             println!("==> {path}");
             print!("{text}");
@@ -1176,6 +1390,14 @@ fn printable_multiline(value: &str) -> String {
         .chars()
         .filter(|c| matches!(c, '\n' | '\t') || !c.is_control())
         .collect()
+}
+
+fn redact_opt(value: Option<&str>) -> &str {
+    if value.is_some() {
+        "(set)"
+    } else {
+        "-"
+    }
 }
 
 /// Print top-level usage.
@@ -1722,6 +1944,121 @@ mod tests {
                 project_id: 7,
                 dry_run: true
             })
+        );
+    }
+
+    #[test]
+    fn given_project_remote_get_when_parsed_then_get_remote_config() {
+        assert_eq!(
+            parse(&argv(&["project", "remote", "get", "7"])).unwrap(),
+            CliAction::Request(Command::GetProjectRemoteConfig { project_id: 7 })
+        );
+    }
+
+    #[test]
+    fn given_project_remote_set_with_toggles_when_parsed_then_upsert_remote_config() {
+        assert_eq!(
+            parse(&argv(&[
+                "project",
+                "remote",
+                "set",
+                "7",
+                "--url",
+                "https://github.com/acme/repo",
+                "--owner",
+                "acme",
+                "--repo",
+                "repo",
+                "--auth-kind",
+                "none",
+                "--inbound-auwsx-run",
+                "--outbound-issue-create",
+                "--remote-pr-merge",
+                "--agent-comments",
+                "--required-checks",
+                "require_green",
+                "--labels",
+                "auwsx,agent",
+                "--pr-base",
+                "main"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::UpsertProjectRemoteConfig {
+                project_id: 7,
+                provider: RemoteProvider::Github,
+                remote_url: "https://github.com/acme/repo".to_string(),
+                owner: "acme".to_string(),
+                repo: "repo".to_string(),
+                api_base_url: "https://api.github.com".to_string(),
+                auth_kind: RemoteAuthKind::None,
+                auth_ref: None,
+                webhook_secret_ref: None,
+                inbound_auwsx_run_enabled: true,
+                outbound_issue_create_enabled: true,
+                remote_pr_merge_enabled: true,
+                agent_comment_sync_enabled: true,
+                subtask_comment_sync_enabled: false,
+                finding_comment_sync_enabled: false,
+                draft_pr_enabled: false,
+                required_checks_policy: RequiredChecksPolicy::RequireGreen,
+                default_labels: Some("auwsx,agent".to_string()),
+                default_assignees: None,
+                pr_base_branch: Some("main".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn given_project_remote_set_bad_auth_kind_when_parsed_then_err() {
+        assert!(parse(&argv(&[
+            "project",
+            "remote",
+            "set",
+            "7",
+            "--url",
+            "https://github.com/acme/repo",
+            "--owner",
+            "acme",
+            "--repo",
+            "repo",
+            "--auth-kind",
+            "pat"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn given_project_remote_delete_when_parsed_then_delete_remote_config() {
+        assert_eq!(
+            parse(&argv(&["project", "remote", "delete", "7"])).unwrap(),
+            CliAction::Request(Command::DeleteProjectRemoteConfig { project_id: 7 })
+        );
+    }
+
+    #[test]
+    fn given_project_remote_sync_runs_when_parsed_then_recent_remote_sync_runs() {
+        assert_eq!(
+            parse(&argv(&[
+                "project",
+                "remote",
+                "sync-runs",
+                "7",
+                "--limit",
+                "3"
+            ]))
+            .unwrap(),
+            CliAction::Request(Command::RecentRemoteSyncRuns {
+                project_id: 7,
+                limit: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn given_project_remote_plan_when_parsed_then_plan_issue_remote_workflow() {
+        assert_eq!(
+            parse(&argv(&["project", "remote", "plan", "42"])).unwrap(),
+            CliAction::Request(Command::PlanIssueRemoteWorkflow { issue_id: 42 })
         );
     }
 

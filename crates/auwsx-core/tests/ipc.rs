@@ -19,6 +19,10 @@ use auwsx_core::db::arsenal::ArsenalPreset;
 use auwsx_core::db::findings::Severity;
 use auwsx_core::db::global_settings::{GlobalSettings, PIPELINE_UX_GUIDANCE_MAX_CHARS};
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode};
+use auwsx_core::db::remote::{
+    self, NewRemoteSyncRun, RemoteAuthKind, RemoteProvider, RemoteSyncDirection, RemoteSyncKind,
+    RemoteSyncStatus, RequiredChecksPolicy,
+};
 use auwsx_core::db::scheduler_runs::{self, SchedulerRunSource};
 use auwsx_core::db::{issues, subtasks, Db};
 use auwsx_core::events::{self, Event};
@@ -84,8 +88,54 @@ fn want_global_settings(r: Response) -> GlobalSettings {
     }
 }
 
+fn want_project_remote_config(r: Response) -> Option<auwsx_core::db::ProjectRemoteConfig> {
+    match r {
+        Response::ProjectRemoteConfig(config) => config,
+        other => panic!("expected Response::ProjectRemoteConfig, got {other:?}"),
+    }
+}
+
+fn want_remote_sync_runs(r: Response) -> Vec<auwsx_core::db::RemoteSyncRun> {
+    match r {
+        Response::RemoteSyncRuns(runs) => runs,
+        other => panic!("expected Response::RemoteSyncRuns, got {other:?}"),
+    }
+}
+
+fn want_issue_remote_workflow_plan(r: Response) -> auwsx_core::remote_plan::RemoteWorkflowPlan {
+    match r {
+        Response::IssueRemoteWorkflowPlan(plan) => plan,
+        other => panic!("expected Response::IssueRemoteWorkflowPlan, got {other:?}"),
+    }
+}
+
 fn is_ok(r: &Response) -> bool {
     matches!(r, Response::Ok)
+}
+
+fn upsert_remote_config_cmd(project_id: i64) -> Command {
+    Command::UpsertProjectRemoteConfig {
+        project_id,
+        provider: RemoteProvider::Github,
+        remote_url: "https://github.com/acme/repo".to_string(),
+        owner: "acme".to_string(),
+        repo: "repo".to_string(),
+        api_base_url: "https://api.github.com".to_string(),
+        auth_kind: RemoteAuthKind::None,
+        auth_ref: None,
+        webhook_secret_ref: Some(" ".to_string()),
+        inbound_auwsx_run_enabled: true,
+        outbound_issue_create_enabled: false,
+        remote_pr_merge_enabled: false,
+        agent_comment_sync_enabled: true,
+        subtask_comment_sync_enabled: false,
+        finding_comment_sync_enabled: false,
+        draft_pr_enabled: true,
+        required_checks_policy: RequiredChecksPolicy::Observe,
+        default_labels: None,
+        default_assignees: None,
+        pr_base_branch: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -960,6 +1010,143 @@ async fn given_update_project_when_dispatched_then_config_fields_change() -> any
     assert_eq!(p.schedule_interval_min, Some(10));
     assert_eq!(p.merge_mode, MergeMode::Pr);
     assert_eq!(p.skill_path.as_deref(), Some("/skills"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_missing_remote_config_when_get_dispatched_then_project_remote_config_none(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let project_id = backlog_seed_project(&db).await?;
+
+    let resp = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::GetProjectRemoteConfig { project_id },
+    )
+    .await;
+
+    assert!(want_project_remote_config(resp).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_valid_remote_config_when_upsert_dispatched_then_ok() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let project_id = backlog_seed_project(&db).await?;
+
+    let resp = ipc::dispatch(&db, &bus, TS, upsert_remote_config_cmd(project_id)).await;
+
+    assert!(is_ok(&resp), "expected Ok, got {resp:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_blank_remote_url_when_upsert_dispatched_then_err() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let project_id = backlog_seed_project(&db).await?;
+    let mut cmd = upsert_remote_config_cmd(project_id);
+    if let Command::UpsertProjectRemoteConfig { remote_url, .. } = &mut cmd {
+        *remote_url = " ".to_string();
+    }
+
+    let message = want_err(ipc::dispatch(&db, &bus, TS, cmd).await);
+
+    assert!(message.contains("remote_url"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_existing_remote_config_when_delete_dispatched_then_get_returns_none(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let project_id = backlog_seed_project(&db).await?;
+    ipc::dispatch(&db, &bus, TS, upsert_remote_config_cmd(project_id)).await;
+    let deleted = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::DeleteProjectRemoteConfig { project_id },
+    )
+    .await;
+    assert!(is_ok(&deleted), "expected Ok, got {deleted:?}");
+
+    let got = ipc::dispatch(
+        &db,
+        &bus,
+        TS,
+        Command::GetProjectRemoteConfig { project_id },
+    )
+    .await;
+
+    assert!(want_project_remote_config(got).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_remote_sync_runs_when_recent_dispatched_then_remote_sync_runs_response(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let project_id = backlog_seed_project(&db).await?;
+    remote::create_sync_run(
+        db.pool(),
+        NewRemoteSyncRun {
+            project_id,
+            issue_id: None,
+            backlog_item_id: None,
+            remote_issue_link_id: None,
+            remote_pr_link_id: None,
+            direction: RemoteSyncDirection::Inbound,
+            kind: RemoteSyncKind::Webhook,
+            status: RemoteSyncStatus::Done,
+            summary: Some("ok"),
+            error: None,
+            started_at: Some(TS),
+            ended_at: Some(TS + 1),
+        },
+        TS,
+    )
+    .await?;
+
+    let runs = want_remote_sync_runs(
+        ipc::dispatch(
+            &db,
+            &bus,
+            TS,
+            Command::RecentRemoteSyncRuns {
+                project_id,
+                limit: 10,
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(runs.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_issue_when_remote_workflow_plan_dispatched_then_plan_response() -> anyhow::Result<()>
+{
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let project_id = backlog_seed_project(&db).await?;
+    let issue_id = issues::create(db.pool(), project_id, "Sync remote issue", None, TS).await?;
+    ipc::dispatch(&db, &bus, TS, upsert_remote_config_cmd(project_id)).await;
+
+    let plan = want_issue_remote_workflow_plan(
+        ipc::dispatch(&db, &bus, TS, Command::PlanIssueRemoteWorkflow { issue_id }).await,
+    );
+
+    assert!(plan
+        .blockers
+        .contains(&auwsx_core::remote_plan::RemotePlanBlocker::OutboundIssueCreateDisabled));
     Ok(())
 }
 

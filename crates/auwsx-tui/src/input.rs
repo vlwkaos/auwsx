@@ -31,6 +31,7 @@ pub enum Action {
     EditSelected,
     Ask,
     Settings,
+    RemoteConfig,
     MoveMode,
     /// Context actions.
     ToggleApproveOrRoutine,
@@ -57,6 +58,7 @@ pub fn map_key(_view: View, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('?') => Action::Ask,
         KeyCode::Char('e') => Action::EditSelected,
         KeyCode::Char('S') => Action::Settings,
+        KeyCode::Char('R') => Action::RemoteConfig,
         KeyCode::Char('m') => Action::MoveMode,
         KeyCode::Char('a') => Action::ToggleApproveOrRoutine,
         KeyCode::Char('d') => Action::DeleteSelected,
@@ -298,8 +300,11 @@ mod tests {
     }
 
     #[test]
-    fn given_uppercase_r_when_mapped_then_none() {
-        assert_eq!(map_key(View::Overview, key(KeyCode::Char('R'))), None);
+    fn given_uppercase_r_when_mapped_then_remote_config() {
+        assert_eq!(
+            map_key(View::Overview, key(KeyCode::Char('R'))),
+            Some(Action::RemoteConfig)
+        );
     }
 
     #[test]

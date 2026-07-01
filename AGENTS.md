@@ -59,11 +59,13 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - `crates/auwsx-core/src/steering.rs` — append-only steering into in-flight issues
 - `crates/auwsx-core/src/main_jobs.rs` — main-workspace lifecycle, queued ops
 - `crates/auwsx-core/src/reconcile.rs` — project-level deterministic reconcile report, safe action classification, and agent proposal validation helpers
+- `crates/auwsx-core/src/remote_plan.rs` — pure remote issue/PR/comment workflow planner and inbound `/auwsx-run` decision logic
 - `crates/auwsx-core/src/routines.rs` — cron routines (incl. built-ins: triage, deepsleep, dream, morning-summary)
 - `crates/auwsx-core/src/inbox.rs` — `notify` watcher on `~/.auwsx/inbox/*.txt`
 - `crates/auwsx-core/src/agent/mod.rs` — direct-subprocess runner (`run`/`AgentSpec`/`AgentOutcome`/`ExitKind`, `{prompt}`-or-stdin); `{claude,codex,opencode}.rs` hold per-agent `DEFAULT_CMD` templates
 - `crates/auwsx-core/src/db/arsenal.rs` — global Arsenal presets for reusable per-role agent command templates, including the cheap route-agent command
 - `crates/auwsx-core/src/db/global_settings.rs` — singleton global settings such as persisted Pipeline UX Standard prompt guidance
+- `crates/auwsx-core/src/db/remote.rs` — per-project remote repo config, remote issue/PR links, webhook event idempotency, and remote sync audit rows
 - `crates/auwsx-core/src/ipc.rs` — Unix-socket `Command`/`Response`/`Event` protocol + `serve`/`request`/`EventStream` + unit-testable `dispatch`
 - `crates/auwsx-core/src/db/{projects,issues,subtasks,findings,agent_runs,routing_runs,ask_answers}.rs` — typed row structs + CRUD (issues/backlog/steering/findings persistence + append-only agent run/route/ask logs; `db/mod.rs` re-exports the row types)
 - `crates/auwsx-core/src/db/migrations/0001_init.sql` — full schema

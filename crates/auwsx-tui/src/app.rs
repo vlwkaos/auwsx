@@ -24,6 +24,9 @@ use auwsx_core::db::issues::Issue;
 use auwsx_core::db::memory_presets::MemoryPreset;
 use auwsx_core::db::profiles::Profile;
 use auwsx_core::db::projects::{CompletionPolicy, MergeMode, Project};
+use auwsx_core::db::remote::{
+    ProjectRemoteConfig, RemoteAuthKind, RemoteProvider, RequiredChecksPolicy,
+};
 use auwsx_core::db::scheduler_runs::{SchedulerRun, SchedulerRunSource};
 use auwsx_core::db::subtasks::Subtask;
 use auwsx_core::events::Event;
@@ -158,6 +161,7 @@ pub enum CapabilityAction {
     Edit,
     Ask,
     Settings,
+    Remote,
     MoveMode,
     Toggle,
     Delete,
@@ -202,6 +206,7 @@ pub struct IssueDetail {
 pub enum FormKind {
     Project,
     ProjectConfig,
+    ProjectRemoteConfig(i64),
     ArsenalPreset,
     Backlog,
     BacklogEdit(i64),
@@ -366,6 +371,142 @@ impl Form {
             ],
             current: 0,
             cursor: project.name.chars().count(),
+            completion_sel: 0,
+        }
+    }
+
+    fn project_remote_config(project_id: i64, config: Option<&ProjectRemoteConfig>) -> Self {
+        let bool_value = |enabled: bool| if enabled { "true" } else { "false" };
+        Self {
+            kind: FormKind::ProjectRemoteConfig(project_id),
+            title: "Remote repository",
+            fields: vec![
+                field(
+                    "remote_provider",
+                    config.map(|c| c.provider.as_str()).unwrap_or("github"),
+                    false,
+                ),
+                field(
+                    "remote_url",
+                    config.map(|c| c.remote_url.as_str()).unwrap_or(""),
+                    false,
+                ),
+                field(
+                    "remote_owner",
+                    config.map(|c| c.owner.as_str()).unwrap_or(""),
+                    false,
+                ),
+                field(
+                    "remote_repo",
+                    config.map(|c| c.repo.as_str()).unwrap_or(""),
+                    false,
+                ),
+                field(
+                    "remote_api_base_url",
+                    config
+                        .map(|c| c.api_base_url.as_str())
+                        .unwrap_or("https://api.github.com"),
+                    false,
+                ),
+                field(
+                    "remote_auth_kind",
+                    config.map(|c| c.auth_kind.as_str()).unwrap_or("token_env"),
+                    false,
+                ),
+                field(
+                    "remote_auth_ref",
+                    config.and_then(|c| c.auth_ref.as_deref()).unwrap_or(""),
+                    true,
+                ),
+                field(
+                    "remote_webhook_secret_ref",
+                    config
+                        .and_then(|c| c.webhook_secret_ref.as_deref())
+                        .unwrap_or(""),
+                    true,
+                ),
+                field(
+                    "remote_inbound_auwsx_run",
+                    bool_value(config.map(|c| c.inbound_auwsx_run_enabled).unwrap_or(false)),
+                    false,
+                ),
+                field(
+                    "remote_outbound_issue_create",
+                    bool_value(
+                        config
+                            .map(|c| c.outbound_issue_create_enabled)
+                            .unwrap_or(false),
+                    ),
+                    false,
+                ),
+                field(
+                    "remote_pr_merge",
+                    bool_value(config.map(|c| c.remote_pr_merge_enabled).unwrap_or(false)),
+                    false,
+                ),
+                field(
+                    "remote_agent_comments",
+                    bool_value(
+                        config
+                            .map(|c| c.agent_comment_sync_enabled)
+                            .unwrap_or(false),
+                    ),
+                    false,
+                ),
+                field(
+                    "remote_subtask_comments",
+                    bool_value(
+                        config
+                            .map(|c| c.subtask_comment_sync_enabled)
+                            .unwrap_or(false),
+                    ),
+                    false,
+                ),
+                field(
+                    "remote_finding_comments",
+                    bool_value(
+                        config
+                            .map(|c| c.finding_comment_sync_enabled)
+                            .unwrap_or(false),
+                    ),
+                    false,
+                ),
+                field(
+                    "remote_draft_pr",
+                    bool_value(config.map(|c| c.draft_pr_enabled).unwrap_or(false)),
+                    false,
+                ),
+                field(
+                    "remote_required_checks",
+                    config
+                        .map(|c| c.required_checks_policy.as_str())
+                        .unwrap_or("observe"),
+                    false,
+                ),
+                field(
+                    "remote_default_labels",
+                    config
+                        .and_then(|c| c.default_labels.as_deref())
+                        .unwrap_or(""),
+                    true,
+                ),
+                field(
+                    "remote_default_assignees",
+                    config
+                        .and_then(|c| c.default_assignees.as_deref())
+                        .unwrap_or(""),
+                    true,
+                ),
+                field(
+                    "remote_pr_base_branch",
+                    config
+                        .and_then(|c| c.pr_base_branch.as_deref())
+                        .unwrap_or(""),
+                    true,
+                ),
+            ],
+            current: 0,
+            cursor: 0,
             completion_sel: 0,
         }
     }
@@ -639,6 +780,9 @@ impl Form {
 
 const COMPLETION_OPTIONS: &[&str] = &["manual", "soft", "auto"];
 const MERGE_MODE_OPTIONS: &[&str] = &["local", "pr"];
+const REMOTE_PROVIDER_OPTIONS: &[&str] = &["github"];
+const REMOTE_AUTH_KIND_OPTIONS: &[&str] = &["none", "token_env", "github_app"];
+const REQUIRED_CHECKS_OPTIONS: &[&str] = &["observe", "require_green"];
 const OUTPUT_ROUTE_OPTIONS: &[&str] = &["report", "backlog", "memory"];
 const BOOL_OPTIONS: &[&str] = &["true", "false"];
 const ASK_MODE_OPTIONS: &[&str] = &["recall", "seek"];
@@ -735,6 +879,120 @@ fn field(label: &'static str, value: &str, optional: bool) -> FormField {
                 options: MERGE_MODE_OPTIONS,
             },
         ),
+        "remote_provider" => (
+            "Provider",
+            "Repository",
+            "",
+            FieldKind::Select {
+                options: REMOTE_PROVIDER_OPTIONS,
+            },
+        ),
+        "remote_url" => (
+            "Remote URL",
+            "Repository",
+            "Git remote URL or canonical repository URL.",
+            FieldKind::Text,
+        ),
+        "remote_owner" => ("Owner", "Repository", "", FieldKind::Text),
+        "remote_repo" => ("Repository", "Repository", "", FieldKind::Text),
+        "remote_api_base_url" => (
+            "API base URL",
+            "Repository",
+            "Defaults to https://api.github.com.",
+            FieldKind::Text,
+        ),
+        "remote_auth_kind" => (
+            "Auth kind",
+            "Auth",
+            "",
+            FieldKind::Select {
+                options: REMOTE_AUTH_KIND_OPTIONS,
+            },
+        ),
+        "remote_auth_ref" => (
+            "Auth ref",
+            "Auth",
+            "Environment variable, app installation reference, or blank when auth kind is none.",
+            FieldKind::Text,
+        ),
+        "remote_webhook_secret_ref" => (
+            "Webhook secret ref",
+            "Auth",
+            "Reference only; do not paste the raw secret.",
+            FieldKind::Text,
+        ),
+        "remote_inbound_auwsx_run" => (
+            "/auwsx-run inbound",
+            "Sync toggles",
+            "Issue comments can create approved local backlog.",
+            FieldKind::Select {
+                options: BOOL_OPTIONS,
+            },
+        ),
+        "remote_outbound_issue_create" => (
+            "Create remote issues",
+            "Sync toggles",
+            "Promoted local issues can create matching remote issues.",
+            FieldKind::Select {
+                options: BOOL_OPTIONS,
+            },
+        ),
+        "remote_pr_merge" => (
+            "PR merge mode",
+            "Sync toggles",
+            "Ready local issues open/update remote PRs instead of local merges.",
+            FieldKind::Select {
+                options: BOOL_OPTIONS,
+            },
+        ),
+        "remote_agent_comments" => (
+            "Agent comments",
+            "Comment sync",
+            "Sync phase summaries to issue or PR marker comments.",
+            FieldKind::Select {
+                options: BOOL_OPTIONS,
+            },
+        ),
+        "remote_subtask_comments" => (
+            "Subtask comments",
+            "Comment sync",
+            "",
+            FieldKind::Select {
+                options: BOOL_OPTIONS,
+            },
+        ),
+        "remote_finding_comments" => (
+            "Finding comments",
+            "Comment sync",
+            "",
+            FieldKind::Select {
+                options: BOOL_OPTIONS,
+            },
+        ),
+        "remote_draft_pr" => (
+            "Draft PR",
+            "Merge",
+            "",
+            FieldKind::Select {
+                options: BOOL_OPTIONS,
+            },
+        ),
+        "remote_required_checks" => (
+            "Required checks",
+            "Merge",
+            "",
+            FieldKind::Select {
+                options: REQUIRED_CHECKS_OPTIONS,
+            },
+        ),
+        "remote_default_labels" => ("Default labels", "Defaults", "Comma-separated.", FieldKind::Text),
+        "remote_default_assignees" => (
+            "Default assignees",
+            "Defaults",
+            "Comma-separated.",
+            FieldKind::Text,
+        ),
+        "remote_pr_base_branch" => ("PR base branch", "Defaults", "", FieldKind::Text),
         "schedule_cron" => (
             "Scheduler cadence",
             "Schedule",
@@ -1029,6 +1287,7 @@ pub struct App {
     pub recent_main_jobs: Vec<MainJob>,
     pub recent_scheduler_runs: Vec<SchedulerRun>,
     pub reconcile_reports: HashMap<i64, ProjectReconcileReport>,
+    pub remote_configs: HashMap<i64, ProjectRemoteConfig>,
     pub ask_answers: Vec<AskAnswer>,
     pub daemon_tick_secs: i64,
     /// Per-project epoch ms of the most recent AUTO scheduler tick.
@@ -1095,6 +1354,7 @@ impl App {
             recent_main_jobs: Vec::new(),
             recent_scheduler_runs: Vec::new(),
             reconcile_reports: HashMap::new(),
+            remote_configs: HashMap::new(),
             ask_answers: Vec::new(),
             daemon_tick_secs: daemon_tick_secs(),
             last_auto_tick: HashMap::new(),
@@ -1332,6 +1592,17 @@ impl App {
         form
     }
 
+    async fn open_project_remote_form(&mut self) -> Result<()> {
+        let Some(project_id) = self.selected_project_id() else {
+            self.status = "select a project first".into();
+            return Ok(());
+        };
+        self.refresh_project_remote_config(project_id).await?;
+        let form = Form::project_remote_config(project_id, self.remote_configs.get(&project_id));
+        self.form = Some(form);
+        Ok(())
+    }
+
     /// The "active" project id — the one the cursor currently sits in.
     pub fn selected_project_id(&self) -> Option<i64> {
         self.projects.get(self.proj_sel).map(|p| p.id)
@@ -1371,6 +1642,10 @@ impl App {
             .and_then(|id| self.children_of(id))
             .map(|c| c.archived_issues.as_slice())
             .unwrap_or(&[])
+    }
+
+    pub fn remote_config(&self, project_id: i64) -> Option<&ProjectRemoteConfig> {
+        self.remote_configs.get(&project_id)
     }
 
     pub fn active_profile_name(&self) -> &str {
@@ -1806,6 +2081,7 @@ impl App {
                 caps.push(CapabilityAction::Edit, "e edit");
                 caps.push(CapabilityAction::NewContext, "n backlog");
                 caps.push(CapabilityAction::Execute, "E reconcile/merge");
+                caps.push(CapabilityAction::Remote, "R remote");
                 caps.push(CapabilityAction::Settings, "S settings");
                 caps.push(CapabilityAction::MoveMode, "m move");
                 caps.push(CapabilityAction::Delete, "d unregister");
@@ -2004,6 +2280,7 @@ impl App {
             // project auto-expands it so the tree is not a wall of collapsed rows.
             let live: HashSet<i64> = self.projects.iter().map(|p| p.id).collect();
             self.children.retain(|id, _| live.contains(id));
+            self.remote_configs.retain(|id, _| live.contains(id));
             self.expanded.retain(|id| live.contains(id));
             self.archive_expanded.retain(|id| live.contains(id));
             if self.expanded.is_empty() {
@@ -2071,6 +2348,7 @@ impl App {
 
     /// Load routines + backlog + issues for one project into the cache.
     async fn refresh_project_children(&mut self, project_id: i64) -> Result<()> {
+        self.refresh_project_remote_config(project_id).await?;
         let mut kids = ProjectChildren::default();
         if let Response::Routines(items) = self.req(Command::ListRoutines { project_id }).await? {
             kids.routines = items;
@@ -2115,6 +2393,22 @@ impl App {
             }
         }
         self.children.insert(project_id, kids);
+        Ok(())
+    }
+
+    async fn refresh_project_remote_config(&mut self, project_id: i64) -> Result<()> {
+        match self
+            .req(Command::GetProjectRemoteConfig { project_id })
+            .await?
+        {
+            Response::ProjectRemoteConfig(Some(config)) => {
+                self.remote_configs.insert(project_id, config);
+            }
+            Response::ProjectRemoteConfig(None) => {
+                self.remote_configs.remove(&project_id);
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -2586,6 +2880,13 @@ impl App {
                 }
             }
             Action::Settings => self.set_view(View::Config).await?,
+            Action::RemoteConfig => {
+                if !self.capabilities().has(CapabilityAction::Remote) {
+                    self.status = "select a project row before editing remote settings".into();
+                    return Ok(false);
+                }
+                self.open_project_remote_form().await?;
+            }
             Action::MoveMode => {
                 if !self.capabilities().has(CapabilityAction::MoveMode) {
                     self.status = "select a project first".into();
@@ -3082,6 +3383,89 @@ impl App {
                 .await;
                 self.form = None;
                 self.refresh_projects().await?;
+            }
+            FormKind::ProjectRemoteConfig(project_id) => {
+                let Some(provider) = RemoteProvider::from_str(&form.get("remote_provider")) else {
+                    self.status = "provider must be github".into();
+                    return Ok(());
+                };
+                let Some(auth_kind) = RemoteAuthKind::from_str(&form.get("remote_auth_kind"))
+                else {
+                    self.status = "auth kind must be none, token_env, or github_app".into();
+                    return Ok(());
+                };
+                let Some(required_checks_policy) =
+                    RequiredChecksPolicy::from_str(&form.get("remote_required_checks"))
+                else {
+                    self.status = "required checks must be observe or require_green".into();
+                    return Ok(());
+                };
+                let Some(inbound_auwsx_run_enabled) =
+                    parse_bool(&form, "remote_inbound_auwsx_run", &mut self.status)
+                else {
+                    return Ok(());
+                };
+                let Some(outbound_issue_create_enabled) =
+                    parse_bool(&form, "remote_outbound_issue_create", &mut self.status)
+                else {
+                    return Ok(());
+                };
+                let Some(remote_pr_merge_enabled) =
+                    parse_bool(&form, "remote_pr_merge", &mut self.status)
+                else {
+                    return Ok(());
+                };
+                let Some(agent_comment_sync_enabled) =
+                    parse_bool(&form, "remote_agent_comments", &mut self.status)
+                else {
+                    return Ok(());
+                };
+                let Some(subtask_comment_sync_enabled) =
+                    parse_bool(&form, "remote_subtask_comments", &mut self.status)
+                else {
+                    return Ok(());
+                };
+                let Some(finding_comment_sync_enabled) =
+                    parse_bool(&form, "remote_finding_comments", &mut self.status)
+                else {
+                    return Ok(());
+                };
+                let Some(draft_pr_enabled) = parse_bool(&form, "remote_draft_pr", &mut self.status)
+                else {
+                    return Ok(());
+                };
+                if auth_kind != RemoteAuthKind::None && form.opt("remote_auth_ref").is_none() {
+                    self.status = "auth ref is required unless auth kind is none".into();
+                    return Ok(());
+                }
+                self.req_ok(
+                    Command::UpsertProjectRemoteConfig {
+                        project_id,
+                        provider,
+                        remote_url: form.get("remote_url"),
+                        owner: form.get("remote_owner"),
+                        repo: form.get("remote_repo"),
+                        api_base_url: form.get("remote_api_base_url"),
+                        auth_kind,
+                        auth_ref: form.opt("remote_auth_ref"),
+                        webhook_secret_ref: form.opt("remote_webhook_secret_ref"),
+                        inbound_auwsx_run_enabled,
+                        outbound_issue_create_enabled,
+                        remote_pr_merge_enabled,
+                        agent_comment_sync_enabled,
+                        subtask_comment_sync_enabled,
+                        finding_comment_sync_enabled,
+                        draft_pr_enabled,
+                        required_checks_policy,
+                        default_labels: form.opt("remote_default_labels"),
+                        default_assignees: form.opt("remote_default_assignees"),
+                        pr_base_branch: form.opt("remote_pr_base_branch"),
+                    },
+                    "remote config",
+                )
+                .await;
+                self.form = None;
+                self.refresh_project_remote_config(project_id).await?;
             }
             FormKind::ArsenalPreset => {
                 self.req_ok(
@@ -4798,6 +5182,51 @@ mod tests {
         assert_eq!(label, "p  manual  R0 B0 I0");
     }
 
+    #[test]
+    fn given_project_row_when_capabilities_requested_then_remote_hint_visible() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(42, ProjectChildren::default());
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Project(42)))
+            .unwrap();
+
+        assert!(app.capabilities().has(CapabilityAction::Remote));
+        assert!(app
+            .capabilities()
+            .hints
+            .iter()
+            .any(|hint| hint.label == "R remote"));
+    }
+
+    #[test]
+    fn given_no_remote_config_when_form_built_then_defaults_are_safe_off() {
+        let form = Form::project_remote_config(42, None);
+
+        assert_eq!(form.get("remote_provider"), "github");
+        assert_eq!(form.get("remote_api_base_url"), "https://api.github.com");
+        assert_eq!(form.get("remote_auth_kind"), "token_env");
+        assert_eq!(form.get("remote_inbound_auwsx_run"), "false");
+        assert_eq!(form.get("remote_pr_merge"), "false");
+    }
+
+    #[test]
+    fn given_existing_remote_config_when_form_built_then_values_roundtrip() {
+        let config = remote_config_fixture();
+        let form = Form::project_remote_config(42, Some(&config));
+
+        assert_eq!(form.get("remote_url"), "https://github.com/acme/repo");
+        assert_eq!(form.get("remote_owner"), "acme");
+        assert_eq!(form.get("remote_repo"), "repo");
+        assert_eq!(form.get("remote_auth_kind"), "none");
+        assert_eq!(form.get("remote_inbound_auwsx_run"), "true");
+        assert_eq!(form.get("remote_pr_merge"), "true");
+        assert_eq!(form.get("remote_required_checks"), "require_green");
+    }
+
     fn repo_field(value: &str) -> FormField {
         field("repo_path", value, false)
     }
@@ -4852,6 +5281,33 @@ mod tests {
             deepsleep_cron: Some("0 0 */30 * *".to_string()),
             last_deepsleep_at: None,
             created_at: 1,
+        }
+    }
+
+    fn remote_config_fixture() -> ProjectRemoteConfig {
+        ProjectRemoteConfig {
+            project_id: 42,
+            provider: RemoteProvider::Github,
+            remote_url: "https://github.com/acme/repo".to_string(),
+            owner: "acme".to_string(),
+            repo: "repo".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+            auth_kind: RemoteAuthKind::None,
+            auth_ref: None,
+            webhook_secret_ref: None,
+            inbound_auwsx_run_enabled: true,
+            outbound_issue_create_enabled: true,
+            remote_pr_merge_enabled: true,
+            agent_comment_sync_enabled: true,
+            subtask_comment_sync_enabled: false,
+            finding_comment_sync_enabled: true,
+            draft_pr_enabled: false,
+            required_checks_policy: RequiredChecksPolicy::RequireGreen,
+            default_labels: Some("auwsx".to_string()),
+            default_assignees: None,
+            pr_base_branch: Some("main".to_string()),
+            created_at: 1,
+            updated_at: 2,
         }
     }
 

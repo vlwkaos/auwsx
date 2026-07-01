@@ -27,6 +27,10 @@ use crate::db::{
     projects::{
         self, CompletionPolicy, MergeMode, NewProject, Project, UpdateProject as ProjectUpdate,
     },
+    remote::{
+        self, ProjectRemoteConfig, RemoteAuthKind, RemoteProvider, RemoteSyncRun,
+        RequiredChecksPolicy, UpsertProjectRemoteConfig,
+    },
     scheduler_runs::{self, SchedulerRun},
     subtasks::{self, Subtask},
     Db,
@@ -37,6 +41,7 @@ use crate::main_jobs::{self, MainJob};
 use crate::memory;
 use crate::project_setup;
 use crate::reconcile::ProjectReconcileReport;
+use crate::remote_plan::{self, RemoteNotesPresence, RemoteWorkflowInput, RemoteWorkflowPlan};
 use crate::routines::{self, OutputRoute, Routine};
 use crate::routing;
 use crate::scheduler::Scheduler;
@@ -193,6 +198,41 @@ pub enum Command {
     },
     ApplyReconcile {
         main_job_id: i64,
+    },
+    GetProjectRemoteConfig {
+        project_id: i64,
+    },
+    UpsertProjectRemoteConfig {
+        project_id: i64,
+        provider: RemoteProvider,
+        remote_url: String,
+        owner: String,
+        repo: String,
+        api_base_url: String,
+        auth_kind: RemoteAuthKind,
+        auth_ref: Option<String>,
+        webhook_secret_ref: Option<String>,
+        inbound_auwsx_run_enabled: bool,
+        outbound_issue_create_enabled: bool,
+        remote_pr_merge_enabled: bool,
+        agent_comment_sync_enabled: bool,
+        subtask_comment_sync_enabled: bool,
+        finding_comment_sync_enabled: bool,
+        draft_pr_enabled: bool,
+        required_checks_policy: RequiredChecksPolicy,
+        default_labels: Option<String>,
+        default_assignees: Option<String>,
+        pr_base_branch: Option<String>,
+    },
+    DeleteProjectRemoteConfig {
+        project_id: i64,
+    },
+    RecentRemoteSyncRuns {
+        project_id: i64,
+        limit: i64,
+    },
+    PlanIssueRemoteWorkflow {
+        issue_id: i64,
     },
 
     // --- backlog ---
@@ -439,6 +479,9 @@ pub enum Response {
     RanIssue { issue_id: i64 },
     ApprovedMerge { issue_ids: Vec<i64> },
     ReconcileReport(ProjectReconcileReport),
+    ProjectRemoteConfig(Option<ProjectRemoteConfig>),
+    RemoteSyncRuns(Vec<RemoteSyncRun>),
+    IssueRemoteWorkflowPlan(RemoteWorkflowPlan),
     Event(Event),
 }
 
@@ -745,6 +788,84 @@ async fn dispatch_inner(
         }
         Command::RemoveProject { .. } => {
             anyhow::bail!("project removal requires the daemon runtime")
+        }
+        Command::GetProjectRemoteConfig { project_id } => {
+            Response::ProjectRemoteConfig(remote::get_config(pool, project_id).await?)
+        }
+        Command::UpsertProjectRemoteConfig {
+            project_id,
+            provider,
+            remote_url,
+            owner,
+            repo,
+            api_base_url,
+            auth_kind,
+            auth_ref,
+            webhook_secret_ref,
+            inbound_auwsx_run_enabled,
+            outbound_issue_create_enabled,
+            remote_pr_merge_enabled,
+            agent_comment_sync_enabled,
+            subtask_comment_sync_enabled,
+            finding_comment_sync_enabled,
+            draft_pr_enabled,
+            required_checks_policy,
+            default_labels,
+            default_assignees,
+            pr_base_branch,
+        } => {
+            remote::upsert_config(
+                pool,
+                UpsertProjectRemoteConfig {
+                    project_id,
+                    provider,
+                    remote_url: &remote_url,
+                    owner: &owner,
+                    repo: &repo,
+                    api_base_url: &api_base_url,
+                    auth_kind,
+                    auth_ref: auth_ref.as_deref(),
+                    webhook_secret_ref: webhook_secret_ref.as_deref(),
+                    inbound_auwsx_run_enabled,
+                    outbound_issue_create_enabled,
+                    remote_pr_merge_enabled,
+                    agent_comment_sync_enabled,
+                    subtask_comment_sync_enabled,
+                    finding_comment_sync_enabled,
+                    draft_pr_enabled,
+                    required_checks_policy,
+                    default_labels: default_labels.as_deref(),
+                    default_assignees: default_assignees.as_deref(),
+                    pr_base_branch: pr_base_branch.as_deref(),
+                },
+                now,
+            )
+            .await?;
+            Response::Ok
+        }
+        Command::DeleteProjectRemoteConfig { project_id } => {
+            remote::delete_config(pool, project_id).await?;
+            Response::Ok
+        }
+        Command::RecentRemoteSyncRuns { project_id, limit } => {
+            Response::RemoteSyncRuns(remote::recent_sync_runs(pool, project_id, limit).await?)
+        }
+        Command::PlanIssueRemoteWorkflow { issue_id } => {
+            let issue = issues::get(pool, issue_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("issue {issue_id} not found"))?;
+            let config = remote::get_config(pool, issue.project_id).await?;
+            let issue_link = remote::issue_link_by_issue(pool, issue_id).await?;
+            let pr_link = remote::pr_link_by_issue(pool, issue_id).await?;
+            Response::IssueRemoteWorkflowPlan(remote_plan::plan_issue_remote_workflow(
+                RemoteWorkflowInput {
+                    config: config.as_ref(),
+                    issue: &issue,
+                    issue_link: issue_link.as_ref(),
+                    pr_link: pr_link.as_ref(),
+                    notes: RemoteNotesPresence::from_issue(&issue),
+                },
+            ))
         }
 
         // --- backlog ---

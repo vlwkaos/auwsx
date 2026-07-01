@@ -120,6 +120,7 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         kv("name", &p.name),
         kv("repo", &p.repo_path),
+        kv("remote", &remote_summary(app, p.id)),
         kv(
             "branch",
             &format!("{} / {}", p.default_branch, p.completion_policy.as_str()),
@@ -173,6 +174,40 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
     render_kanban(frame, app, rows[2]);
     render_kanban_preview(frame, app, rows[3]);
     render_archive_summary(frame, app, rows[4]);
+}
+
+fn remote_summary(app: &App, project_id: i64) -> String {
+    let Some(config) = app.remote_config(project_id) else {
+        return "not configured".to_string();
+    };
+    let mut enabled = Vec::new();
+    if config.inbound_auwsx_run_enabled {
+        enabled.push("/auwsx-run");
+    }
+    if config.outbound_issue_create_enabled {
+        enabled.push("issues");
+    }
+    if config.remote_pr_merge_enabled {
+        enabled.push("PR merge");
+    }
+    if config.agent_comment_sync_enabled
+        || config.subtask_comment_sync_enabled
+        || config.finding_comment_sync_enabled
+    {
+        enabled.push("comments");
+    }
+    let toggles = if enabled.is_empty() {
+        "no sync toggles".to_string()
+    } else {
+        enabled.join(", ")
+    };
+    format!(
+        "{} {}/{} · {}",
+        config.provider.as_str(),
+        config.owner,
+        config.repo,
+        toggles
+    )
 }
 
 fn render_recovery(frame: &mut Frame, app: &App, project_id: i64, area: Rect) {

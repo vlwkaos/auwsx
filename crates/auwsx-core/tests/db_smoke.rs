@@ -8,11 +8,40 @@
 //! CHECK-domain test supplies all other required columns correctly so the
 //! single bad value is the only possible reason for rejection.
 
+use auwsx_core::db::remote::{
+    self, RecordRemoteEvent, RemoteAuthKind, RemotePrState, RemoteProvider, RequiredChecksPolicy,
+    UpsertProjectRemoteConfig, UpsertRemoteIssueLink, UpsertRemotePrLink,
+};
 use auwsx_core::db::Db;
 use sqlx::{Row, SqlitePool};
 
 /// Fixed deterministic timestamp (Unix epoch ms) for every row. No SystemTime.
 const TS: i64 = 1_000_000;
+
+fn valid_remote_config(project_id: i64) -> UpsertProjectRemoteConfig<'static> {
+    UpsertProjectRemoteConfig {
+        project_id,
+        provider: RemoteProvider::Github,
+        remote_url: "https://github.com/acme/repo",
+        owner: "acme",
+        repo: "repo",
+        api_base_url: "https://api.github.com",
+        auth_kind: RemoteAuthKind::TokenEnv,
+        auth_ref: Some("GITHUB_TOKEN"),
+        webhook_secret_ref: Some("WEBHOOK_SECRET"),
+        inbound_auwsx_run_enabled: true,
+        outbound_issue_create_enabled: true,
+        remote_pr_merge_enabled: false,
+        agent_comment_sync_enabled: true,
+        subtask_comment_sync_enabled: false,
+        finding_comment_sync_enabled: true,
+        draft_pr_enabled: true,
+        required_checks_policy: RequiredChecksPolicy::Observe,
+        default_labels: Some("auwsx"),
+        default_assignees: Some("maintainer"),
+        pr_base_branch: Some("main"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers: each inserts a row supplying EVERY NOT NULL column with a valid
@@ -133,6 +162,11 @@ async fn all_runtime_tables_exist() -> anyhow::Result<()> {
         "routing_runs",
         "scheduler_runs",
         "project_route_locks",
+        "project_remote_configs",
+        "remote_issue_links",
+        "remote_pr_links",
+        "remote_events",
+        "remote_sync_runs",
     ];
     let actual_count: i64 = sqlx::query(
         "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name NOT LIKE '_sqlx%'",
@@ -188,6 +222,77 @@ async fn project_row_roundtrips() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn given_existing_project_remote_config_when_upserted_then_one_row_remains(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "remote-upsert").await?;
+    remote::upsert_config(db.pool(), valid_remote_config(project_id), TS).await?;
+    let mut updated = valid_remote_config(project_id);
+    updated.repo = "renamed";
+
+    remote::upsert_config(db.pool(), updated, TS + 1).await?;
+
+    let count: i64 =
+        sqlx::query("SELECT COUNT(*) AS n FROM project_remote_configs WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_one(db.pool())
+            .await?
+            .get("n");
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_optional_blank_remote_config_fields_when_upserted_then_they_are_null(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "remote-trim").await?;
+    let mut input = valid_remote_config(project_id);
+    input.webhook_secret_ref = Some(" ");
+    input.default_labels = Some("");
+    input.default_assignees = Some("  ");
+    input.pr_base_branch = Some("\n");
+
+    remote::upsert_config(db.pool(), input, TS).await?;
+
+    let got = remote::get_config(db.pool(), project_id)
+        .await?
+        .expect("config");
+    assert_eq!(
+        (
+            got.webhook_secret_ref,
+            got.default_labels,
+            got.default_assignees,
+            got.pr_base_branch
+        ),
+        (None, None, None, None)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_blank_required_remote_url_when_upserted_then_error() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "remote-required").await?;
+    let mut input = valid_remote_config(project_id);
+    input.remote_url = " ";
+
+    assert!(remote::upsert_config(db.pool(), input, TS).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_token_auth_without_auth_ref_when_upserted_then_error() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "remote-auth").await?;
+    let mut input = valid_remote_config(project_id);
+    input.auth_ref = Some(" ");
+
+    assert!(remote::upsert_config(db.pool(), input, TS).await.is_err());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 3. issues round-trip
 // ---------------------------------------------------------------------------
@@ -205,6 +310,136 @@ async fn issue_row_roundtrips_with_planning_status() -> anyhow::Result<()> {
         .get("status");
 
     assert_eq!(status, "PLANNING");
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_duplicate_remote_delivery_when_recorded_then_second_insert_is_ignored(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let first = remote::record_event(
+        db.pool(),
+        RecordRemoteEvent {
+            project_id: None,
+            provider: RemoteProvider::Github,
+            delivery_id: "delivery-dup",
+            event_kind: "issue_comment",
+            action: Some("created"),
+            payload_hash: "hash",
+        },
+        TS,
+    )
+    .await?;
+    let second = remote::record_event(
+        db.pool(),
+        RecordRemoteEvent {
+            project_id: None,
+            provider: RemoteProvider::Github,
+            delivery_id: "delivery-dup",
+            event_kind: "issue_comment",
+            action: Some("created"),
+            payload_hash: "hash",
+        },
+        TS + 1,
+    )
+    .await?;
+
+    assert!(first.is_some() && second.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_remote_issue_link_without_local_target_when_upserted_then_error(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "remote-link-invalid").await?;
+
+    assert!(remote::upsert_issue_link(
+        db.pool(),
+        UpsertRemoteIssueLink {
+            project_id,
+            issue_id: None,
+            backlog_item_id: None,
+            provider: RemoteProvider::Github,
+            remote_owner: "acme",
+            remote_repo: "repo",
+            remote_issue_number: 1,
+            remote_node_id: None,
+            remote_url: "https://github.com/acme/repo/issues/1",
+            last_synced_at: None,
+        },
+        TS,
+    )
+    .await
+    .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_issue_remote_issue_link_when_fetched_by_issue_then_returns_link(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "remote-link").await?;
+    let issue_id = insert_issue(db.pool(), project_id, "PLANNING").await?;
+    remote::upsert_issue_link(
+        db.pool(),
+        UpsertRemoteIssueLink {
+            project_id,
+            issue_id: Some(issue_id),
+            backlog_item_id: None,
+            provider: RemoteProvider::Github,
+            remote_owner: "acme",
+            remote_repo: "repo",
+            remote_issue_number: 2,
+            remote_node_id: None,
+            remote_url: "https://github.com/acme/repo/issues/2",
+            last_synced_at: None,
+        },
+        TS,
+    )
+    .await?;
+
+    let got = remote::issue_link_by_issue(db.pool(), issue_id)
+        .await?
+        .expect("remote issue link");
+    assert_eq!(got.remote_issue_number, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_existing_issue_pr_link_when_upserted_again_then_fetch_returns_updated_link(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = insert_project(db.pool(), "remote-pr").await?;
+    let issue_id = insert_issue(db.pool(), project_id, "PLANNING").await?;
+    for number in [10, 11] {
+        remote::upsert_pr_link(
+            db.pool(),
+            UpsertRemotePrLink {
+                project_id,
+                issue_id,
+                provider: RemoteProvider::Github,
+                remote_owner: "acme",
+                remote_repo: "repo",
+                remote_pr_number: number,
+                remote_node_id: None,
+                remote_url: "https://github.com/acme/repo/pull/11",
+                head_branch: "auwsx/issue-1",
+                head_sha: None,
+                base_branch: "main",
+                base_sha: None,
+                state: RemotePrState::Open,
+                last_synced_at: None,
+            },
+            TS + number,
+        )
+        .await?;
+    }
+
+    let got = remote::pr_link_by_issue(db.pool(), issue_id)
+        .await?
+        .expect("remote PR link");
+    assert_eq!(got.remote_pr_number, 11);
     Ok(())
 }
 

@@ -9,6 +9,7 @@
 //! - [`scheduler`]  — per-project tokio ticker (issues + routines) (Plan Step 3, 3.6)
 //! - [`main_jobs`]  — main-workspace lifecycle, queued ops (Plan Step 3.5)
 //! - [`main_job_runner`] — main-job agent execution + artifact recording
+//! - [`remote_plan`] — pure remote issue/PR/comment workflow decisions
 //! - [`routines`]   — cron routines (incl. built-ins) (Plan Step 3.6)
 //! - [`backlog`]    — backlog_items CRUD + admission gate (Plan Step 3.7)
 //! - [`routing`]    — backlog routing into issues / queue messages
@@ -47,6 +48,7 @@ pub mod pipeline;
 pub mod project_setup;
 pub mod prompt;
 pub mod reconcile;
+pub mod remote_plan;
 pub mod routines;
 pub mod routing;
 pub mod schedule;
