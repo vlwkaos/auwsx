@@ -294,6 +294,13 @@ pub struct Form {
     pub current: usize,
     pub cursor: usize,
     pub completion_sel: usize,
+    pub mode: FormMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormMode {
+    Navigate,
+    Edit,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +343,7 @@ impl Form {
             current: 0,
             cursor: 0,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -406,6 +414,7 @@ impl Form {
             current: 0,
             cursor: project.name.chars().count(),
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -542,6 +551,7 @@ impl Form {
             current: 0,
             cursor: 0,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -583,6 +593,7 @@ impl Form {
             current: 0,
             cursor: preset.map(|p| p.name.chars().count()).unwrap_or_default(),
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -594,6 +605,7 @@ impl Form {
             current: 0,
             cursor: 0,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -605,6 +617,7 @@ impl Form {
             current: 0,
             cursor: item.text.chars().count(),
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -623,6 +636,7 @@ impl Form {
             current: 0,
             cursor: 0,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -649,6 +663,7 @@ impl Form {
             current: 0,
             cursor: 0,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -660,6 +675,7 @@ impl Form {
             current: 0,
             cursor: 0,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -671,6 +687,7 @@ impl Form {
             current: 1,
             cursor: 0,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -700,6 +717,7 @@ impl Form {
             current: 0,
             cursor: 0,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         }
     }
 
@@ -3170,16 +3188,34 @@ impl App {
             return Ok(());
         }
 
+        let mode = self.form.as_ref().map(|form| form.mode);
+        if matches!(mode, Some(FormMode::Navigate)) {
+            return self.handle_form_navigation_key(key).await;
+        }
+        self.handle_form_edit_key(key).await
+    }
+
+    async fn handle_form_navigation_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
                 self.form = None;
                 self.status = "cancelled".into();
                 self.status_until = Some(Instant::now() + Duration::from_millis(1500));
             }
-            KeyCode::Enter => self.advance_or_submit_form().await?,
+            KeyCode::Char('E') => self.submit_form().await?,
             KeyCode::Tab if self.accept_completion() => {}
             KeyCode::Down if self.move_completion(1) => {}
             KeyCode::Up if self.move_completion(-1) => {}
+            KeyCode::Enter => {
+                if self.current_form_field_accepts_input() {
+                    if let Some(form) = self.form.as_mut() {
+                        form.mode = FormMode::Edit;
+                        form.clamp_cursor();
+                    }
+                } else {
+                    self.status = "field uses h/l or prefix keys".into();
+                }
+            }
             KeyCode::Left if self.cycle_current_select(-1) => {}
             KeyCode::Right if self.cycle_current_select(1) => {}
             KeyCode::Char(' ') if self.cycle_current_select(1) => {}
@@ -3204,6 +3240,21 @@ impl App {
                     form.move_field(-1);
                 }
             }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_form_edit_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                if let Some(form) = self.form.as_mut() {
+                    form.mode = FormMode::Navigate;
+                }
+            }
+            KeyCode::Tab if self.accept_completion() => {}
+            KeyCode::Down if self.move_completion(1) => {}
+            KeyCode::Up if self.move_completion(-1) => {}
             KeyCode::Left => {
                 if let Some(form) = self.form.as_mut() {
                     form.cursor = form.cursor.saturating_sub(1);
@@ -3258,6 +3309,18 @@ impl App {
         Ok(())
     }
 
+    fn current_form_field_accepts_input(&self) -> bool {
+        self.form
+            .as_ref()
+            .and_then(Form::current_field)
+            .is_some_and(|field| {
+                !matches!(
+                    field.kind,
+                    FieldKind::Select { .. } | FieldKind::Combo { free_text: false }
+                )
+            })
+    }
+
     fn select_option_by_prefix(&mut self, c: char) {
         let Some(form) = self.form.as_mut() else {
             return;
@@ -3301,21 +3364,6 @@ impl App {
             }
             _ => Ok(false), // ignore other keys; popup stays open
         }
-    }
-
-    async fn advance_or_submit_form(&mut self) -> Result<()> {
-        let should_submit = self
-            .form
-            .as_ref()
-            .map(|f| f.current + 1 >= f.fields.len())
-            .unwrap_or(false);
-        if !should_submit {
-            if let Some(form) = self.form.as_mut() {
-                form.move_field(1);
-            }
-            return Ok(());
-        }
-        self.submit_form().await
     }
 
     async fn submit_form(&mut self) -> Result<()> {
@@ -5869,6 +5917,7 @@ mod tests {
             current: 0,
             cursor: 3,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         });
         assert!(app.repo_suggestions().is_empty());
     }
@@ -5884,6 +5933,7 @@ mod tests {
             current: 0,
             cursor: 3,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         });
         assert!(app.repo_suggestions().is_empty());
     }
@@ -5899,6 +5949,7 @@ mod tests {
             current: 0,
             cursor: 3,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         });
         assert!(!app.repo_suggestions().is_empty());
     }
@@ -5914,6 +5965,7 @@ mod tests {
             current: 0,
             cursor: 4,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         });
         assert!(app.repo_suggestions().is_empty());
     }
@@ -5930,6 +5982,7 @@ mod tests {
             current: 1,
             cursor: 3,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         });
         assert!(!app.repo_suggestions().is_empty());
     }
@@ -5945,6 +5998,7 @@ mod tests {
             current: 0,
             cursor: 3,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         });
         assert_eq!(app.repo_suggestions().len(), 8);
     }
@@ -5978,6 +6032,8 @@ mod tests {
             resolved_at: None,
         }));
 
+        app.handle_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await?;
         app.handle_form_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
             .await?;
         app.handle_form_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT))
@@ -5986,6 +6042,7 @@ mod tests {
         let form = app.form.expect("form remains open");
         assert_eq!(form.get("text"), "abcXd");
         assert_eq!(form.cursor, 4);
+        assert_eq!(form.mode, FormMode::Edit);
         Ok(())
     }
 
@@ -5998,6 +6055,8 @@ mod tests {
         form.cursor = 2;
         app.form = Some(form);
 
+        app.handle_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await?;
         app.handle_form_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
             .await?;
         app.handle_form_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))
@@ -6006,6 +6065,50 @@ mod tests {
         let form = app.form.expect("form remains open");
         assert_eq!(form.get("text"), "ad");
         assert_eq!(form.cursor, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_form_navigate_mode_when_char_typed_then_value_is_unchanged() -> anyhow::Result<()>
+    {
+        let mut app = test_app();
+        app.form = Some(Form::backlog_edit(&BacklogItem {
+            id: 1,
+            project_id: 1,
+            text: "abcd".to_string(),
+            source: Source::Human,
+            approval: auwsx_core::backlog::Approval::Approved,
+            origin_routine_id: None,
+            consumed_issue_id: None,
+            created_at: 1,
+            resolved_at: None,
+        }));
+
+        app.handle_form_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT))
+            .await?;
+
+        let form = app.form.expect("form remains open");
+        assert_eq!(form.get("text"), "abcd");
+        assert_eq!(form.mode, FormMode::Navigate);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_form_edit_mode_when_enter_pressed_then_returns_to_navigation(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.form = Some(Form::backlog());
+
+        app.handle_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await?;
+        app.handle_form_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await?;
+        app.handle_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await?;
+
+        let form = app.form.expect("form remains open");
+        assert_eq!(form.get("text"), "x");
+        assert_eq!(form.mode, FormMode::Navigate);
         Ok(())
     }
 
@@ -6241,6 +6344,7 @@ mod tests {
             current: 0,
             cursor: 2,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         });
         assert!(app.arsenal_suggestions().is_empty());
     }
@@ -6256,6 +6360,7 @@ mod tests {
             current: 0,
             cursor: 2,
             completion_sel: 0,
+            mode: FormMode::Navigate,
         });
         assert!(app.arsenal_suggestions().is_empty());
     }

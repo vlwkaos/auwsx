@@ -104,15 +104,28 @@ fn footer_model(app: &App) -> FooterModel {
         );
         return model;
     }
-    if app.form.is_some() {
-        model.context.extend(
-            [
-                key_hint("Tab/Enter", "next"),
-                key_hint("Shift-Tab", "previous"),
-                key_hint("Esc", "cancel"),
-            ]
-            .map(String::from),
-        );
+    if let Some(form) = app.form.as_ref() {
+        match form.mode {
+            crate::app::FormMode::Navigate => model.context.extend(
+                [
+                    "form nav".to_string(),
+                    key_hint("j/k", "field"),
+                    key_hint("Enter", "edit"),
+                    key_hint("E", "submit"),
+                    key_hint("Esc", "cancel"),
+                ]
+                .map(String::from),
+            ),
+            crate::app::FormMode::Edit => model.context.extend(
+                [
+                    "form edit".to_string(),
+                    key_hint("Tab", "complete"),
+                    key_hint("Enter", "done"),
+                    key_hint("Esc", "done"),
+                ]
+                .map(String::from),
+            ),
+        }
         return model;
     }
     if app.view == View::Issue {
@@ -275,18 +288,19 @@ fn draw_form(frame: &mut Frame, app: &App) {
         let marker = if idx == form.current { ">" } else { " " };
         let optional = if field.optional { " optional" } else { "" };
         let active = idx == form.current;
+        let editing = active && form.mode == crate::app::FormMode::Edit;
         let label_style = if active {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             theme::dim()
         };
         let label = format!("{marker} {:>18}{optional}: ", field.display);
-        if active && field_accepts_cursor(field) {
+        if editing && field_accepts_cursor(field) {
             active_field_line = Some(lines.len());
             active_field_prefix_chars = label.chars().count();
         }
         let mut row = vec![Span::styled(label, label_style)];
-        row.extend(field_value_spans(field, form.cursor, active));
+        row.extend(field_value_spans(field, form.cursor, editing));
         row.push(Span::styled(
             format!("  {}", field_kind_tag(field)),
             theme::dim(),
@@ -324,10 +338,15 @@ fn draw_form(frame: &mut Frame, app: &App) {
     }
 
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Enter next/submit · h/l cycle select · Tab complete · Backspace edit · Esc cancel",
-        theme::hint(),
-    )));
+    let controls = match form.mode {
+        crate::app::FormMode::Navigate => {
+            "Navigate: j/k field · Enter edit · h/l cycle select · (E) submit · Esc cancel"
+        }
+        crate::app::FormMode::Edit => {
+            "Edit: type text · Tab complete · Backspace/Delete edit · Enter/Esc done"
+        }
+    };
+    lines.push(Line::from(Span::styled(controls, theme::hint())));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -768,10 +787,45 @@ mod tests {
             current: 0,
             cursor: 0,
             completion_sel: 0,
+            mode: crate::app::FormMode::Navigate,
         };
         let with_help = form_extra_rows(&form, 0);
         form.current = 1;
 
         assert_eq!(with_help, form_extra_rows(&form, 0));
+    }
+
+    #[test]
+    fn given_form_mode_when_footer_modeled_then_hints_match_navigation_depth() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.connected = true;
+        app.form = Some(Form {
+            kind: FormKind::Backlog,
+            title: "Backlog",
+            fields: vec![FormField {
+                label: "text",
+                display: "Text",
+                section: "Content",
+                help: "",
+                kind: FieldKind::Text,
+                value: String::new(),
+                optional: false,
+            }],
+            current: 0,
+            cursor: 0,
+            completion_sel: 0,
+            mode: crate::app::FormMode::Navigate,
+        });
+
+        let nav = footer_model(&app).context_text();
+        assert!(nav.contains("form nav"));
+        assert!(nav.contains("(Enter) edit"));
+        assert!(nav.contains("(E) submit"));
+
+        app.form.as_mut().expect("form").mode = crate::app::FormMode::Edit;
+        let edit = footer_model(&app).context_text();
+        assert!(edit.contains("form edit"));
+        assert!(edit.contains("(Enter) done"));
+        assert!(!edit.contains("(E) submit"));
     }
 }
