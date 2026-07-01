@@ -5,7 +5,7 @@ use crate::app::App;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 pub(super) fn log_block_with_title_focused(
@@ -19,7 +19,6 @@ pub(super) fn log_block_with_title_focused(
 }
 
 fn log_block_inner(frame: &mut Frame, area: Rect, app: &App, section: Option<&str>, focused: bool) {
-    frame.render_widget(Clear, area);
     let base_title = app
         .log_tail_path
         .as_ref()
