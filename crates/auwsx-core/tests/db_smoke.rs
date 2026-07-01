@@ -192,6 +192,23 @@ async fn all_runtime_tables_exist() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn issues_agent_session_column_absent() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let columns: Vec<String> = sqlx::query("PRAGMA table_info(issues)")
+        .fetch_all(db.pool())
+        .await?
+        .into_iter()
+        .map(|row| row.get("name"))
+        .collect();
+
+    assert!(
+        !columns.iter().any(|name| name == "agent_session"),
+        "agent_session is a removed tmux-era field"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn global_settings_seed_row_exists() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM global_settings WHERE id = 1")

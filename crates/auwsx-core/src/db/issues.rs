@@ -31,7 +31,6 @@ pub struct Issue {
     pub status: IssueStatus,
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
-    pub agent_session: Option<String>,
     pub review_round: i64,
     pub conflict_attempts: i64,
     pub wait_until: Option<i64>,
@@ -57,7 +56,6 @@ impl Issue {
                 .ok_or_else(|| anyhow!("unknown issue status {status_raw:?} in db"))?,
             branch: row.try_get("branch")?,
             worktree_path: row.try_get("worktree_path")?,
-            agent_session: row.try_get("agent_session")?,
             review_round: row.try_get("review_round")?,
             conflict_attempts: row.try_get("conflict_attempts")?,
             wait_until: row.try_get("wait_until")?,
@@ -250,23 +248,21 @@ pub async fn mark_absorbed(_pool: &SqlitePool, id: i64, _into_id: i64, _now: i64
     ))
 }
 
-/// Record the worktree/branch/session a standalone issue acquires at PLANNING.
+/// Record the worktree/branch a standalone issue acquires at PLANNING.
 /// Any field may be `None` to leave it NULL.
 pub async fn set_worktree(
     pool: &SqlitePool,
     id: i64,
     branch: Option<&str>,
     worktree_path: Option<&str>,
-    agent_session: Option<&str>,
     now: i64,
 ) -> Result<()> {
     let n = sqlx::query(
-        "UPDATE issues SET branch = ?, worktree_path = ?, agent_session = ?, updated_at = ?
+        "UPDATE issues SET branch = ?, worktree_path = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(branch)
     .bind(worktree_path)
-    .bind(agent_session)
     .bind(now)
     .bind(id)
     .execute(pool)

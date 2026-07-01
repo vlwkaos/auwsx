@@ -1796,15 +1796,7 @@ impl Scheduler {
             path: PathBuf::from(path),
         };
         self.worktrees.teardown(project, &handle).await?;
-        issues::set_worktree(
-            self.db.pool(),
-            issue.id,
-            None,
-            None,
-            None,
-            self.clock.now_ms(),
-        )
-        .await
+        issues::set_worktree(self.db.pool(), issue.id, None, None, self.clock.now_ms()).await
     }
 
     /// Drop handles for tasks that have finished (keeps the in-flight Vec from

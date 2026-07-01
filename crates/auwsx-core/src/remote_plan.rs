@@ -409,7 +409,6 @@ mod tests {
             status,
             branch: Some("auwsx/issue-42".to_string()),
             worktree_path: None,
-            agent_session: None,
             review_round: 0,
             conflict_attempts: 0,
             wait_until: None,

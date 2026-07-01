@@ -994,7 +994,6 @@ mod tests {
             issue_id,
             Some("auwsx/issue-1"),
             Some("/worktree"),
-            None,
             TS,
         )
         .await
@@ -1110,7 +1109,6 @@ mod tests {
             issue_id,
             Some("auwsx/issue-1"),
             Some("/worktree"),
-            None,
             TS,
         )
         .await

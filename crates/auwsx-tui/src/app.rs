@@ -5797,7 +5797,6 @@ mod tests {
             status: auwsx_core::state::IssueStatus::Planning,
             branch: None,
             worktree_path: None,
-            agent_session: None,
             review_round: 0,
             conflict_attempts: 0,
             wait_until: None,

@@ -81,7 +81,6 @@ fn issue_at(id: i64, status: IssueStatus) -> Issue {
         status,
         branch: None,
         worktree_path: None,
-        agent_session: None,
         review_round: 0,
         conflict_attempts: 0,
         wait_until: None,
@@ -1243,7 +1242,7 @@ async fn attach_clean_issue_branch(
     git(repo, &["add", file_name])?;
     git(repo, &["commit", "-m", &format!("issue {issue_id}")])?;
     git(repo, &["checkout", "main"])?;
-    issues::set_worktree(pool, issue_id, Some(&branch), None, None, TS).await?;
+    issues::set_worktree(pool, issue_id, Some(&branch), None, TS).await?;
     Ok(())
 }
 
@@ -1261,7 +1260,7 @@ async fn attach_conflicting_issue_branch(
     std::fs::write(repo.join("README.md"), "main change\n")?;
     git(repo, &["add", "README.md"])?;
     git(repo, &["commit", "-m", "main change"])?;
-    issues::set_worktree(pool, issue_id, Some(&branch), None, None, TS).await?;
+    issues::set_worktree(pool, issue_id, Some(&branch), None, TS).await?;
     Ok(())
 }
 
@@ -1542,7 +1541,6 @@ async fn given_pr_merge_project_when_issue_merge_approved_then_remote_pr_sync_is
         issue_id,
         Some("auwsx/issue-remote-pr"),
         Some("/worktree"),
-        None,
         TS,
     )
     .await?;
@@ -1592,7 +1590,6 @@ async fn given_pr_merge_project_when_remote_pr_observed_merged_then_issue_done(
         issue_id,
         Some("auwsx/issue-remote-pr"),
         Some("/worktree"),
-        None,
         TS,
     )
     .await?;
@@ -1671,15 +1668,7 @@ async fn given_pr_merge_project_when_project_merge_approved_then_all_ready_pr_sy
     let first = issues::create(db.pool(), project_id, "first remote pr", None, TS).await?;
     let second = issues::create(db.pool(), project_id, "second remote pr", None, TS).await?;
     for (issue_id, branch) in [(first, "auwsx/issue-first"), (second, "auwsx/issue-second")] {
-        issues::set_worktree(
-            db.pool(),
-            issue_id,
-            Some(branch),
-            Some("/worktree"),
-            None,
-            TS,
-        )
-        .await?;
+        issues::set_worktree(db.pool(), issue_id, Some(branch), Some("/worktree"), TS).await?;
         issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
     }
     let scheduler = scheduler_with(
@@ -1794,7 +1783,6 @@ async fn given_represented_ready_issue_when_cleanup_fails_then_mark_done_claim_h
         issue_id,
         Some(&branch_for_issue(issue_id)),
         Some("/tmp/auwsx-represented-order"),
-        None,
         TS,
     )
     .await?;
@@ -2098,7 +2086,6 @@ async fn given_reconcile_apply_running_for_project_when_apply_again_then_project
         issue_id,
         Some(&branch_for_issue(issue_id)),
         Some("/tmp/auwsx-apply-guard"),
-        None,
         TS,
     )
     .await?;
@@ -3487,7 +3474,7 @@ async fn given_done_issue_when_abandoned_then_noop() -> anyhow::Result<()> {
     let project_id = drive_project(db.pool()).await?;
     let issue_id = issues::create(db.pool(), project_id, "done", None, TS).await?;
     issues::force_status(db.pool(), issue_id, IssueStatus::Done, TS).await?;
-    issues::set_worktree(db.pool(), issue_id, Some("br"), Some("/wt"), None, TS).await?;
+    issues::set_worktree(db.pool(), issue_id, Some("br"), Some("/wt"), TS).await?;
     let sched = scheduler_with(
         db.clone(),
         Arc::new(FixedClock(TS)),
@@ -3513,7 +3500,7 @@ async fn given_failed_issue_when_abandoned_then_noop() -> anyhow::Result<()> {
     let project_id = drive_project(db.pool()).await?;
     let issue_id = issues::create(db.pool(), project_id, "failed", None, TS).await?;
     issues::force_status(db.pool(), issue_id, IssueStatus::Failed, TS).await?;
-    issues::set_worktree(db.pool(), issue_id, Some("br"), Some("/wt"), None, TS).await?;
+    issues::set_worktree(db.pool(), issue_id, Some("br"), Some("/wt"), TS).await?;
     let sched = scheduler_with(
         db.clone(),
         Arc::new(FixedClock(TS)),
@@ -3540,7 +3527,7 @@ async fn given_working_issue_with_worktree_when_abandoned_then_status_abandoned(
     let project_id = drive_project(db.pool()).await?;
     let issue_id = issues::create(db.pool(), project_id, "working", None, TS).await?;
     issues::force_status(db.pool(), issue_id, IssueStatus::Working, TS).await?;
-    issues::set_worktree(db.pool(), issue_id, Some("br"), Some("/wt"), None, TS).await?;
+    issues::set_worktree(db.pool(), issue_id, Some("br"), Some("/wt"), TS).await?;
     let sched = scheduler_with(
         db.clone(),
         Arc::new(FixedClock(TS)),
@@ -3567,7 +3554,7 @@ async fn given_failed_issue_with_worktree_when_cleanup_then_worktree_fields_clea
     let project_id = drive_project(db.pool()).await?;
     let issue_id = issues::create(db.pool(), project_id, "failed", None, TS).await?;
     issues::force_status(db.pool(), issue_id, IssueStatus::Failed, TS).await?;
-    issues::set_worktree(db.pool(), issue_id, Some("br"), Some("/wt"), None, TS).await?;
+    issues::set_worktree(db.pool(), issue_id, Some("br"), Some("/wt"), TS).await?;
     let sched = scheduler_with(
         db.clone(),
         Arc::new(FixedClock(TS)),

@@ -2189,7 +2189,6 @@ async fn given_apply_issue_merge_when_clean_merge_then_marks_done() -> anyhow::R
         id,
         Some("auwsx/issue-1"),
         Some(repo.path().to_str().expect("utf8 repo path")),
-        None,
         TS,
     )
     .await?;
@@ -2217,7 +2216,6 @@ async fn given_apply_issue_merge_when_dirty_restore_conflicts_then_marks_conflic
         id,
         Some("auwsx/issue-1"),
         Some(repo.path().to_str().expect("utf8 repo path")),
-        None,
         TS,
     )
     .await?;

@@ -30,7 +30,7 @@ was removed.
 | **profiles** | project grouping | profile name/order; projects store profile membership and order within profile |
 | **projects** | per-project config | per-role agent cmds `main/plan/work/review_agent_cmd` (review NULL → fall back to work); `schedule_interval_min` (NULL manual, `<=0` every daemon tick, positive minutes); `completion_policy` (manual\|soft\|auto), `completion_soft_timeout_min`, `plan_gate_timeout_min`, `iteration_timeout_min`, `main_job_timeout_min`, `review_max_rounds`, `conflict_max_attempts`, `max_concurrency`, `merge_mode` (local\|pr), `skill_path`, deepsleep fields |
 | **project_remote_configs** | per-project remote repo settings | one row per project; provider `github`; repo identity `remote_url`/`owner`/`repo`/`api_base_url`; auth ref/secret ref only (no raw token); toggles for inbound `/auwsx-run`, outbound issue creation, PR merge, agent/subtask/finding comment sync, draft PR, required checks policy |
-| **issues** | pipeline unit | `status` (16-state CHECK), `branch`/`worktree_path`/`agent_session` (set at PLANNING), `review_round`, `conflict_attempts`, `wait_until`, `absorbed_into_id`, `has_pending_steering` |
+| **issues** | pipeline unit | `status` (16-state CHECK), `branch`/`worktree_path` (set at PLANNING), `review_round`, `conflict_attempts`, `wait_until`, `absorbed_into_id`, `has_pending_steering` |
 | **subtasks** | issue checklist | A add; A/H check; H edit/rm |
 | **findings** | review output | `severity` (blocker\|major\|minor\|nit), `lens`, `status` (open\|accepted\|rejected\|dismissed), adjudication |
 | **steering** | append-only guidance | `source` (human\|consolidation); append-only; guarded by `accepts_steering` (working phases only) |

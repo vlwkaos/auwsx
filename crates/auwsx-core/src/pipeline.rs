@@ -136,7 +136,6 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
             issue_id,
             Some(&handle.branch),
             Some(&path_str),
-            None,
             deps.clock.now_ms(),
         )
         .await

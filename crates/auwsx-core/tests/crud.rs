@@ -966,15 +966,11 @@ async fn given_issue_when_set_worktree_then_fields_roundtrip() -> anyhow::Result
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
-    issues::set_worktree(db.pool(), id, Some("br"), Some("/wt"), Some("sess"), TS2).await?;
+    issues::set_worktree(db.pool(), id, Some("br"), Some("/wt"), TS2).await?;
     let issue = issues::get(db.pool(), id).await?.expect("issue exists");
     assert_eq!(
-        (
-            issue.branch.as_deref(),
-            issue.worktree_path.as_deref(),
-            issue.agent_session.as_deref()
-        ),
-        (Some("br"), Some("/wt"), Some("sess"))
+        (issue.branch.as_deref(), issue.worktree_path.as_deref()),
+        (Some("br"), Some("/wt"))
     );
     Ok(())
 }
@@ -984,19 +980,16 @@ async fn given_issue_when_set_worktree_all_none_then_fields_null() -> anyhow::Re
     let db = Db::open_memory().await?;
     let pid = insert_project(db.pool(), "p").await?;
     let id = issues::create(db.pool(), pid, "t", None, TS).await?;
-    issues::set_worktree(db.pool(), id, None, None, None, TS2).await?;
+    issues::set_worktree(db.pool(), id, None, None, TS2).await?;
     let issue = issues::get(db.pool(), id).await?.expect("issue exists");
-    assert_eq!(
-        (issue.branch, issue.worktree_path, issue.agent_session),
-        (None, None, None)
-    );
+    assert_eq!((issue.branch, issue.worktree_path), (None, None));
     Ok(())
 }
 
 #[tokio::test]
 async fn given_missing_issue_when_set_worktree_then_err() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
-    let res = issues::set_worktree(db.pool(), 999_999, None, None, None, TS).await;
+    let res = issues::set_worktree(db.pool(), 999_999, None, None, TS).await;
     assert!(res.is_err(), "set_worktree on missing id must Err");
     Ok(())
 }
