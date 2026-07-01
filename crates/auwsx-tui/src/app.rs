@@ -172,7 +172,6 @@ pub enum CapabilityAction {
     Add,
     Edit,
     Ask,
-    Settings,
     Remote,
     MoveMode,
     Approve,
@@ -2049,7 +2048,6 @@ impl App {
                 caps.push(CapabilityAction::Edit, "e", "edit");
                 caps.push(CapabilityAction::Execute, "E", "execute");
                 caps.push(CapabilityAction::Remote, "R", "remote");
-                caps.push(CapabilityAction::Settings, "Ctrl-,", "config");
                 caps.push(CapabilityAction::MoveMode, "m", "move");
                 caps.push(CapabilityAction::Delete, "d", "unregister");
             }

@@ -49,130 +49,198 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    // Global hints and version stay pinned right; contextual hints use the left.
-    let global = format!(
-        " (Ctrl-,) config · (q)uit · v{} ",
-        env!("CARGO_PKG_VERSION")
-    );
+    let model = footer_model(app);
+    let global = model.global_text();
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(global.len() as u16)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(global.len().min(area.width as usize) as u16),
+        ])
         .split(area);
 
     // A status/error message preempts the hint line when present.
     let (text, style) = if !app.status.is_empty() {
         (app.status.clone(), Style::default().fg(theme::WARN))
     } else {
-        (footer_hint(app), theme::hint())
+        (model.context_text(), theme::hint())
     };
     frame.render_widget(Paragraph::new(Span::styled(text, style)), cols[0]);
     frame.render_widget(Paragraph::new(Span::styled(global, theme::dim())), cols[1]);
 }
 
-fn footer_hint(app: &App) -> String {
-    let prefix = footer_prefix(app);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FooterModel {
+    context: Vec<String>,
+    global: Vec<String>,
+}
+
+impl FooterModel {
+    fn context_text(&self) -> String {
+        self.context.join(" · ")
+    }
+
+    fn global_text(&self) -> String {
+        format!(" {} ", self.global.join(" · "))
+    }
+}
+
+fn footer_model(app: &App) -> FooterModel {
+    let mut model = FooterModel {
+        context: Vec::new(),
+        global: global_footer_hints(),
+    };
+    if !app.connected {
+        model.context.push("offline".to_string());
+    }
     if app.confirm_quit {
-        return format!("{prefix}(y/Enter) stop daemon · (n/Esc) cancel · (Ctrl-C) quit only");
+        model.context.extend(
+            [
+                key_hint("y/Enter", "stop daemon"),
+                key_hint("n/Esc", "cancel"),
+                key_hint("Ctrl-C", "quit only"),
+            ]
+            .map(String::from),
+        );
+        return model;
     }
     if app.form.is_some() {
-        return format!("{prefix}(Tab/Enter) next · (Shift-Tab) previous · (Esc) cancel");
+        model.context.extend(
+            [
+                key_hint("Tab/Enter", "next"),
+                key_hint("Shift-Tab", "previous"),
+                key_hint("Esc", "cancel"),
+            ]
+            .map(String::from),
+        );
+        return model;
     }
     if app.view == View::Issue {
-        let mut parts = vec![
-            "(k) older".to_string(),
-            "(j) newer".to_string(),
-            "PgUp/PgDn page".to_string(),
-            "Home oldest".to_string(),
-            "End newest".to_string(),
-        ];
-        parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-        parts.extend(["(Esc) back", "(Tab) view"].map(str::to_string));
-        return format!("{prefix}{}", parts.join(" · "));
+        model.context.extend(
+            [
+                key_hint("k", "older"),
+                key_hint("j", "newer"),
+                key_hint("PgUp/PgDn", "page"),
+                key_hint("Home", "oldest"),
+                key_hint("End", "newest"),
+            ]
+            .map(String::from),
+        );
+        model
+            .context
+            .extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
+        model.context.push(key_hint("Esc", "back"));
+        return model;
     }
     if app.view == View::Config {
-        let mut parts = vec!["settings".to_string(), "(j/k) select".to_string()];
-        parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-        parts.extend(["Pg scroll detail", "(Esc) main"].map(str::to_string));
-        return format!("{prefix}{}", parts.join(" · "));
+        model.context.push("settings".to_string());
+        model.context.push(key_hint("j/k", "select"));
+        model
+            .context
+            .extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
+        model.context.push(key_hint("Pg", "scroll detail"));
+        model.context.push(key_hint("Esc", "main"));
+        return model;
     }
     if app.move_mode {
         let profile = if matches!(
             app.selected_tree_item(),
             Some(crate::app::TreeItem::Project(_))
         ) {
-            " · (h/l) move profile"
+            Some(key_hint("h/l", "move profile"))
         } else {
-            ""
+            None
         };
-        return format!("{prefix}move mode · (j/k) reorder{profile} · (m)ove exit · (Esc) cancel");
+        model.context.push("move mode".to_string());
+        model.context.push(key_hint("j/k", "reorder"));
+        if let Some(profile) = profile {
+            model.context.push(profile);
+        }
+        model.context.push(key_hint("m", "move exit"));
+        model.context.push(key_hint("Esc", "cancel"));
+        return model;
     }
     if app.focus == crate::app::Focus::ProjectKanban {
         let caps = app.capabilities();
-        let mut parts = vec![
+        model.context.extend([
             "kanban".to_string(),
-            "(h/l) column".to_string(),
-            "(j/k) item".to_string(),
-            "(Enter) open".to_string(),
-        ];
-        parts.extend(caps.hints.into_iter().map(|hint| hint.label));
-        return format!("{prefix}{} · (Esc) left", parts.join(" · "));
+            key_hint("h/l", "column"),
+            key_hint("j/k", "item"),
+            key_hint("Enter", "open"),
+        ]);
+        model
+            .context
+            .extend(caps.hints.into_iter().map(|hint| hint.label));
+        model.context.push(key_hint("Esc", "left"));
+        return model;
     }
     if app.focus == crate::app::Focus::IssueDetail {
-        let mut parts = if app.issue_section_sel == 3 && app.issue_section_is_active() {
-            vec![
+        if app.issue_section_sel == 3 && app.issue_section_is_active() {
+            model.context.extend([
                 "log active".to_string(),
-                "(j/k) scroll".to_string(),
-                "(h/l) section".to_string(),
-                "Pg page".to_string(),
-            ]
+                key_hint("j/k", "scroll"),
+                key_hint("h/l", "section"),
+                key_hint("Pg", "page"),
+            ]);
         } else if app.issue_section_sel == 3 {
-            vec![
+            model.context.extend([
                 "issue detail".to_string(),
-                "(j/k) section".to_string(),
-                "(h/l) section".to_string(),
-                "(Enter) scroll log".to_string(),
-            ]
+                key_hint("j/k", "section"),
+                key_hint("h/l", "section"),
+                key_hint("Enter", "scroll log"),
+            ]);
         } else {
-            vec![
+            model.context.extend([
                 "issue detail".to_string(),
-                "(j/k) section".to_string(),
-                "(h/l) section".to_string(),
-                "(Enter) activate".to_string(),
-            ]
-        };
-        parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
+                key_hint("j/k", "section"),
+                key_hint("h/l", "section"),
+                key_hint("Enter", "activate"),
+            ]);
+        }
+        model
+            .context
+            .extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
         let esc = if app.issue_section_is_active() {
-            "(Esc) section"
+            key_hint("Esc", "section")
         } else if app.issue_return_focus == crate::app::Focus::ProjectKanban {
-            "(Esc) kanban"
+            key_hint("Esc", "kanban")
         } else {
-            "(Esc) left"
+            key_hint("Esc", "left")
         };
-        parts.push(esc.to_string());
-        return format!("{prefix}{}", parts.join(" · "));
+        model.context.push(esc);
+        return model;
     }
 
-    let mut parts = footer_parts(app, ["(j/k) move", "([/]) project"]);
-    parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-    parts.extend(["(Tab) view", "(Q) stop+quit"].map(str::to_string));
-    parts.join(" · ")
+    model
+        .context
+        .extend([key_hint("j/k", "move"), key_hint("[/]", "project")]);
+    model
+        .context
+        .extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
+    model
 }
 
-fn footer_prefix(app: &App) -> &'static str {
-    if app.connected {
-        ""
+fn global_footer_hints() -> Vec<String> {
+    vec![
+        key_hint("Tab", "view"),
+        key_hint("Ctrl-,", "config"),
+        key_hint("q", "quit"),
+        key_hint("Q", "stop+quit"),
+        format!("v{}", env!("CARGO_PKG_VERSION")),
+    ]
+}
+
+fn key_hint(key: &str, label: &str) -> String {
+    let mut chars = label.chars();
+    if key.chars().count() == 1
+        && chars
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(&key.chars().next().unwrap()))
+    {
+        format!("({key}){}", chars.as_str())
     } else {
-        "offline · "
+        format!("({key}) {label}")
     }
-}
-
-fn footer_parts<const N: usize>(app: &App, parts: [&str; N]) -> Vec<String> {
-    let mut out = Vec::new();
-    if !app.connected {
-        out.push("offline".to_string());
-    }
-    out.extend(parts.map(str::to_string));
-    out
 }
 
 fn draw_form(frame: &mut Frame, app: &App) {
@@ -458,6 +526,7 @@ pub(crate) fn render_list(
 
 #[cfg(test)]
 mod tests {
+    use super::{footer_model, key_hint};
     use crate::app::{App, View};
     use crate::ui::draw;
     use auwsx_core::agent::ExitKind;
@@ -625,5 +694,34 @@ mod tests {
     #[test]
     fn draw_empty_app_renders_project_row() {
         assert!(rendered_empty_app().contains("Project"));
+    }
+
+    #[test]
+    fn given_matching_single_key_when_key_hint_then_parenthesizes_initial() {
+        assert_eq!(key_hint("m", "move"), "(m)ove");
+        assert_eq!(key_hint("E", "execute"), "(E)xecute");
+    }
+
+    #[test]
+    fn given_nonmatching_or_compound_key_when_key_hint_then_key_is_separate() {
+        assert_eq!(key_hint("Ctrl-,", "config"), "(Ctrl-,) config");
+        assert_eq!(key_hint("Enter", "open"), "(Enter) open");
+    }
+
+    #[test]
+    fn given_default_footer_when_modeled_then_context_and_global_hints_are_separate() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.connected = true;
+
+        let model = footer_model(&app);
+        let context = model.context_text();
+        let global = model.global_text();
+
+        assert!(context.contains("(a)dd project"));
+        assert!(!context.contains("(q)uit"));
+        assert!(!context.contains("(Tab) view"));
+        assert!(global.contains("(q)uit"));
+        assert!(global.contains("(Tab) view"));
+        assert!(global.contains("(Ctrl-,) config"));
     }
 }
