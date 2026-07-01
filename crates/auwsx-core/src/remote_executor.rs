@@ -5,9 +5,9 @@
 //! instead of applying old assumptions.
 
 use crate::db::remote::{
-    self, NewRemoteSyncRun, ProjectRemoteConfig, RemoteIssueLink, RemotePrLink, RemotePrState,
-    RemoteProvider, RemoteSyncDirection, RemoteSyncKind, RemoteSyncRun, RemoteSyncStatus,
-    UpsertRemoteIssueLink, UpsertRemotePrLink,
+    self, NewRemoteSyncRun, ProjectRemoteConfig, RemoteIssueLink, RemotePrCheckStatus,
+    RemotePrLink, RemotePrState, RemoteProvider, RemoteSyncDirection, RemoteSyncKind,
+    RemoteSyncRun, RemoteSyncStatus, UpsertRemoteIssueLink, UpsertRemotePrLink,
 };
 use crate::db::{issues, Issue};
 use crate::remote_plan::{self, RemotePlannedAction, RemoteWorkflowInput, RemoteWorkflowPlan};
@@ -56,6 +56,10 @@ pub struct CreatedRemotePr {
     pub base_branch: String,
     pub base_sha: Option<String>,
     pub state: RemotePrState,
+    pub check_status: RemotePrCheckStatus,
+    pub check_summary: Option<String>,
+    pub merge_state_status: Option<String>,
+    pub review_decision: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +161,10 @@ impl RemoteProviderExecutor for GithubCliRemoteExecutor {
                     base_branch: base_branch.clone(),
                     base_sha: None,
                     state: RemotePrState::Open,
+                    check_status: RemotePrCheckStatus::Unknown,
+                    check_summary: None,
+                    merge_state_status: None,
+                    review_decision: None,
                 }))
             }
             RemotePlannedAction::PostProgressComment { target, body, .. } => {
@@ -321,6 +329,10 @@ async fn observe_issue_pull_request(
             base_branch: &observed.base_branch,
             base_sha: observed.base_sha.as_deref(),
             state: observed.state,
+            check_status: observed.check_status,
+            check_summary: observed.check_summary.as_deref(),
+            merge_state_status: observed.merge_state_status.as_deref(),
+            review_decision: observed.review_decision.as_deref(),
             last_synced_at: Some(now),
         },
         now,
@@ -497,6 +509,10 @@ async fn execute_claimed_sync_run(
                     base_branch: &created.base_branch,
                     base_sha: created.base_sha.as_deref(),
                     state: created.state,
+                    check_status: created.check_status,
+                    check_summary: created.check_summary.as_deref(),
+                    merge_state_status: created.merge_state_status.as_deref(),
+                    review_decision: created.review_decision.as_deref(),
                     last_synced_at: Some(now),
                 },
                 now,
@@ -619,7 +635,7 @@ fn gh_pr_view_args(config: &ProjectRemoteConfig, selector: &str) -> Vec<String> 
         "--repo".to_string(),
         repo_slug(config),
         "--json".to_string(),
-        "number,url,id,state,headRefName,baseRefName,headRefOid,baseRefOid".to_string(),
+        "number,url,id,state,headRefName,baseRefName,headRefOid,baseRefOid,statusCheckRollup,mergeStateStatus,reviewDecision".to_string(),
     ]
 }
 
@@ -696,7 +712,103 @@ fn parse_pr_view_json(text: &str) -> Result<CreatedRemotePr> {
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned),
         state,
+        check_status: parse_check_status(value.get("statusCheckRollup")),
+        check_summary: check_summary(value.get("statusCheckRollup")),
+        merge_state_status: value
+            .get("mergeStateStatus")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
+        review_decision: value
+            .get("reviewDecision")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
     })
+}
+
+fn parse_check_status(value: Option<&Value>) -> RemotePrCheckStatus {
+    let mut tokens = Vec::new();
+    if let Some(value) = value {
+        collect_check_tokens(value, &mut tokens);
+    }
+    classify_check_tokens(&tokens)
+}
+
+fn check_summary(value: Option<&Value>) -> Option<String> {
+    let mut tokens = Vec::new();
+    if let Some(value) = value {
+        collect_check_tokens(value, &mut tokens);
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut success = 0usize;
+    let mut pending = 0usize;
+    let mut failure = 0usize;
+    let mut unknown = 0usize;
+    for token in &tokens {
+        match classify_check_tokens(std::slice::from_ref(token)) {
+            RemotePrCheckStatus::Success => success += 1,
+            RemotePrCheckStatus::Pending => pending += 1,
+            RemotePrCheckStatus::Failure => failure += 1,
+            RemotePrCheckStatus::Unknown => unknown += 1,
+        }
+    }
+    Some(format!(
+        "{success} success, {pending} pending, {failure} failure, {unknown} unknown"
+    ))
+}
+
+fn collect_check_tokens(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_check_tokens(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["conclusion", "state", "status"] {
+                if let Some(token) = map.get(key).and_then(|v| v.as_str()) {
+                    out.push(token.to_ascii_uppercase());
+                }
+            }
+            if let Some(nodes) = map.get("nodes") {
+                collect_check_tokens(nodes, out);
+            }
+            if let Some(contexts) = map.get("contexts") {
+                collect_check_tokens(contexts, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn classify_check_tokens(tokens: &[String]) -> RemotePrCheckStatus {
+    if tokens.is_empty() {
+        return RemotePrCheckStatus::Unknown;
+    }
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "FAILURE" | "FAILED" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED"
+        )
+    }) {
+        return RemotePrCheckStatus::Failure;
+    }
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "PENDING" | "QUEUED" | "IN_PROGRESS" | "WAITING" | "REQUESTED" | "EXPECTED"
+        )
+    }) {
+        return RemotePrCheckStatus::Pending;
+    }
+    if tokens
+        .iter()
+        .all(|token| matches!(token.as_str(), "SUCCESS" | "SKIPPED" | "NEUTRAL"))
+    {
+        return RemotePrCheckStatus::Success;
+    }
+    RemotePrCheckStatus::Unknown
 }
 
 fn parse_github_number(url: &str, segment: &str) -> Result<i64> {
@@ -757,6 +869,10 @@ mod tests {
                     base_branch,
                     base_sha: None,
                     state: RemotePrState::Open,
+                    check_status: RemotePrCheckStatus::Unknown,
+                    check_summary: None,
+                    merge_state_status: None,
+                    review_decision: None,
                 })),
                 RemotePlannedAction::PostProgressComment { .. } => {
                     Ok(RemoteProviderEffect::Comment)
@@ -778,6 +894,10 @@ mod tests {
                 base_branch: pr_link.base_branch.clone(),
                 base_sha: pr_link.base_sha.clone(),
                 state: self.observed_state.unwrap_or(pr_link.state),
+                check_status: pr_link.check_status,
+                check_summary: pr_link.check_summary.clone(),
+                merge_state_status: pr_link.merge_state_status.clone(),
+                review_decision: pr_link.review_decision.clone(),
             })
         }
     }
@@ -898,6 +1018,10 @@ mod tests {
                 base_branch: "main",
                 base_sha: None,
                 state,
+                check_status: RemotePrCheckStatus::Unknown,
+                check_summary: None,
+                merge_state_status: None,
+                review_decision: None,
                 last_synced_at: Some(TS),
             },
             TS,
@@ -1105,6 +1229,88 @@ mod tests {
         assert_eq!(
             parse_github_number("https://github.com/acme/app/pull/12", "pull").unwrap(),
             12
+        );
+    }
+
+    #[test]
+    fn given_pr_view_json_with_failing_check_when_parsed_then_check_status_failure() {
+        let pr = parse_pr_view_json(
+            r#"{
+              "number": 12,
+              "id": "PR_kw",
+              "url": "https://github.com/acme/app/pull/12",
+              "state": "OPEN",
+              "headRefName": "auwsx/issue-1",
+              "headRefOid": "head",
+              "baseRefName": "main",
+              "baseRefOid": "base",
+              "mergeStateStatus": "BLOCKED",
+              "reviewDecision": "REVIEW_REQUIRED",
+              "statusCheckRollup": [
+                {"state": "SUCCESS"},
+                {"conclusion": "FAILURE"},
+                {"status": "QUEUED"}
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(pr.check_status, RemotePrCheckStatus::Failure);
+        assert_eq!(
+            pr.check_summary.as_deref(),
+            Some("1 success, 1 pending, 1 failure, 0 unknown")
+        );
+        assert_eq!(pr.merge_state_status.as_deref(), Some("BLOCKED"));
+        assert_eq!(pr.review_decision.as_deref(), Some("REVIEW_REQUIRED"));
+    }
+
+    #[test]
+    fn given_pr_view_json_with_nested_pending_checks_when_parsed_then_pending() {
+        let pr = parse_pr_view_json(
+            r#"{
+              "number": 13,
+              "url": "https://github.com/acme/app/pull/13",
+              "state": "OPEN",
+              "headRefName": "auwsx/issue-2",
+              "baseRefName": "main",
+              "statusCheckRollup": {
+                "nodes": [
+                  {"conclusion": "SUCCESS"},
+                  {"state": "IN_PROGRESS"}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(pr.check_status, RemotePrCheckStatus::Pending);
+        assert_eq!(
+            pr.check_summary.as_deref(),
+            Some("1 success, 1 pending, 0 failure, 0 unknown")
+        );
+    }
+
+    #[test]
+    fn given_pr_view_json_with_all_green_checks_when_parsed_then_success() {
+        let pr = parse_pr_view_json(
+            r#"{
+              "number": 14,
+              "url": "https://github.com/acme/app/pull/14",
+              "state": "OPEN",
+              "headRefName": "auwsx/issue-3",
+              "baseRefName": "main",
+              "statusCheckRollup": [
+                {"conclusion": "SUCCESS"},
+                {"conclusion": "SKIPPED"}
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(pr.check_status, RemotePrCheckStatus::Success);
+        assert_eq!(
+            pr.check_summary.as_deref(),
+            Some("2 success, 0 pending, 0 failure, 0 unknown")
         );
     }
 }

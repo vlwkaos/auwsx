@@ -7,7 +7,7 @@ use auwsx_core::backlog::{Approval, BacklogItem};
 use auwsx_core::db::agent_runs::AgentRun;
 use auwsx_core::db::findings::Finding;
 use auwsx_core::db::issues::Issue;
-use auwsx_core::db::remote::{RemoteSyncRun, RemoteSyncStatus};
+use auwsx_core::db::remote::{RemotePrLink, RemoteSyncRun, RemoteSyncStatus};
 use auwsx_core::db::subtasks::Subtask;
 use auwsx_core::state::{IssueStatus, ProgressLane};
 use auwsx_core::steering::Steering;
@@ -202,6 +202,7 @@ pub(crate) fn issue_summary_rows(
     findings: &[Finding],
     steering: &[Steering],
     runs: &[AgentRun],
+    remote_pr_link: Option<&RemotePrLink>,
 ) -> Vec<SummaryRow> {
     let mut rows = vec![
         summary_row("status", issue_status_text(issue.status)),
@@ -210,6 +211,9 @@ pub(crate) fn issue_summary_rows(
             first_nonempty_line(issue.description.as_deref().unwrap_or(&issue.title)),
         ),
     ];
+    if let Some(link) = remote_pr_link {
+        rows.push(summary_row("remote pr", remote_pr_summary(link)));
+    }
     push_optional_report(&mut rows, "agent summary", issue.agent_summary.as_deref());
     push_optional_report(&mut rows, "progress", issue.progress_report.as_deref());
     push_optional_report(&mut rows, "result", issue.result_report.as_deref());
@@ -269,6 +273,30 @@ pub(crate) fn issue_summary_rows(
         ));
     }
     rows
+}
+
+fn remote_pr_summary(link: &RemotePrLink) -> String {
+    let mut parts = vec![
+        format!("#{}", link.remote_pr_number),
+        link.state.as_str().to_string(),
+        format!("checks {}", link.check_status.as_str()),
+    ];
+    if let Some(summary) = link
+        .check_summary
+        .as_deref()
+        .map(first_nonempty_line)
+        .filter(|line| !line.is_empty())
+    {
+        parts.push(summary);
+    }
+    if let Some(merge) = link.merge_state_status.as_deref() {
+        parts.push(format!("merge {merge}"));
+    }
+    if let Some(review) = link.review_decision.as_deref() {
+        parts.push(format!("review {review}"));
+    }
+    parts.push(link.remote_url.clone());
+    parts.join(" · ")
 }
 
 pub(crate) fn remote_sync_summary(runs: &[RemoteSyncRun], limit: usize) -> RemoteSyncSummary {
@@ -476,7 +504,9 @@ mod tests {
     use auwsx_core::agent::ExitKind;
     use auwsx_core::backlog::Source;
     use auwsx_core::db::agent_runs::Role;
-    use auwsx_core::db::remote::{RemoteSyncDirection, RemoteSyncKind};
+    use auwsx_core::db::remote::{
+        RemotePrCheckStatus, RemotePrState, RemoteProvider, RemoteSyncDirection, RemoteSyncKind,
+    };
 
     const TS: i64 = 1_000_000;
 
@@ -533,6 +563,32 @@ mod tests {
             started_at: Some(TS),
             ended_at: Some(TS + 1),
             created_at: TS,
+        }
+    }
+
+    fn remote_pr_link(check_status: RemotePrCheckStatus) -> RemotePrLink {
+        RemotePrLink {
+            id: 1,
+            project_id: 1,
+            issue_id: 7,
+            provider: RemoteProvider::Github,
+            remote_owner: "acme".to_string(),
+            remote_repo: "app".to_string(),
+            remote_pr_number: 42,
+            remote_node_id: None,
+            remote_url: "https://github.com/acme/app/pull/42".to_string(),
+            head_branch: "auwsx/issue-7".to_string(),
+            head_sha: Some("head".to_string()),
+            base_branch: "main".to_string(),
+            base_sha: Some("base".to_string()),
+            state: RemotePrState::Open,
+            check_status,
+            check_summary: Some("1 success, 0 pending, 1 failure, 0 unknown".to_string()),
+            merge_state_status: Some("BLOCKED".to_string()),
+            review_decision: Some("REVIEW_REQUIRED".to_string()),
+            last_synced_at: Some(TS),
+            created_at: TS,
+            updated_at: TS,
         }
     }
 
@@ -708,7 +764,7 @@ mod tests {
             note: None,
         }];
 
-        let rows = issue_summary_rows(&issue, &subtasks, &[], &[], &runs);
+        let rows = issue_summary_rows(&issue, &subtasks, &[], &[], &runs, None);
 
         assert!(rows
             .iter()
@@ -722,6 +778,23 @@ mod tests {
         }));
         assert!(rows.iter().any(|row| {
             row.label == "latest run" && row.value == "#9 work WORKING exited:0 -> REVIEWING"
+        }));
+    }
+
+    #[test]
+    fn given_remote_pr_link_when_issue_rows_requested_then_check_status_is_visible() {
+        let issue = issue(7, IssueStatus::ReadyToMerge);
+        let link = remote_pr_link(RemotePrCheckStatus::Failure);
+
+        let rows = issue_summary_rows(&issue, &[], &[], &[], &[], Some(&link));
+
+        assert!(rows.iter().any(|row| {
+            row.label == "remote pr"
+                && row.value.contains("#42")
+                && row.value.contains("checks failure")
+                && row.value.contains("merge BLOCKED")
+                && row.value.contains("review REVIEW_REQUIRED")
+                && row.value.contains("https://github.com/acme/app/pull/42")
         }));
     }
 

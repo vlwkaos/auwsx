@@ -107,6 +107,42 @@ impl RemotePrState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RemotePrCheckStatus {
+    Unknown,
+    Pending,
+    Success,
+    Failure,
+}
+
+impl RemotePrCheckStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemotePrCheckStatus::Unknown => "unknown",
+            RemotePrCheckStatus::Pending => "pending",
+            RemotePrCheckStatus::Success => "success",
+            RemotePrCheckStatus::Failure => "failure",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "unknown" => RemotePrCheckStatus::Unknown,
+            "pending" => RemotePrCheckStatus::Pending,
+            "success" => RemotePrCheckStatus::Success,
+            "failure" => RemotePrCheckStatus::Failure,
+            _ => return None,
+        })
+    }
+}
+
+impl Default for RemotePrCheckStatus {
+    fn default() -> Self {
+        RemotePrCheckStatus::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RemoteEventStatus {
     Received,
     Processed,
@@ -319,6 +355,14 @@ pub struct RemotePrLink {
     pub base_branch: String,
     pub base_sha: Option<String>,
     pub state: RemotePrState,
+    #[serde(default)]
+    pub check_status: RemotePrCheckStatus,
+    #[serde(default)]
+    pub check_summary: Option<String>,
+    #[serde(default)]
+    pub merge_state_status: Option<String>,
+    #[serde(default)]
+    pub review_decision: Option<String>,
     pub last_synced_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -339,6 +383,10 @@ pub struct UpsertRemotePrLink<'a> {
     pub base_branch: &'a str,
     pub base_sha: Option<&'a str>,
     pub state: RemotePrState,
+    pub check_status: RemotePrCheckStatus,
+    pub check_summary: Option<&'a str>,
+    pub merge_state_status: Option<&'a str>,
+    pub review_decision: Option<&'a str>,
     pub last_synced_at: Option<i64>,
 }
 
@@ -575,8 +623,9 @@ pub async fn upsert_pr_link(
         "INSERT INTO remote_pr_links
             (project_id, issue_id, provider, remote_owner, remote_repo, remote_pr_number,
              remote_node_id, remote_url, head_branch, head_sha, base_branch, base_sha, state,
+             check_status, check_summary, merge_state_status, review_decision,
              last_synced_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(issue_id) DO UPDATE SET
             provider = excluded.provider,
             remote_owner = excluded.remote_owner,
@@ -589,6 +638,10 @@ pub async fn upsert_pr_link(
             base_branch = excluded.base_branch,
             base_sha = excluded.base_sha,
             state = excluded.state,
+            check_status = excluded.check_status,
+            check_summary = excluded.check_summary,
+            merge_state_status = excluded.merge_state_status,
+            review_decision = excluded.review_decision,
             last_synced_at = excluded.last_synced_at,
             updated_at = excluded.updated_at
          RETURNING id",
@@ -606,6 +659,10 @@ pub async fn upsert_pr_link(
     .bind(input.base_branch)
     .bind(input.base_sha)
     .bind(input.state.as_str())
+    .bind(input.check_status.as_str())
+    .bind(trimmed_opt(input.check_summary))
+    .bind(trimmed_opt(input.merge_state_status))
+    .bind(trimmed_opt(input.review_decision))
     .bind(input.last_synced_at)
     .bind(now)
     .bind(now)
@@ -922,6 +979,7 @@ fn issue_link_from_row(row: &SqliteRow) -> Result<RemoteIssueLink> {
 fn pr_link_from_row(row: &SqliteRow) -> Result<RemotePrLink> {
     let provider: String = row.try_get("provider")?;
     let state: String = row.try_get("state")?;
+    let check_status: String = row.try_get("check_status")?;
     Ok(RemotePrLink {
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
@@ -939,6 +997,11 @@ fn pr_link_from_row(row: &SqliteRow) -> Result<RemotePrLink> {
         base_sha: row.try_get("base_sha")?,
         state: RemotePrState::from_str(&state)
             .ok_or_else(|| anyhow!("unknown remote PR state {state:?}"))?,
+        check_status: RemotePrCheckStatus::from_str(&check_status)
+            .ok_or_else(|| anyhow!("unknown remote PR check status {check_status:?}"))?,
+        check_summary: row.try_get("check_summary")?,
+        merge_state_status: row.try_get("merge_state_status")?,
+        review_decision: row.try_get("review_decision")?,
         last_synced_at: row.try_get("last_synced_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,

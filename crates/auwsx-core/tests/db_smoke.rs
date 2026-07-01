@@ -9,8 +9,8 @@
 //! single bad value is the only possible reason for rejection.
 
 use auwsx_core::db::remote::{
-    self, RecordRemoteEvent, RemoteAuthKind, RemotePrState, RemoteProvider, RequiredChecksPolicy,
-    UpsertProjectRemoteConfig, UpsertRemoteIssueLink, UpsertRemotePrLink,
+    self, RecordRemoteEvent, RemoteAuthKind, RemotePrCheckStatus, RemotePrState, RemoteProvider,
+    RequiredChecksPolicy, UpsertProjectRemoteConfig, UpsertRemoteIssueLink, UpsertRemotePrLink,
 };
 use auwsx_core::db::Db;
 use sqlx::{Row, SqlitePool};
@@ -412,7 +412,10 @@ async fn given_existing_issue_pr_link_when_upserted_again_then_fetch_returns_upd
     let db = Db::open_memory().await?;
     let project_id = insert_project(db.pool(), "remote-pr").await?;
     let issue_id = insert_issue(db.pool(), project_id, "PLANNING").await?;
-    for number in [10, 11] {
+    for (number, check_status) in [
+        (10, RemotePrCheckStatus::Success),
+        (11, RemotePrCheckStatus::Failure),
+    ] {
         remote::upsert_pr_link(
             db.pool(),
             UpsertRemotePrLink {
@@ -429,6 +432,10 @@ async fn given_existing_issue_pr_link_when_upserted_again_then_fetch_returns_upd
                 base_branch: "main",
                 base_sha: None,
                 state: RemotePrState::Open,
+                check_status,
+                check_summary: Some("check summary"),
+                merge_state_status: None,
+                review_decision: None,
                 last_synced_at: None,
             },
             TS + number,
@@ -440,6 +447,8 @@ async fn given_existing_issue_pr_link_when_upserted_again_then_fetch_returns_upd
         .await?
         .expect("remote PR link");
     assert_eq!(got.remote_pr_number, 11);
+    assert_eq!(got.check_status, RemotePrCheckStatus::Failure);
+    assert_eq!(got.check_summary.as_deref(), Some("check summary"));
     Ok(())
 }
 

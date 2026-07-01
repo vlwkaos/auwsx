@@ -28,8 +28,8 @@ use crate::db::{
         self, CompletionPolicy, MergeMode, NewProject, Project, UpdateProject as ProjectUpdate,
     },
     remote::{
-        self, ProjectRemoteConfig, RemoteAuthKind, RemoteProvider, RemoteSyncRun,
-        RequiredChecksPolicy, UpsertProjectRemoteConfig,
+        self, ProjectRemoteConfig, RemoteAuthKind, RemoteIssueLink, RemotePrLink, RemoteProvider,
+        RemoteSyncRun, RequiredChecksPolicy, UpsertProjectRemoteConfig,
     },
     scheduler_runs::{self, SchedulerRun},
     subtasks::{self, Subtask},
@@ -238,6 +238,9 @@ pub enum Command {
         limit: i64,
     },
     PlanIssueRemoteWorkflow {
+        issue_id: i64,
+    },
+    GetIssueRemoteLinks {
         issue_id: i64,
     },
     ProcessRemoteAuwsxRun {
@@ -502,8 +505,15 @@ pub enum Response {
     ProjectRemoteConfig(Option<ProjectRemoteConfig>),
     RemoteSyncRuns(Vec<RemoteSyncRun>),
     IssueRemoteWorkflowPlan(RemoteWorkflowPlan),
+    IssueRemoteLinks(IssueRemoteLinks),
     RemoteInboundOutcome(RemoteInboundOutcome),
     Event(Event),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueRemoteLinks {
+    pub issue_link: Option<RemoteIssueLink>,
+    pub pr_link: Option<RemotePrLink>,
 }
 
 impl Response {
@@ -896,6 +906,10 @@ async fn dispatch_inner(
                 },
             ))
         }
+        Command::GetIssueRemoteLinks { issue_id } => Response::IssueRemoteLinks(IssueRemoteLinks {
+            issue_link: remote::issue_link_by_issue(pool, issue_id).await?,
+            pr_link: remote::pr_link_by_issue(pool, issue_id).await?,
+        }),
         Command::ProcessRemoteAuwsxRun {
             provider,
             delivery_id,

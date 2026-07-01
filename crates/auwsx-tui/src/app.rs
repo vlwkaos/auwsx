@@ -30,7 +30,7 @@ use auwsx_core::db::remote::{
 use auwsx_core::db::scheduler_runs::{SchedulerRun, SchedulerRunSource};
 use auwsx_core::db::subtasks::Subtask;
 use auwsx_core::events::Event;
-use auwsx_core::ipc::{self, Command, Response};
+use auwsx_core::ipc::{self, Command, IssueRemoteLinks, Response};
 use auwsx_core::main_jobs::MainJob;
 use auwsx_core::reconcile::ProjectReconcileReport;
 use auwsx_core::routines::{OutputRoute, Routine};
@@ -200,6 +200,7 @@ pub struct IssueDetail {
     pub findings: Vec<Finding>,
     pub steering: Vec<Steering>,
     pub runs: Vec<AgentRun>,
+    pub remote_links: Option<IssueRemoteLinks>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2515,6 +2516,12 @@ impl App {
             .await?
         {
             d.steering = st;
+        }
+        if let Response::IssueRemoteLinks(links) = self
+            .req(Command::GetIssueRemoteLinks { issue_id: iid })
+            .await?
+        {
+            d.remote_links = Some(links);
         }
         self.detail = d;
         self.refresh_issue_runs_and_tail().await?;

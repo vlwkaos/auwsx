@@ -1366,6 +1366,21 @@ fn print_response(resp: Response) -> bool {
                 println!("blocker\t{blocker:?}");
             }
         }
+        Response::IssueRemoteLinks(links) => {
+            if let Some(link) = links.issue_link {
+                println!("issue\t#{}\t{}", link.remote_issue_number, link.remote_url);
+            }
+            if let Some(link) = links.pr_link {
+                println!(
+                    "pr\t#{}\t{}\tchecks={}\t{}\t{}",
+                    link.remote_pr_number,
+                    link.state.as_str(),
+                    link.check_status.as_str(),
+                    link.check_summary.unwrap_or_default(),
+                    link.remote_url
+                );
+            }
+        }
         Response::RemoteInboundOutcome(outcome) => println!("{outcome:?}"),
         Response::LogTail { path, text } => {
             println!("==> {path}");

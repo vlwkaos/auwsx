@@ -186,6 +186,10 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
         &app.detail.findings,
         &app.detail.steering,
         &app.detail.runs,
+        app.detail
+            .remote_links
+            .as_ref()
+            .and_then(|links| links.pr_link.as_ref()),
     )
     .into_iter()
     .map(|row| kv(row.label, &truncate_text(&row.value, 160)))

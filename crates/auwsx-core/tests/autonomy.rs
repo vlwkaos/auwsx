@@ -31,8 +31,8 @@ use auwsx_core::db::agent_runs::{self, Role, StartRun};
 use auwsx_core::db::issues::{self, Issue};
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode, NewProject, Project};
 use auwsx_core::db::remote::{
-    self, ProjectRemoteConfig, RemoteAuthKind, RemotePrLink, RemotePrState, RemoteProvider,
-    RemoteSyncDirection, RemoteSyncKind, RemoteSyncStatus, RequiredChecksPolicy,
+    self, ProjectRemoteConfig, RemoteAuthKind, RemotePrCheckStatus, RemotePrLink, RemotePrState,
+    RemoteProvider, RemoteSyncDirection, RemoteSyncKind, RemoteSyncStatus, RequiredChecksPolicy,
     UpsertProjectRemoteConfig, UpsertRemotePrLink,
 };
 use auwsx_core::db::scheduler_runs;
@@ -1085,6 +1085,10 @@ impl RemoteProviderExecutor for TestRemoteExecutor {
                 base_branch,
                 base_sha: None,
                 state: auwsx_core::db::remote::RemotePrState::Open,
+                check_status: RemotePrCheckStatus::Unknown,
+                check_summary: None,
+                merge_state_status: None,
+                review_decision: None,
             })),
             RemotePlannedAction::PostProgressComment { .. } => Ok(RemoteProviderEffect::Comment),
         }
@@ -1104,6 +1108,10 @@ impl RemoteProviderExecutor for TestRemoteExecutor {
             base_branch: pr_link.base_branch.clone(),
             base_sha: pr_link.base_sha.clone(),
             state: self.observed_state.unwrap_or(pr_link.state),
+            check_status: pr_link.check_status,
+            check_summary: pr_link.check_summary.clone(),
+            merge_state_status: pr_link.merge_state_status.clone(),
+            review_decision: pr_link.review_decision.clone(),
         })
     }
 }
@@ -1605,6 +1613,10 @@ async fn given_pr_merge_project_when_remote_pr_observed_merged_then_issue_done(
             base_branch: "main",
             base_sha: None,
             state: RemotePrState::Open,
+            check_status: RemotePrCheckStatus::Unknown,
+            check_summary: None,
+            merge_state_status: None,
+            review_decision: None,
             last_synced_at: Some(TS),
         },
         TS,

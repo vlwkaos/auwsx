@@ -1105,18 +1105,24 @@ fn append_issue_summary_lines(
     app: &App,
     issue: &auwsx_core::db::issues::Issue,
 ) {
-    let (subtasks, findings, steering, runs) =
+    let (subtasks, findings, steering, runs, remote_pr_link) =
         if app.detail.issue.as_ref().map(|i| i.id) == Some(issue.id) {
             (
                 app.detail.subtasks.as_slice(),
                 app.detail.findings.as_slice(),
                 app.detail.steering.as_slice(),
                 app.detail.runs.as_slice(),
+                app.detail
+                    .remote_links
+                    .as_ref()
+                    .and_then(|links| links.pr_link.as_ref()),
             )
         } else {
-            (&[][..], &[][..], &[][..], &[][..])
+            (&[][..], &[][..], &[][..], &[][..], None)
         };
-    for row in super::vm::issue_summary_rows(issue, subtasks, findings, steering, runs) {
+    for row in
+        super::vm::issue_summary_rows(issue, subtasks, findings, steering, runs, remote_pr_link)
+    {
         lines.push(kv(row.label, &truncate_text(&row.value, 180)));
     }
 }

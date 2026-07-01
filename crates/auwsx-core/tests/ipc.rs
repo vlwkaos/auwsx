@@ -20,8 +20,9 @@ use auwsx_core::db::findings::Severity;
 use auwsx_core::db::global_settings::{GlobalSettings, PIPELINE_UX_GUIDANCE_MAX_CHARS};
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode};
 use auwsx_core::db::remote::{
-    self, NewRemoteSyncRun, RemoteAuthKind, RemoteProvider, RemoteSyncDirection, RemoteSyncKind,
-    RemoteSyncStatus, RequiredChecksPolicy,
+    self, NewRemoteSyncRun, RemoteAuthKind, RemotePrCheckStatus, RemotePrState, RemoteProvider,
+    RemoteSyncDirection, RemoteSyncKind, RemoteSyncStatus, RequiredChecksPolicy,
+    UpsertRemotePrLink,
 };
 use auwsx_core::db::scheduler_runs::{self, SchedulerRunSource};
 use auwsx_core::db::{issues, subtasks, Db};
@@ -106,6 +107,13 @@ fn want_issue_remote_workflow_plan(r: Response) -> auwsx_core::remote_plan::Remo
     match r {
         Response::IssueRemoteWorkflowPlan(plan) => plan,
         other => panic!("expected Response::IssueRemoteWorkflowPlan, got {other:?}"),
+    }
+}
+
+fn want_issue_remote_links(r: Response) -> auwsx_core::ipc::IssueRemoteLinks {
+    match r {
+        Response::IssueRemoteLinks(links) => links,
+        other => panic!("expected Response::IssueRemoteLinks, got {other:?}"),
     }
 }
 
@@ -1199,6 +1207,51 @@ async fn given_issue_when_remote_workflow_plan_dispatched_then_plan_response() -
     Ok(())
 }
 
+#[tokio::test]
+async fn given_issue_remote_links_when_dispatched_then_pr_check_status_is_returned(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let project_id = backlog_seed_project(&db).await?;
+    let issue_id = issues::create(db.pool(), project_id, "Remote PR checks", None, TS).await?;
+    remote::upsert_pr_link(
+        db.pool(),
+        UpsertRemotePrLink {
+            project_id,
+            issue_id,
+            provider: RemoteProvider::Github,
+            remote_owner: "acme",
+            remote_repo: "repo",
+            remote_pr_number: 99,
+            remote_node_id: None,
+            remote_url: "https://github.com/acme/repo/pull/99",
+            head_branch: "auwsx/issue-99",
+            head_sha: None,
+            base_branch: "main",
+            base_sha: None,
+            state: RemotePrState::Open,
+            check_status: RemotePrCheckStatus::Failure,
+            check_summary: Some("0 success, 0 pending, 1 failure, 0 unknown"),
+            merge_state_status: Some("BLOCKED"),
+            review_decision: Some("REVIEW_REQUIRED"),
+            last_synced_at: Some(TS),
+        },
+        TS,
+    )
+    .await?;
+
+    let links = want_issue_remote_links(
+        ipc::dispatch(&db, &bus, TS, Command::GetIssueRemoteLinks { issue_id }).await,
+    );
+
+    let pr = links.pr_link.expect("pr link");
+    assert_eq!(pr.remote_pr_number, 99);
+    assert_eq!(pr.check_status, RemotePrCheckStatus::Failure);
+    assert_eq!(pr.merge_state_status.as_deref(), Some("BLOCKED"));
+    assert_eq!(pr.review_decision.as_deref(), Some("REVIEW_REQUIRED"));
+    Ok(())
+}
+
 #[test]
 fn given_remote_inbound_command_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
     let command = Command::ProcessRemoteAuwsxRun {
@@ -1220,6 +1273,45 @@ fn given_remote_inbound_command_when_json_roundtripped_then_unchanged() -> anyho
     let got: Command = serde_json::from_str(&json)?;
 
     assert_eq!(got, command);
+    Ok(())
+}
+
+#[test]
+fn given_legacy_issue_remote_links_response_when_json_decoded_then_check_status_defaults_unknown(
+) -> anyhow::Result<()> {
+    let json = r#"{
+      "kind": "issue_remote_links",
+      "data": {
+        "issue_link": null,
+        "pr_link": {
+          "id": 1,
+          "project_id": 1,
+          "issue_id": 7,
+          "provider": "github",
+          "remote_owner": "acme",
+          "remote_repo": "repo",
+          "remote_pr_number": 42,
+          "remote_node_id": null,
+          "remote_url": "https://github.com/acme/repo/pull/42",
+          "head_branch": "auwsx/issue-7",
+          "head_sha": null,
+          "base_branch": "main",
+          "base_sha": null,
+          "state": "open",
+          "last_synced_at": null,
+          "created_at": 1,
+          "updated_at": 1
+        }
+      }
+    }"#;
+
+    let Response::IssueRemoteLinks(links) = serde_json::from_str::<Response>(json)? else {
+        panic!("expected issue remote links response");
+    };
+    assert_eq!(
+        links.pr_link.expect("pr link").check_status,
+        RemotePrCheckStatus::Unknown
+    );
     Ok(())
 }
 
