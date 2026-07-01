@@ -366,6 +366,28 @@ mod tests {
         }
     }
 
+    fn preview_issue(id: i64, description: Option<&str>) -> auwsx_core::db::issues::Issue {
+        auwsx_core::db::issues::Issue {
+            id,
+            project_id: 1,
+            title: format!("issue {id}"),
+            description: description.map(str::to_string),
+            agent_summary: None,
+            progress_report: None,
+            result_report: None,
+            status: IssueStatus::Planning,
+            branch: None,
+            worktree_path: None,
+            review_round: 0,
+            conflict_attempts: 0,
+            wait_until: None,
+            absorbed_into_id: None,
+            has_pending_steering: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
     fn main_job(id: i64, project_id: i64, kind: &str, status: MainJobStatus) -> MainJob {
         MainJob {
             id,
@@ -627,6 +649,23 @@ mod tests {
         assert!(text[0].contains("line 2/3"));
         assert_eq!(text[1], "  two");
         assert_eq!(text[2], "  three");
+    }
+
+    #[test]
+    fn given_kanban_issue_preview_when_description_scrolls_then_window_starts_at_offset() {
+        let mut app = App::new("socket".into());
+        app.selected_text_scroll_key = Some("issue:7:description".to_string());
+        app.selected_text_scroll_offset = 1;
+        let issue = preview_issue(7, Some("alpha\nbeta\ngamma"));
+
+        let text = kanban_issue_preview_lines(&app, &issue, 14)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text.iter().any(|line| line.contains("line 2/3")));
+        assert!(text.iter().any(|line| line == "  beta"));
+        assert!(text.iter().any(|line| line == "  gamma"));
     }
 }
 
@@ -1080,20 +1119,12 @@ fn render_kanban_preview(frame: &mut Frame, app: &App, area: Rect) {
                 lines
             })
         }
-        super::vm::KanbanPreview::Issue(issue) => {
-            panel(frame, area, &format!("Preview Issue #{}", issue.id), {
-                let mut lines = vec![
-                    kv("title", &issue.title),
-                    kv("branch", issue.branch.as_deref().unwrap_or("(none)")),
-                    kv(
-                        "worktree",
-                        issue.worktree_path.as_deref().unwrap_or("(none)"),
-                    ),
-                ];
-                append_issue_summary_lines(&mut lines, app, issue);
-                lines
-            })
-        }
+        super::vm::KanbanPreview::Issue(issue) => panel(
+            frame,
+            area,
+            &format!("Preview Issue #{}", issue.id),
+            kanban_issue_preview_lines(app, issue, area.height as usize),
+        ),
     }
 }
 
@@ -1172,6 +1203,32 @@ fn scrolling_text_lines(
         )));
     }
     out
+}
+
+fn kanban_issue_preview_lines(
+    app: &App,
+    issue: &auwsx_core::db::issues::Issue,
+    area_height: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        kv("title", &issue.title),
+        kv("branch", issue.branch.as_deref().unwrap_or("(none)")),
+        kv(
+            "worktree",
+            issue.worktree_path.as_deref().unwrap_or("(none)"),
+        ),
+    ];
+    if let Some(description) = issue.description.as_deref() {
+        lines.extend(scrolling_text_lines(
+            "description",
+            &format!("issue:{}:description", issue.id),
+            description,
+            app,
+            area_height.saturating_sub(10).max(3),
+        ));
+    }
+    append_issue_summary_lines(&mut lines, app, issue);
+    lines
 }
 
 fn append_issue_summary_lines(
