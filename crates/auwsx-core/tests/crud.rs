@@ -53,7 +53,6 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -167,7 +166,6 @@ async fn given_review_agent_cmd_some_when_created_then_review_agent_cmd_roundtri
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -198,7 +196,6 @@ async fn given_project_with_arsenal_and_blank_overrides_when_get_then_effective_
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -238,7 +235,6 @@ async fn given_linked_project_when_arsenal_updates_then_effective_commands_follo
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -287,7 +283,6 @@ async fn given_project_with_arsenal_and_manual_override_when_get_then_override_w
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -324,7 +319,6 @@ async fn given_unknown_arsenal_when_project_created_then_err() -> anyhow::Result
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -417,12 +411,11 @@ async fn given_minimal_create_when_get_then_max_concurrency_defaults_3() -> anyh
 }
 
 #[tokio::test]
-async fn given_minimal_create_when_get_then_schedule_interval_defaults_none() -> anyhow::Result<()>
-{
+async fn given_minimal_create_when_get_then_schedule_cron_defaults_none() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let id = insert_project(db.pool(), "p").await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
-    assert_eq!(p.schedule_interval_min, None);
+    assert_eq!(p.schedule_cron, None);
     Ok(())
 }
 
@@ -445,11 +438,11 @@ async fn given_minimal_create_when_get_then_skill_path_defaults_none() -> anyhow
 }
 
 #[tokio::test]
-async fn given_minimal_create_when_get_then_deepsleep_interval_defaults_7() -> anyhow::Result<()> {
+async fn given_minimal_create_when_get_then_deepsleep_cron_defaults_weekly() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let id = insert_project(db.pool(), "p").await?;
     let p = projects::get(db.pool(), id).await?.expect("project exists");
-    assert_eq!(p.deepsleep_interval_days, 7);
+    assert_eq!(p.deepsleep_cron.as_deref(), Some("0 0 * * 0"));
     Ok(())
 }
 
@@ -2372,7 +2365,6 @@ async fn given_completion_policy_some_auto_when_created_then_completion_policy_i
             completion_policy: Some(CompletionPolicy::Auto),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2402,7 +2394,6 @@ async fn given_completion_policy_some_auto_when_created_then_plan_gate_sibling_s
             completion_policy: Some(CompletionPolicy::Auto),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2432,7 +2423,6 @@ async fn given_completion_policy_some_auto_when_created_then_soft_timeout_siblin
             completion_policy: Some(CompletionPolicy::Auto),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2462,7 +2452,6 @@ async fn given_plan_gate_timeout_some_zero_when_created_then_plan_gate_is_0() ->
             completion_policy: None,
             plan_gate_timeout_min: Some(0),
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2492,7 +2481,6 @@ async fn given_plan_gate_timeout_some_zero_when_created_then_completion_policy_s
             completion_policy: None,
             plan_gate_timeout_min: Some(0),
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2522,7 +2510,6 @@ async fn given_soft_timeout_30_and_policy_soft_when_created_then_soft_timeout_is
             completion_policy: Some(CompletionPolicy::Soft),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: Some(30),
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2552,7 +2539,6 @@ async fn given_soft_timeout_30_and_policy_soft_when_created_then_completion_poli
             completion_policy: Some(CompletionPolicy::Soft),
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: Some(30),
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2582,7 +2568,6 @@ async fn given_all_three_overrides_when_created_then_each_persists_independently
             completion_policy: Some(CompletionPolicy::Soft),
             plan_gate_timeout_min: Some(0),
             completion_soft_timeout_min: Some(45),
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2621,7 +2606,6 @@ async fn given_negative_plan_gate_timeout_override_when_created_then_stored_verb
             completion_policy: None,
             plan_gate_timeout_min: Some(-5),
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2654,7 +2638,6 @@ async fn given_soft_timeout_override_alone_when_created_then_persists_and_policy
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: Some(45),
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,

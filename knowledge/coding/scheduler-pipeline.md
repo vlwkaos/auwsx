@@ -3,7 +3,7 @@ slug: scheduler-pipeline
 kind: coding
 title: autonomy loop — scheduler + pipeline via ports & adapters
 description: How the daemon drives an issue through phases using pure plan_phase/decide domain logic, pipeline::execute, Scheduler runtime, issue-scoped callbacks, and deterministic drive-loop tests.
-keywords: [scheduler, pipeline, ports and adapters, hexagonal, Clock SystemClock, AgentExecutor SubprocessExecutor, Worktrees WsxWorktrees, plan_phase, scheduler decide, Spawn SoftGate Teardown, soft_gate_due, project_due_for_auto_tick, schedule_interval_min, AUWSX_TICK_SECS, tick_project, spawn_phase running set, pipeline execute AgentSpec, agent callback AUWSX_SOCK AUWSX_ISSUE_ID, issue-local proxy allowlist, daemon wiring stop Notify, ask_project, drive loop test FixedClock ScriptedAgent, max_concurrency, spawn_blocking wsx-core, autonomy loop how does the daemon drive an issue]
+keywords: [scheduler, pipeline, ports and adapters, hexagonal, Clock SystemClock, AgentExecutor SubprocessExecutor, Worktrees WsxWorktrees, plan_phase, scheduler decide, Spawn SoftGate Teardown, soft_gate_due, project_due_for_auto_tick, schedule_cron, AUWSX_TICK_SECS, tick_project, spawn_phase running set, pipeline execute AgentSpec, agent callback AUWSX_SOCK AUWSX_ISSUE_ID, issue-local proxy allowlist, daemon wiring stop Notify, ask_project, drive loop test FixedClock ScriptedAgent, max_concurrency, spawn_blocking wsx-core, autonomy loop how does the daemon drive an issue]
 created: 2026-06-09
 modified: 2026-06-24
 ---
@@ -80,14 +80,15 @@ repo (the agent writes its own `.auwsx/` artifacts in the worktree).
 
 ## Project auto-tick cadence
 
-`projects.schedule_interval_min` controls whether the daemon evaluates a project
+`projects.schedule_cron` controls whether the daemon evaluates a project
 on the global loop:
 
 | Value | Meaning |
 |-------|---------|
-| NULL | manual only; no auto-tick, only explicit scheduler IPC commands |
-| `<= 0` | due on every global daemon loop |
-| `n > 0` | due when `now - last_auto_tick >= n * 60_000` |
+| NULL, blank, `manual`, `@manual` | manual only; no auto-tick, only explicit scheduler IPC commands |
+| `@tick` | due on every global daemon loop |
+| five-field cron | due on the next matching local wall-clock minute |
+| `@every <duration>` | due when `now - last_auto_tick` reaches the duration |
 
 The global loop cadence is `AUWSX_TICK_SECS` with default 10 seconds and a
 minimum of 1 second. A due tick only evaluates scheduler decisions; it spawns an

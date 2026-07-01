@@ -99,11 +99,9 @@ pub struct Project {
     pub review_max_rounds: i64,
     pub conflict_max_attempts: i64,
     pub max_concurrency: i64,
-    pub schedule_interval_min: Option<i64>,
     pub schedule_cron: Option<String>,
     pub merge_mode: MergeMode,
     pub skill_path: Option<String>,
-    pub deepsleep_interval_days: i64,
     pub deepsleep_cron: Option<String>,
     pub last_deepsleep_at: Option<i64>,
     pub created_at: i64,
@@ -134,8 +132,6 @@ pub struct NewProject<'a> {
     pub plan_gate_timeout_min: Option<i64>,
     /// Soft-release delay for `READY_TO_MERGE -> MERGING` under `soft`. None ⇒ DB default.
     pub completion_soft_timeout_min: Option<i64>,
-    /// Legacy autonomous cadence in minutes. `schedule_cron` is canonical.
-    pub schedule_interval_min: Option<i64>,
     /// User-facing autonomous cadence. None ⇒ DB default/manual-only.
     pub schedule_cron: Option<&'a str>,
 }
@@ -160,11 +156,9 @@ pub struct UpdateProject<'a> {
     pub review_max_rounds: i64,
     pub conflict_max_attempts: i64,
     pub max_concurrency: i64,
-    pub schedule_interval_min: Option<i64>,
     pub schedule_cron: Option<&'a str>,
     pub merge_mode: MergeMode,
     pub skill_path: Option<&'a str>,
-    pub deepsleep_interval_days: i64,
     pub deepsleep_cron: Option<&'a str>,
 }
 
@@ -219,12 +213,10 @@ impl Project {
             review_max_rounds: row.try_get("review_max_rounds")?,
             conflict_max_attempts: row.try_get("conflict_max_attempts")?,
             max_concurrency: row.try_get("max_concurrency")?,
-            schedule_interval_min: row.try_get("schedule_interval_min")?,
             schedule_cron: row.try_get("schedule_cron")?,
             merge_mode: MergeMode::from_str(&merge_raw)
                 .ok_or_else(|| anyhow!("unknown merge_mode {merge_raw:?} in db"))?,
             skill_path: row.try_get("skill_path")?,
-            deepsleep_interval_days: row.try_get("deepsleep_interval_days")?,
             deepsleep_cron: row.try_get("deepsleep_cron")?,
             last_deepsleep_at: row.try_get("last_deepsleep_at")?,
             created_at: row.try_get("created_at")?,
@@ -261,11 +253,9 @@ const PROJECT_SELECT: &str = "
         p.review_max_rounds,
         p.conflict_max_attempts,
         p.max_concurrency,
-        p.schedule_interval_min,
         p.schedule_cron,
         p.merge_mode,
         p.skill_path,
-        p.deepsleep_interval_days,
         p.deepsleep_cron,
         p.last_deepsleep_at,
         p.created_at
@@ -360,7 +350,6 @@ pub async fn create(pool: &SqlitePool, new: NewProject<'_>, now: i64) -> Result<
     if new.completion_policy.is_some()
         || new.plan_gate_timeout_min.is_some()
         || new.completion_soft_timeout_min.is_some()
-        || new.schedule_interval_min.is_some()
         || schedule_cron.is_some()
     {
         sqlx::query(
@@ -368,14 +357,12 @@ pub async fn create(pool: &SqlitePool, new: NewProject<'_>, now: i64) -> Result<
                 completion_policy = COALESCE(?, completion_policy),
                 plan_gate_timeout_min = COALESCE(?, plan_gate_timeout_min),
                 completion_soft_timeout_min = COALESCE(?, completion_soft_timeout_min),
-                schedule_interval_min = COALESCE(?, schedule_interval_min),
                 schedule_cron = COALESCE(?, schedule_cron)
              WHERE id = ?",
         )
         .bind(new.completion_policy.map(|p| p.as_str()))
         .bind(new.plan_gate_timeout_min)
         .bind(new.completion_soft_timeout_min)
-        .bind(new.schedule_interval_min)
         .bind(schedule_cron)
         .bind(id)
         .execute(pool)
@@ -427,11 +414,9 @@ pub async fn update(pool: &SqlitePool, id: i64, update: UpdateProject<'_>) -> Re
             review_max_rounds = ?,
             conflict_max_attempts = ?,
             max_concurrency = ?,
-            schedule_interval_min = ?,
             schedule_cron = ?,
             merge_mode = ?,
             skill_path = ?,
-            deepsleep_interval_days = ?,
             deepsleep_cron = ?
          WHERE id = ?",
     )
@@ -452,11 +437,9 @@ pub async fn update(pool: &SqlitePool, id: i64, update: UpdateProject<'_>) -> Re
     .bind(update.review_max_rounds)
     .bind(update.conflict_max_attempts)
     .bind(update.max_concurrency)
-    .bind(update.schedule_interval_min)
     .bind(schedule_cron)
     .bind(update.merge_mode.as_str())
     .bind(update.skill_path)
-    .bind(update.deepsleep_interval_days)
     .bind(deepsleep_cron)
     .bind(id)
     .execute(pool)

@@ -105,9 +105,10 @@ impl RemotePrState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemotePrCheckStatus {
+    #[default]
     Unknown,
     Pending,
     Success,
@@ -132,12 +133,6 @@ impl RemotePrCheckStatus {
             "failure" => RemotePrCheckStatus::Failure,
             _ => return None,
         })
-    }
-}
-
-impl Default for RemotePrCheckStatus {
-    fn default() -> Self {
-        RemotePrCheckStatus::Unknown
     }
 }
 

@@ -132,12 +132,10 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
                 "{} / next {}",
                 crate::ui::schedule::interval_label(
                     p.schedule_cron.as_deref(),
-                    p.schedule_interval_min,
                     app.daemon_tick_secs,
                 ),
                 crate::ui::schedule::next_due_label(
                     p.schedule_cron.as_deref(),
-                    p.schedule_interval_min,
                     last_auto_ms,
                     p.created_at,
                     now_ms,
@@ -330,6 +328,7 @@ fn remote_sync_lines(app: &App, project_id: i64) -> Vec<Line<'static>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use auwsx_core::agent::ExitKind;

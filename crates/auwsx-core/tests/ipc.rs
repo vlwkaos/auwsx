@@ -179,7 +179,6 @@ async fn add_project(db: &Db, bus: &tokio::sync::broadcast::Sender<Event>, name:
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
-                schedule_interval_min: None,
                 schedule_cron: None,
             },
         )
@@ -206,7 +205,6 @@ async fn backlog_seed_project(db: &Db) -> anyhow::Result<i64> {
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -238,7 +236,6 @@ async fn project_for_repo(db: &Db, repo_path: &str) -> anyhow::Result<i64> {
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -487,11 +484,9 @@ fn given_legacy_project_response_json_when_decoded_then_route_defaults_empty() -
             "review_max_rounds":5,
             "conflict_max_attempts":3,
             "max_concurrency":3,
-            "schedule_interval_min":null,
             "schedule_cron":null,
             "merge_mode":"local",
             "skill_path":null,
-            "deepsleep_interval_days":7,
             "deepsleep_cron":null,
             "last_deepsleep_at":null,
             "created_at":1
@@ -883,7 +878,6 @@ async fn given_legacy_add_project_json_when_dispatched_then_route_uses_work() ->
         "completion_policy":null,
         "plan_gate_timeout_min":null,
         "completion_soft_timeout_min":null,
-        "schedule_interval_min":null,
         "schedule_cron":null
     }"#;
     let command: Command = serde_json::from_str(raw)?;
@@ -920,7 +914,6 @@ async fn given_duplicate_name_when_add_project_then_err() -> anyhow::Result<()> 
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
     )
@@ -1005,11 +998,9 @@ async fn given_update_project_when_dispatched_then_config_fields_change() -> any
             review_max_rounds: 7,
             conflict_max_attempts: 8,
             max_concurrency: 9,
-            schedule_interval_min: Some(10),
             schedule_cron: Some("*/10 * * * *".to_string()),
             merge_mode: MergeMode::Pr,
             skill_path: Some("/skills".to_string()),
-            deepsleep_interval_days: 11,
             deepsleep_cron: Some("0 0 */11 * *".to_string()),
         },
     )
@@ -1022,7 +1013,8 @@ async fn given_update_project_when_dispatched_then_config_fields_change() -> any
     assert_eq!(p.default_branch, "trunk");
     assert_eq!(p.review_agent_cmd.as_deref(), Some("review2 {prompt}"));
     assert_eq!(p.completion_policy, CompletionPolicy::Soft);
-    assert_eq!(p.schedule_interval_min, Some(10));
+    assert_eq!(p.schedule_cron.as_deref(), Some("*/10 * * * *"));
+    assert_eq!(p.deepsleep_cron.as_deref(), Some("0 0 */11 * *"));
     assert_eq!(p.merge_mode, MergeMode::Pr);
     assert_eq!(p.skill_path.as_deref(), Some("/skills"));
     Ok(())
@@ -2993,7 +2985,6 @@ async fn given_running_server_when_request_add_project_then_id() -> anyhow::Resu
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
     )
@@ -3038,7 +3029,6 @@ async fn given_running_server_when_request_list_projects_then_projects_vec() -> 
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
     )

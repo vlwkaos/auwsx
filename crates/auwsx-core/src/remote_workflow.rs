@@ -205,7 +205,6 @@ mod tests {
                 completion_policy: Some(projects::CompletionPolicy::Manual),
                 plan_gate_timeout_min: Some(10),
                 completion_soft_timeout_min: Some(60),
-                schedule_interval_min: None,
                 schedule_cron: None,
             },
             TS,

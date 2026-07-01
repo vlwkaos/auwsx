@@ -33,10 +33,10 @@ fn default_port() -> u16 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultsConfig {
     pub agent: String,
-    pub schedule_interval_min: u32,
+    pub schedule_cron: Option<String>,
     pub max_concurrency: u32,
     pub merge_mode: String, // auto | pr | local
-    pub deepsleep_interval_days: u32,
+    pub deepsleep_cron: Option<String>,
     pub dream_interval_days: u32,
     pub iteration_timeout_min: u32,
     pub main_job_timeout_min: u32,

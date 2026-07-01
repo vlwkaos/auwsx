@@ -152,8 +152,6 @@ pub enum Command {
         completion_policy: Option<CompletionPolicy>,
         plan_gate_timeout_min: Option<i64>,
         completion_soft_timeout_min: Option<i64>,
-        /// Legacy autonomous cadence in minutes; `schedule_cron` is canonical.
-        schedule_interval_min: Option<i64>,
         /// User-facing autonomous cadence: 5-field cron, @tick, @every, or normalized shorthand.
         schedule_cron: Option<String>,
     },
@@ -177,11 +175,9 @@ pub enum Command {
         review_max_rounds: i64,
         conflict_max_attempts: i64,
         max_concurrency: i64,
-        schedule_interval_min: Option<i64>,
         schedule_cron: Option<String>,
         merge_mode: MergeMode,
         skill_path: Option<String>,
-        deepsleep_interval_days: i64,
         deepsleep_cron: Option<String>,
     },
     RemoveProject {
@@ -711,7 +707,6 @@ async fn dispatch_inner(
             completion_policy,
             plan_gate_timeout_min,
             completion_soft_timeout_min,
-            schedule_interval_min,
             schedule_cron,
         } => {
             let route_agent_cmd =
@@ -735,7 +730,6 @@ async fn dispatch_inner(
                     completion_policy,
                     plan_gate_timeout_min,
                     completion_soft_timeout_min,
-                    schedule_interval_min,
                     schedule_cron: schedule_cron.as_deref(),
                 },
                 now,
@@ -767,11 +761,9 @@ async fn dispatch_inner(
             review_max_rounds,
             conflict_max_attempts,
             max_concurrency,
-            schedule_interval_min,
             schedule_cron,
             merge_mode,
             skill_path,
-            deepsleep_interval_days,
             deepsleep_cron,
         } => {
             let route_agent_cmd =
@@ -801,11 +793,9 @@ async fn dispatch_inner(
                     review_max_rounds,
                     conflict_max_attempts,
                     max_concurrency,
-                    schedule_interval_min,
                     schedule_cron: schedule_cron.as_deref(),
                     merge_mode,
                     skill_path: skill_path.as_deref(),
-                    deepsleep_interval_days,
                     deepsleep_cron: deepsleep_cron.as_deref(),
                 },
             )

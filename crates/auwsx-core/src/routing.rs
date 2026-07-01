@@ -935,7 +935,6 @@ mod tests {
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
-                schedule_interval_min: None,
                 schedule_cron: None,
             },
             1,

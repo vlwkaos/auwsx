@@ -58,7 +58,7 @@ create-override-coalesce-default in db-crud-conventions.md):
 | `--completion-policy <manual\|soft\|auto>` | `completion_policy` | enum |
 | `--plan-gate-timeout <int>` | `plan_gate_timeout_min` | `opt_int` |
 | `--completion-timeout <int>` | `completion_soft_timeout_min` | `opt_int` |
-| `--schedule <int>` | `schedule_interval_min` | `opt_int` |
+| `--schedule <cron\|30m\|1h\|1d>` | `schedule_cron` | normalized cadence |
 
 All optional → `None` when absent (DB DEFAULT kept). `print_response`'s Project
 arm prints a `policy:` line (completion / plan_gate / completion_soft /

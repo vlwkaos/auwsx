@@ -196,11 +196,7 @@ impl ContextCapabilities {
     fn push(&mut self, action: CapabilityAction, key: impl Into<String>, label: impl Into<String>) {
         let key = key.into();
         let label = format_key_hint(&key, &label.into());
-        self.hints.push(ActionHint {
-            action,
-            key,
-            label: label.into(),
-        });
+        self.hints.push(ActionHint { action, key, label });
     }
 
     pub fn has(&self, action: CapabilityAction) -> bool {
@@ -301,12 +297,8 @@ impl Form {
     }
 
     fn project_config(project: &Project) -> Self {
-        let schedule_value = project.schedule_cron.clone().or_else(|| {
-            auwsx_core::schedule::legacy_interval_to_cron(project.schedule_interval_min)
-        });
-        let deepsleep_value = project.deepsleep_cron.clone().or_else(|| {
-            auwsx_core::schedule::legacy_deepsleep_to_cron(project.deepsleep_interval_days)
-        });
+        let schedule_value = project.schedule_cron.clone();
+        let deepsleep_value = project.deepsleep_cron.clone();
         Self {
             kind: FormKind::ProjectConfig,
             title: "Project config",
@@ -1099,17 +1091,6 @@ fn parse_cadence(form: &Form, label: &'static str, status: &mut String) -> Optio
     }
 }
 
-fn cron_days_hint(cron: &str) -> Option<i64> {
-    match cron {
-        "0 0 * * *" => Some(1),
-        "0 0 * * 0" => Some(7),
-        _ => cron
-            .strip_prefix("0 0 */")
-            .and_then(|rest| rest.strip_suffix(" * *"))
-            .and_then(|days| days.parse::<i64>().ok()),
-    }
-}
-
 fn parse_bool(form: &Form, label: &'static str, status: &mut String) -> Option<bool> {
     match form.get(label).as_str() {
         "true" | "yes" | "1" | "on" => Some(true),
@@ -1192,7 +1173,6 @@ fn add_project_command_from_form(
         completion_policy: None,
         plan_gate_timeout_min: None,
         completion_soft_timeout_min: None,
-        schedule_interval_min: None,
         schedule_cron,
     })
 }
@@ -1780,7 +1760,6 @@ impl App {
             let last = self.last_auto_tick.get(&p.id).copied();
             let sched = crate::ui::schedule::tree_schedule_label(
                 p.schedule_cron.as_deref(),
-                p.schedule_interval_min,
                 last,
                 p.created_at,
                 now_ms,
@@ -3359,12 +3338,6 @@ impl App {
                 else {
                     return Ok(());
                 };
-                let existing_deepsleep_interval_days = self
-                    .projects
-                    .iter()
-                    .find(|project| project.id == project_id)
-                    .map(|project| project.deepsleep_interval_days)
-                    .unwrap_or(7);
                 let preset = self.find_arsenal_preset(&form.get("arsenal"));
                 let Some(agent_config) =
                     project_agent_config_from_form(&form, preset.as_ref(), &mut self.status)
@@ -3391,16 +3364,9 @@ impl App {
                         review_max_rounds,
                         conflict_max_attempts,
                         max_concurrency,
-                        schedule_interval_min: None,
                         schedule_cron,
                         merge_mode,
                         skill_path: form.opt("skill_path"),
-                        deepsleep_interval_days: match deepsleep_cron.as_deref() {
-                            Some(cron) => {
-                                cron_days_hint(cron).unwrap_or(existing_deepsleep_interval_days)
-                            }
-                            None => 0,
-                        },
                         deepsleep_cron,
                     },
                     "project update",
@@ -4290,21 +4256,18 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
     // event::read is blocking; this keeps it off the runtime without needing
     // the optional event-stream feature.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<CEvent>();
-    std::thread::spawn(move || loop {
-        match event::read() {
-            Ok(ev) => {
-                let keep = matches!(
-                    ev,
-                    CEvent::Key(KeyEvent {
-                        kind: KeyEventKind::Press,
-                        ..
-                    }) | CEvent::Resize(_, _)
-                );
-                if keep && event_tx.send(ev).is_err() {
-                    break;
-                }
+    std::thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            let keep = matches!(
+                ev,
+                CEvent::Key(KeyEvent {
+                    kind: KeyEventKind::Press,
+                    ..
+                }) | CEvent::Resize(_, _)
+            );
+            if keep && event_tx.send(ev).is_err() {
+                break;
             }
-            Err(_) => break,
         }
     });
 
@@ -5580,7 +5543,7 @@ mod tests {
         let mut project = project_fixture();
         project.id = 42;
         project.name = "demo".into();
-        project.schedule_interval_min = Some(15);
+        project.schedule_cron = Some("*/15 * * * *".into());
         project.skill_path = Some("skills".into());
         project
     }
@@ -5747,11 +5710,9 @@ mod tests {
             review_max_rounds: 5,
             conflict_max_attempts: 3,
             max_concurrency: 1,
-            schedule_interval_min: None,
             schedule_cron: None,
             merge_mode: MergeMode::Local,
             skill_path: None,
-            deepsleep_interval_days: 30,
             deepsleep_cron: Some("0 0 */30 * *".to_string()),
             last_deepsleep_at: None,
             created_at: 1,

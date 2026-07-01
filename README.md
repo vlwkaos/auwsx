@@ -95,8 +95,8 @@ Each project has `schedule_cron` as the user-facing scheduler cadence:
   `1d`, `7d`. Durations that are not exact five-field cron, such as `90m`,
   are stored as `@every 90m`.
 
-The legacy `schedule_interval_min` column is still read as a fallback for old
-databases and scripts. New UI and CLI writes should use `schedule_cron`.
+Older databases are normalized by migration `0016_project_cron_cadence.sql`;
+the final schema stores cadence only in `schedule_cron`.
 
 Manual commands bypass the cadence gate:
 
@@ -171,8 +171,7 @@ Routine routes are:
 Project config owns the deepsleep cadence field as `deepsleep_cron`. Blank,
 `manual`, or `@manual` disables the project-owned memory routine. If deepsleep
 has never run for the project, the first automatic tick runs it immediately;
-after that, the cron cadence controls subsequent runs. The legacy
-`deepsleep_interval_days` column remains a compatibility fallback.
+after that, the cron cadence controls subsequent runs.
 
 ## Real-Agent E2E
 

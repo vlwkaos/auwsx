@@ -339,7 +339,6 @@ fn parse_project(args: &[String]) -> Result<CliAction> {
                 plan_gate_timeout_min: p.opt_int("plan-gate-timeout")?,
                 completion_soft_timeout_min: p
                     .opt_int_any(&["merge-delay", "completion-timeout"])?,
-                schedule_interval_min: p.opt_int("schedule-min")?,
                 schedule_cron,
             }
         }
@@ -1811,7 +1810,6 @@ mod tests {
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
-                schedule_interval_min: None,
                 schedule_cron: None,
             })
         );
@@ -1838,7 +1836,6 @@ mod tests {
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
-                schedule_interval_min: None,
                 schedule_cron: None,
             })
         );
@@ -1874,7 +1871,6 @@ mod tests {
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
-                schedule_interval_min: None,
                 schedule_cron: None,
             })
         );
@@ -2555,7 +2551,6 @@ mod tests {
                 completion_policy: None,
                 plan_gate_timeout_min: None,
                 completion_soft_timeout_min: None,
-                schedule_interval_min: None,
                 schedule_cron: None,
             })
         );
@@ -2625,34 +2620,6 @@ mod tests {
             panic!("expected AddProject")
         };
         assert_eq!(schedule_cron, Some("15 9 * * 1-5".to_string()));
-    }
-
-    #[test]
-    fn given_schedule_min_when_parsed_then_legacy_interval_is_set() {
-        let CliAction::Request(Command::AddProject {
-            schedule_interval_min,
-            schedule_cron,
-            ..
-        }) = parse(&argv(&[
-            "project",
-            "add",
-            "demo",
-            "/repo",
-            "--main",
-            "mc",
-            "--plan",
-            "pc",
-            "--work",
-            "wc",
-            "--schedule-min",
-            "5",
-        ]))
-        .unwrap()
-        else {
-            panic!("expected AddProject")
-        };
-        assert_eq!(schedule_interval_min, Some(5));
-        assert_eq!(schedule_cron, None);
     }
 
     #[test]
@@ -3063,7 +3030,6 @@ mod tests {
                 completion_policy: Some(CompletionPolicy::Soft),
                 plan_gate_timeout_min: Some(0),
                 completion_soft_timeout_min: Some(45),
-                schedule_interval_min: None,
                 schedule_cron: None,
             })
         );

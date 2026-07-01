@@ -154,10 +154,7 @@ fn ask_context_summary(
         format!(
             "Policy: completion={} schedule={}",
             project.completion_policy.as_str(),
-            crate::schedule::cadence_label(
-                project.schedule_cron.as_deref(),
-                project.schedule_interval_min
-            )
+            crate::schedule::cadence_label(project.schedule_cron.as_deref())
         ),
         format!(
             "Counts: {} issues, {} live backlog, {} routines",
@@ -400,7 +397,6 @@ impl Scheduler {
         match scheduler_runs::latest_auto_by_project(self.db.pool(), project.id).await {
             Ok(last) => match crate::schedule::is_due(
                 project.schedule_cron.as_deref(),
-                project.schedule_interval_min,
                 last.map(|run| run.fired_at),
                 project.created_at,
                 now,
@@ -600,10 +596,7 @@ impl Scheduler {
     }
 
     async fn service_project_deepsleep(&self, project: &Project, now: i64) -> Result<()> {
-        let deepsleep_cron = project
-            .deepsleep_cron
-            .clone()
-            .or_else(|| crate::schedule::legacy_deepsleep_to_cron(project.deepsleep_interval_days));
+        let deepsleep_cron = project.deepsleep_cron.clone();
         let Some(deepsleep_cron) = deepsleep_cron else {
             return Ok(());
         };
@@ -611,7 +604,6 @@ impl Scheduler {
             None => true,
             Some(last) => crate::schedule::is_due(
                 Some(&deepsleep_cron),
-                None,
                 Some(last),
                 project.created_at,
                 now,

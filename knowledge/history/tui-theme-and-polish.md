@@ -20,7 +20,7 @@ and quit-with-daemon-stop flow.
   modules except `theme.rs`.
 - Repository search avoids new runtime dependencies and requires `.git` to be a
   directory.
-- `schedule_interval_min=0` means evaluate every daemon loop, not spawn
+- `schedule_cron=@tick` means evaluate every daemon loop, not spawn
   constantly.
 
 ## Knowledge Created/Updated

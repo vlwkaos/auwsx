@@ -279,11 +279,9 @@ async fn set_project_merge_mode(db: &Db, project_id: i64, merge_mode: MergeMode)
             review_max_rounds: project.review_max_rounds,
             conflict_max_attempts: project.conflict_max_attempts,
             max_concurrency: project.max_concurrency,
-            schedule_interval_min: project.schedule_interval_min,
             schedule_cron: project.schedule_cron.as_deref(),
             merge_mode,
             skill_path: project.skill_path.as_deref(),
-            deepsleep_interval_days: project.deepsleep_interval_days,
             deepsleep_cron: project.deepsleep_cron.as_deref(),
         },
     )

@@ -51,18 +51,7 @@ pub fn normalize_cadence_input(input: &str) -> crate::Result<Option<String>> {
     Ok(Some(trimmed.to_string()))
 }
 
-pub fn legacy_interval_to_cron(interval_min: Option<i64>) -> Option<String> {
-    match interval_min {
-        None => None,
-        Some(min) if min <= 0 => Some("@tick".to_string()),
-        Some(min) if min <= 59 => Some(format!("*/{min} * * * *")),
-        Some(min) if min % (24 * 60) == 0 => Some(format!("0 0 */{} * *", min / (24 * 60))),
-        Some(min) if min % 60 == 0 => Some(format!("0 */{} * * *", min / 60)),
-        Some(min) => Some(format!("@every {min}m")),
-    }
-}
-
-pub fn legacy_deepsleep_to_cron(interval_days: i64) -> Option<String> {
+fn days_to_cron(interval_days: i64) -> Option<String> {
     match interval_days {
         days if days <= 0 => None,
         1 => Some("0 0 * * *".to_string()),
@@ -71,12 +60,11 @@ pub fn legacy_deepsleep_to_cron(interval_days: i64) -> Option<String> {
     }
 }
 
-pub fn cadence_label(schedule_cron: Option<&str>, legacy_interval_min: Option<i64>) -> String {
+pub fn cadence_label(schedule_cron: Option<&str>) -> String {
     let expr = schedule_cron
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| legacy_interval_to_cron(legacy_interval_min));
+        .map(str::to_string);
     match expr.as_deref() {
         None => "manual".to_string(),
         Some("@tick") => "tick".to_string(),
@@ -86,7 +74,6 @@ pub fn cadence_label(schedule_cron: Option<&str>, legacy_interval_min: Option<i6
 
 pub fn is_due(
     schedule_cron: Option<&str>,
-    legacy_interval_min: Option<i64>,
     since_ms: Option<i64>,
     created_at_ms: i64,
     now_ms: i64,
@@ -95,8 +82,7 @@ pub fn is_due(
     let expr = schedule_cron
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| legacy_interval_to_cron(legacy_interval_min));
+        .map(str::to_string);
     let Some(expr) = expr else {
         return Ok(false);
     };
@@ -123,7 +109,6 @@ pub fn is_due(
 
 pub fn next_due_ms(
     schedule_cron: Option<&str>,
-    legacy_interval_min: Option<i64>,
     since_ms: Option<i64>,
     created_at_ms: i64,
     now_ms: i64,
@@ -132,8 +117,7 @@ pub fn next_due_ms(
     let expr = schedule_cron
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| legacy_interval_to_cron(legacy_interval_min));
+        .map(str::to_string);
     let Some(expr) = expr else {
         return Ok(None);
     };
@@ -180,7 +164,7 @@ fn duration_shorthand_to_cadence(input: &str) -> crate::Result<Option<String>> {
         'h' if value <= 23 => format!("0 */{value} * * *"),
         'h' if value % 24 == 0 => format!("0 0 */{} * *", value / 24),
         'h' => format!("@every {value}h"),
-        'd' => legacy_deepsleep_to_cron(value).ok_or_else(|| anyhow!("invalid day shorthand"))?,
+        'd' => days_to_cron(value).ok_or_else(|| anyhow!("invalid day shorthand"))?,
         _ => unreachable!(),
     };
     Ok(Some(cron))
@@ -392,6 +376,6 @@ mod tests {
             .unwrap()
             .timestamp_millis();
 
-        assert!(is_due(Some("*/30 * * * *"), None, Some(since), since, now, 10).unwrap());
+        assert!(is_due(Some("*/30 * * * *"), None, since, now, 10).unwrap());
     }
 }

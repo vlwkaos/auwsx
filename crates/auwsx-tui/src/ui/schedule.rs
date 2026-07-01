@@ -32,7 +32,6 @@ pub fn fmt_duration_ms(ms: i64) -> String {
 /// Full "next auto" label for the detail panel.
 pub fn next_due_label(
     schedule_cron: Option<&str>,
-    schedule_interval_min: Option<i64>,
     last_auto_fired_at: Option<i64>,
     created_at_ms: i64,
     now_ms: i64,
@@ -40,7 +39,6 @@ pub fn next_due_label(
 ) -> String {
     match auwsx_core::schedule::next_due_ms(
         schedule_cron,
-        schedule_interval_min,
         last_auto_fired_at,
         created_at_ms,
         now_ms,
@@ -58,7 +56,6 @@ pub fn next_due_label(
 
 pub fn schedule_due_for_tree(
     schedule_cron: Option<&str>,
-    schedule_interval_min: Option<i64>,
     last_auto_fired_at: Option<i64>,
     created_at_ms: i64,
     now_ms: i64,
@@ -66,7 +63,6 @@ pub fn schedule_due_for_tree(
 ) -> Option<String> {
     match auwsx_core::schedule::next_due_ms(
         schedule_cron,
-        schedule_interval_min,
         last_auto_fired_at,
         created_at_ms,
         now_ms,
@@ -84,16 +80,14 @@ pub fn schedule_due_for_tree(
 
 pub fn tree_schedule_label(
     schedule_cron: Option<&str>,
-    schedule_interval_min: Option<i64>,
     last_auto_fired_at: Option<i64>,
     created_at_ms: i64,
     now_ms: i64,
     tick_interval_secs: i64,
 ) -> String {
-    let cadence = interval_label(schedule_cron, schedule_interval_min, tick_interval_secs);
+    let cadence = interval_label(schedule_cron, tick_interval_secs);
     match schedule_due_for_tree(
         schedule_cron,
-        schedule_interval_min,
         last_auto_fired_at,
         created_at_ms,
         now_ms,
@@ -104,34 +98,9 @@ pub fn tree_schedule_label(
     }
 }
 
-pub fn interval_label(
-    schedule_cron: Option<&str>,
-    schedule_interval_min: Option<i64>,
-    tick_interval_secs: i64,
-) -> String {
-    if schedule_cron
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_none()
-    {
-        if let Some(min) = schedule_interval_min {
-            return legacy_interval_display(min, tick_interval_secs);
-        }
-    }
-    let label = auwsx_core::schedule::cadence_label(schedule_cron, schedule_interval_min);
+pub fn interval_label(schedule_cron: Option<&str>, tick_interval_secs: i64) -> String {
+    let label = auwsx_core::schedule::cadence_label(schedule_cron);
     compact_cadence_label(&label, tick_interval_secs)
-}
-
-fn legacy_interval_display(min: i64, tick_interval_secs: i64) -> String {
-    if min <= 0 {
-        format!("{}s", tick_interval_secs.max(1))
-    } else if min % (24 * 60) == 0 {
-        format!("{}d", min / (24 * 60))
-    } else if min % 60 == 0 {
-        format!("{}h", min / 60)
-    } else {
-        format!("{min}m")
-    }
 }
 
 fn compact_cadence_label(label: &str, tick_interval_secs: i64) -> String {
@@ -165,31 +134,6 @@ fn compact_cadence_label(label: &str, tick_interval_secs: i64) -> String {
         "0 0 * * 0" => "7d".to_string(),
         _ => label.to_string(),
     }
-}
-
-#[allow(dead_code)]
-pub fn tree_countdown(
-    schedule_interval_min: Option<i64>,
-    last_auto_fired_at: Option<i64>,
-    now_ms: i64,
-    tick_interval_secs: i64,
-) -> Option<String> {
-    schedule_due_for_tree(
-        None,
-        schedule_interval_min,
-        last_auto_fired_at,
-        now_ms,
-        now_ms,
-        tick_interval_secs,
-    )
-}
-
-#[allow(dead_code)]
-pub fn legacy_interval_label(
-    schedule_interval_min: Option<i64>,
-    tick_interval_secs: i64,
-) -> String {
-    interval_label(None, schedule_interval_min, tick_interval_secs)
 }
 
 enum CountdownRemaining {
@@ -233,14 +177,14 @@ mod tests {
 
     #[test]
     fn given_auto_schedule_when_tree_label_then_countdown_and_cadence_are_joined() {
-        let label = tree_schedule_label(None, Some(30), Some(0), 0, 15 * 60_000, 10);
+        let label = tree_schedule_label(Some("@every 30m"), Some(0), 0, 15 * 60_000, 10);
 
         assert_eq!(label, "\u{23f1} 15m/30m");
     }
 
     #[test]
     fn given_manual_schedule_when_tree_label_then_manual() {
-        let label = tree_schedule_label(Some("@manual"), None, None, 0, 0, 10);
+        let label = tree_schedule_label(Some("@manual"), None, 0, 0, 10);
 
         assert_eq!(label, "manual");
     }

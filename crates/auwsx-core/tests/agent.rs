@@ -48,7 +48,6 @@ async fn insert_project(pool: &SqlitePool, name: &str) -> anyhow::Result<i64> {
             completion_policy: None,
             plan_gate_timeout_min: None,
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,

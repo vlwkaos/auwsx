@@ -209,6 +209,25 @@ async fn issues_agent_session_column_absent() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn projects_legacy_interval_columns_absent() -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let columns: Vec<String> = sqlx::query("PRAGMA table_info(projects)")
+        .fetch_all(db.pool())
+        .await?
+        .into_iter()
+        .map(|row| row.get("name"))
+        .collect();
+
+    for removed in ["schedule_interval_min", "deepsleep_interval_days"] {
+        assert!(
+            !columns.iter().any(|name| name == removed),
+            "{removed} is a removed pre-cron scheduling field"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn global_settings_seed_row_exists() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM global_settings WHERE id = 1")

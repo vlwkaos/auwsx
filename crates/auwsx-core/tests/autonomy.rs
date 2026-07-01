@@ -121,11 +121,9 @@ fn project_with(max_concurrency: i64, completion_policy: CompletionPolicy) -> Pr
         review_max_rounds: 5,
         conflict_max_attempts: 3,
         max_concurrency,
-        schedule_interval_min: None,
         schedule_cron: None,
         merge_mode: MergeMode::Local,
         skill_path: None,
-        deepsleep_interval_days: 7,
         deepsleep_cron: Some("0 0 * * 0".to_string()),
         last_deepsleep_at: None,
         created_at: TS,
@@ -1190,7 +1188,6 @@ async fn drive_project_with_repo(pool: &SqlitePool, repo_path: &str) -> anyhow::
             completion_policy: Some(CompletionPolicy::Auto),
             plan_gate_timeout_min: Some(0),
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -1375,15 +1372,15 @@ async fn set_project_runtime_policy(
     pool: &SqlitePool,
     project_id: i64,
     max_concurrency: i64,
-    schedule_interval_min: Option<i64>,
+    schedule_cron: Option<&str>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE projects
-         SET max_concurrency = ?, schedule_interval_min = ?
+         SET max_concurrency = ?, schedule_cron = ?
          WHERE id = ?",
     )
     .bind(max_concurrency)
-    .bind(schedule_interval_min)
+    .bind(schedule_cron)
     .bind(project_id)
     .execute(pool)
     .await?;
@@ -1396,13 +1393,17 @@ async fn set_project_deepsleep_interval(
     interval_days: i64,
     last_ran_at: Option<i64>,
 ) -> anyhow::Result<()> {
-    let deepsleep_cron = auwsx_core::schedule::legacy_deepsleep_to_cron(interval_days);
+    let deepsleep_cron = match interval_days {
+        days if days <= 0 => None,
+        1 => Some("0 0 * * *".to_string()),
+        7 => Some("0 0 * * 0".to_string()),
+        days => Some(format!("0 0 */{days} * *")),
+    };
     sqlx::query(
         "UPDATE projects
-         SET deepsleep_interval_days = ?, deepsleep_cron = ?, last_deepsleep_at = ?
+         SET deepsleep_cron = ?, last_deepsleep_at = ?
          WHERE id = ?",
     )
-    .bind(interval_days)
     .bind(deepsleep_cron)
     .bind(last_ran_at)
     .bind(project_id)
@@ -2173,7 +2174,6 @@ async fn given_reconcile_retry_proposal_for_moved_issue_when_applied_then_reject
             completion_policy: Some(CompletionPolicy::Auto),
             plan_gate_timeout_min: Some(0),
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -2746,7 +2746,7 @@ async fn given_deepsleep_due_when_auto_ticks_then_memory_job_runs_once() -> anyh
     let db = Db::open_memory().await?;
     let project_id = drive_project(db.pool()).await?;
     set_project_deepsleep_interval(db.pool(), project_id, 7, None).await?;
-    set_project_runtime_policy(db.pool(), project_id, 0, Some(0)).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some("@tick")).await?;
     let shutdown = Arc::new(Notify::new());
     let sched = scheduler_with(
         db.clone(),
@@ -2789,7 +2789,7 @@ async fn given_deepsleep_not_due_when_auto_ticks_then_no_memory_job_runs() -> an
     let db = Db::open_memory().await?;
     let project_id = drive_project(db.pool()).await?;
     set_project_deepsleep_interval(db.pool(), project_id, 7, Some(TS)).await?;
-    set_project_runtime_policy(db.pool(), project_id, 0, Some(0)).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some("@tick")).await?;
     let shutdown = Arc::new(Notify::new());
     let sched = scheduler_with(
         db.clone(),
@@ -3086,7 +3086,6 @@ async fn given_issue_running_in_other_project_when_tick_project_then_capacity_is
             completion_policy: Some(CompletionPolicy::Auto),
             plan_gate_timeout_min: Some(0),
             completion_soft_timeout_min: None,
-            schedule_interval_min: None,
             schedule_cron: None,
         },
         TS,
@@ -3154,7 +3153,7 @@ async fn given_project_zero_interval_when_run_ticks_then_scheduler_records_repea
 ) -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let project_id = drive_project(db.pool()).await?;
-    set_project_runtime_policy(db.pool(), project_id, 0, Some(0)).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some("@tick")).await?;
     let shutdown = Arc::new(Notify::new());
     let sched = scheduler_with(
         db.clone(),
@@ -3181,7 +3180,7 @@ async fn given_project_interval_not_elapsed_when_run_ticks_then_project_is_not_s
 ) -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let project_id = drive_project(db.pool()).await?;
-    set_project_runtime_policy(db.pool(), project_id, 0, Some(60)).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some("0 * * * *")).await?;
     scheduler_runs::record(
         db.pool(),
         project_id,
@@ -3231,7 +3230,7 @@ async fn given_project_interval_elapsed_when_run_ticks_then_project_is_scheduled
 ) -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let project_id = drive_project(db.pool()).await?;
-    set_project_runtime_policy(db.pool(), project_id, 0, Some(1)).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some("* * * * *")).await?;
     scheduler_runs::record(
         db.pool(),
         project_id,
@@ -3278,7 +3277,7 @@ async fn given_project_interval_configured_when_manual_tick_project_then_interva
 ) -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let project_id = drive_project(db.pool()).await?;
-    set_project_runtime_policy(db.pool(), project_id, 0, Some(60)).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, Some("0 * * * *")).await?;
     scheduler_runs::record(
         db.pool(),
         project_id,
