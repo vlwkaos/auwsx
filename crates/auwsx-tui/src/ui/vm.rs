@@ -7,6 +7,7 @@ use auwsx_core::backlog::{Approval, BacklogItem};
 use auwsx_core::db::agent_runs::AgentRun;
 use auwsx_core::db::findings::Finding;
 use auwsx_core::db::issues::Issue;
+use auwsx_core::db::remote::{RemoteSyncRun, RemoteSyncStatus};
 use auwsx_core::db::subtasks::Subtask;
 use auwsx_core::state::{IssueStatus, ProgressLane};
 use auwsx_core::steering::Steering;
@@ -75,6 +76,13 @@ pub(crate) struct IssueStatusPresentation {
 pub(crate) struct SummaryRow {
     pub(crate) label: &'static str,
     pub(crate) value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteSyncSummary {
+    pub(crate) active: usize,
+    pub(crate) failures: usize,
+    pub(crate) rows: Vec<SummaryRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +271,82 @@ pub(crate) fn issue_summary_rows(
     rows
 }
 
+pub(crate) fn remote_sync_summary(runs: &[RemoteSyncRun], limit: usize) -> RemoteSyncSummary {
+    let active = runs
+        .iter()
+        .filter(|run| {
+            matches!(
+                run.status,
+                RemoteSyncStatus::Queued | RemoteSyncStatus::Running
+            )
+        })
+        .count();
+    let failures = runs
+        .iter()
+        .filter(|run| run.status == RemoteSyncStatus::Failed)
+        .count();
+    let rows = runs
+        .iter()
+        .take(limit)
+        .map(remote_sync_row)
+        .collect::<Vec<_>>();
+    RemoteSyncSummary {
+        active,
+        failures,
+        rows,
+    }
+}
+
+fn remote_sync_row(run: &RemoteSyncRun) -> SummaryRow {
+    let label = match run.status {
+        RemoteSyncStatus::Queued | RemoteSyncStatus::Running => "active",
+        RemoteSyncStatus::Failed => "failed",
+        RemoteSyncStatus::Skipped => "skipped",
+        RemoteSyncStatus::Done => "latest",
+    };
+    let mut parts = vec![
+        format!("#{}", run.id),
+        run.direction.as_str().to_string(),
+        run.kind.as_str().to_string(),
+        run.status.as_str().to_string(),
+    ];
+    if let Some(target) = remote_sync_target(run) {
+        parts.push(target);
+    }
+    if let Some(message) = remote_sync_message(run) {
+        parts.push(format!("- {message}"));
+    }
+    summary_row(label, parts.join(" "))
+}
+
+fn remote_sync_target(run: &RemoteSyncRun) -> Option<String> {
+    if let Some(issue_id) = run.issue_id {
+        return Some(format!("issue #{issue_id}"));
+    }
+    if let Some(backlog_id) = run.backlog_item_id {
+        return Some(format!("backlog #{backlog_id}"));
+    }
+    if let Some(pr_id) = run.remote_pr_link_id {
+        return Some(format!("pr-link #{pr_id}"));
+    }
+    if let Some(remote_issue_id) = run.remote_issue_link_id {
+        return Some(format!("remote-issue-link #{remote_issue_id}"));
+    }
+    None
+}
+
+fn remote_sync_message(run: &RemoteSyncRun) -> Option<String> {
+    run.error
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| {
+            run.summary
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+        })
+        .map(first_nonempty_line)
+}
+
 fn card_sort_key(card: &KanbanCard) -> (u8, IssueSortKey, i64) {
     match card {
         KanbanCard::Backlog { id, .. } => (
@@ -392,6 +476,7 @@ mod tests {
     use auwsx_core::agent::ExitKind;
     use auwsx_core::backlog::Source;
     use auwsx_core::db::agent_runs::Role;
+    use auwsx_core::db::remote::{RemoteSyncDirection, RemoteSyncKind};
 
     const TS: i64 = 1_000_000;
 
@@ -429,6 +514,25 @@ mod tests {
             has_pending_steering: false,
             created_at: TS,
             updated_at: TS,
+        }
+    }
+
+    fn remote_run(id: i64, status: RemoteSyncStatus) -> RemoteSyncRun {
+        RemoteSyncRun {
+            id,
+            project_id: 1,
+            issue_id: Some(7),
+            backlog_item_id: None,
+            remote_issue_link_id: None,
+            remote_pr_link_id: None,
+            direction: RemoteSyncDirection::Outbound,
+            kind: RemoteSyncKind::Pr,
+            status,
+            summary: Some("created pull request".to_string()),
+            error: None,
+            started_at: Some(TS),
+            ended_at: Some(TS + 1),
+            created_at: TS,
         }
     }
 
@@ -619,5 +723,29 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.label == "latest run" && row.value == "#9 work WORKING exited:0 -> REVIEWING"
         }));
+    }
+
+    #[test]
+    fn given_remote_sync_runs_when_projected_then_active_failures_and_messages_are_visible() {
+        let mut failed = remote_run(2, RemoteSyncStatus::Failed);
+        failed.error = Some("check suite is red".to_string());
+        let rows = remote_sync_summary(
+            &[
+                remote_run(3, RemoteSyncStatus::Running),
+                failed,
+                remote_run(1, RemoteSyncStatus::Done),
+            ],
+            2,
+        );
+
+        assert_eq!(rows.active, 1);
+        assert_eq!(rows.failures, 1);
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0].label, "active");
+        assert!(rows.rows[0]
+            .value
+            .contains("#3 outbound pr running issue #7"));
+        assert_eq!(rows.rows[1].label, "failed");
+        assert!(rows.rows[1].value.contains("check suite is red"));
     }
 }

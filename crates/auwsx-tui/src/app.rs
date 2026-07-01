@@ -25,7 +25,7 @@ use auwsx_core::db::memory_presets::MemoryPreset;
 use auwsx_core::db::profiles::Profile;
 use auwsx_core::db::projects::{CompletionPolicy, MergeMode, Project};
 use auwsx_core::db::remote::{
-    ProjectRemoteConfig, RemoteAuthKind, RemoteProvider, RequiredChecksPolicy,
+    ProjectRemoteConfig, RemoteAuthKind, RemoteProvider, RemoteSyncRun, RequiredChecksPolicy,
 };
 use auwsx_core::db::scheduler_runs::{SchedulerRun, SchedulerRunSource};
 use auwsx_core::db::subtasks::Subtask;
@@ -1288,6 +1288,7 @@ pub struct App {
     pub recent_scheduler_runs: Vec<SchedulerRun>,
     pub reconcile_reports: HashMap<i64, ProjectReconcileReport>,
     pub remote_configs: HashMap<i64, ProjectRemoteConfig>,
+    pub remote_sync_runs: HashMap<i64, Vec<RemoteSyncRun>>,
     pub ask_answers: Vec<AskAnswer>,
     pub daemon_tick_secs: i64,
     /// Per-project epoch ms of the most recent AUTO scheduler tick.
@@ -1355,6 +1356,7 @@ impl App {
             recent_scheduler_runs: Vec::new(),
             reconcile_reports: HashMap::new(),
             remote_configs: HashMap::new(),
+            remote_sync_runs: HashMap::new(),
             ask_answers: Vec::new(),
             daemon_tick_secs: daemon_tick_secs(),
             last_auto_tick: HashMap::new(),
@@ -1646,6 +1648,13 @@ impl App {
 
     pub fn remote_config(&self, project_id: i64) -> Option<&ProjectRemoteConfig> {
         self.remote_configs.get(&project_id)
+    }
+
+    pub fn remote_sync_runs(&self, project_id: i64) -> &[RemoteSyncRun] {
+        self.remote_sync_runs
+            .get(&project_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub fn active_profile_name(&self) -> &str {
@@ -2281,6 +2290,7 @@ impl App {
             let live: HashSet<i64> = self.projects.iter().map(|p| p.id).collect();
             self.children.retain(|id, _| live.contains(id));
             self.remote_configs.retain(|id, _| live.contains(id));
+            self.remote_sync_runs.retain(|id, _| live.contains(id));
             self.expanded.retain(|id| live.contains(id));
             self.archive_expanded.retain(|id| live.contains(id));
             if self.expanded.is_empty() {
@@ -2408,6 +2418,20 @@ impl App {
                 self.remote_configs.remove(&project_id);
             }
             _ => {}
+        }
+        match self
+            .req(Command::RecentRemoteSyncRuns {
+                project_id,
+                limit: 8,
+            })
+            .await?
+        {
+            Response::RemoteSyncRuns(runs) => {
+                self.remote_sync_runs.insert(project_id, runs);
+            }
+            _ => {
+                self.remote_sync_runs.remove(&project_id);
+            }
         }
         Ok(())
     }

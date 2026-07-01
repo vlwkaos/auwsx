@@ -97,6 +97,7 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(8),
             Constraint::Length(7),
+            Constraint::Length(6),
             Constraint::Min(8),
             Constraint::Length(7),
             Constraint::Length(5),
@@ -171,9 +172,10 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
     ];
     panel(frame, rows[0], &format!("Project {}", p.name), lines);
     render_recovery(frame, app, p.id, rows[1]);
-    render_kanban(frame, app, rows[2]);
-    render_kanban_preview(frame, app, rows[3]);
-    render_archive_summary(frame, app, rows[4]);
+    render_remote_sync(frame, app, p.id, rows[2]);
+    render_kanban(frame, app, rows[3]);
+    render_kanban_preview(frame, app, rows[4]);
+    render_archive_summary(frame, app, rows[5]);
 }
 
 fn remote_summary(app: &App, project_id: i64) -> String {
@@ -296,11 +298,46 @@ fn running_issue_agents(runs: &[AgentRun]) -> usize {
         .count()
 }
 
+fn render_remote_sync(frame: &mut Frame, app: &App, project_id: i64, area: Rect) {
+    panel(
+        frame,
+        area,
+        "Remote Sync",
+        remote_sync_lines(app, project_id),
+    );
+}
+
+fn remote_sync_lines(app: &App, project_id: i64) -> Vec<Line<'static>> {
+    if app.remote_config(project_id).is_none() {
+        return vec![Line::styled("remote not configured", theme::dim())];
+    }
+    let summary = crate::ui::vm::remote_sync_summary(app.remote_sync_runs(project_id), 3);
+    let mut lines = vec![kv(
+        "state",
+        &format!(
+            "{} active  {} failed recent",
+            summary.active, summary.failures
+        ),
+    )];
+    if summary.rows.is_empty() {
+        lines.push(Line::styled("no remote sync runs yet", theme::dim()));
+        return lines;
+    }
+    for row in summary.rows {
+        lines.push(kv(row.label, &row.value));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use auwsx_core::agent::ExitKind;
     use auwsx_core::db::agent_runs::Role;
+    use auwsx_core::db::remote::{
+        ProjectRemoteConfig, RemoteAuthKind, RemoteProvider, RemoteSyncDirection, RemoteSyncKind,
+        RemoteSyncRun, RemoteSyncStatus, RequiredChecksPolicy,
+    };
     use auwsx_core::main_jobs::MainJobSource;
     use auwsx_core::reconcile::ReconcileDiagnosis;
     use auwsx_core::reconcile::{ReconcileIssueReport, ReconcileOrphanReport};
@@ -369,6 +406,52 @@ mod tests {
             spawned_at: 0,
             exited_at,
             note: None,
+        }
+    }
+
+    fn remote_config(project_id: i64) -> ProjectRemoteConfig {
+        ProjectRemoteConfig {
+            project_id,
+            provider: RemoteProvider::Github,
+            remote_url: "https://github.com/acme/repo".to_string(),
+            owner: "acme".to_string(),
+            repo: "repo".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+            auth_kind: RemoteAuthKind::None,
+            auth_ref: None,
+            webhook_secret_ref: None,
+            inbound_auwsx_run_enabled: true,
+            outbound_issue_create_enabled: true,
+            remote_pr_merge_enabled: true,
+            agent_comment_sync_enabled: true,
+            subtask_comment_sync_enabled: true,
+            finding_comment_sync_enabled: true,
+            draft_pr_enabled: false,
+            required_checks_policy: RequiredChecksPolicy::Observe,
+            default_labels: None,
+            default_assignees: None,
+            pr_base_branch: Some("main".to_string()),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn remote_run(id: i64, status: RemoteSyncStatus) -> RemoteSyncRun {
+        RemoteSyncRun {
+            id,
+            project_id: 1,
+            issue_id: Some(9),
+            backlog_item_id: None,
+            remote_issue_link_id: None,
+            remote_pr_link_id: None,
+            direction: RemoteSyncDirection::Outbound,
+            kind: RemoteSyncKind::Pr,
+            status,
+            summary: Some("opened pull request".to_string()),
+            error: None,
+            started_at: Some(1),
+            ended_at: Some(2),
+            created_at: 1,
         }
     }
 
@@ -504,6 +587,31 @@ mod tests {
         assert!(text
             .iter()
             .any(|line| line.contains("issues") && line.contains("1 running")));
+    }
+
+    #[test]
+    fn given_remote_sync_runs_when_lines_built_then_status_and_failures_are_visible() {
+        let mut app = App::new("socket".into());
+        app.remote_configs.insert(1, remote_config(1));
+        let mut failed = remote_run(7, RemoteSyncStatus::Failed);
+        failed.error = Some("required check failed".to_string());
+        app.remote_sync_runs
+            .insert(1, vec![remote_run(8, RemoteSyncStatus::Running), failed]);
+
+        let text = remote_sync_lines(&app, 1)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text
+            .iter()
+            .any(|line| line.contains("1 active") && line.contains("1 failed")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("#8 outbound pr running issue #9")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("required check failed")));
     }
 }
 
