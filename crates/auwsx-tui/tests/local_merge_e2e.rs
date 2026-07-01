@@ -1,6 +1,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use auwsx_core::agent::{codex, ExitKind};
-use auwsx_core::db::{agent_runs, issues, scheduler_runs, Db};
+use auwsx_core::db::projects::{self, MergeMode, UpdateProject};
+use auwsx_core::db::{agent_runs, issues, remote, scheduler_runs, Db};
 use auwsx_core::state::IssueStatus;
 use std::collections::BTreeMap;
 use std::fs;
@@ -139,6 +140,181 @@ async fn configured_llm_agent_can_drive_one_issue_to_terminal() -> Result<()> {
     }
 
     bail!("LLM pipeline did not reach DONE before timeout");
+}
+
+#[tokio::test]
+#[ignore = "spawns auwsx daemon, git worktrees, and fake GitHub CLI"]
+async fn deterministic_agent_drives_remote_issue_and_pr_pipeline() -> Result<()> {
+    let harness = Harness::new("remote-")?;
+    harness.init_repo()?;
+    let agent = harness.write_script("real-agent.sh", DETERMINISTIC_AGENT)?;
+    let gh_log = harness.root.path().join("gh.log");
+    harness.write_script("gh", FAKE_GH)?;
+    let _daemon = harness.start_daemon()?;
+    harness.wait_for_daemon()?;
+
+    let project_id = harness.add_project(&agent)?;
+    let db = Db::open_at(&harness.db_path).await?;
+    set_project_merge_mode(&db, project_id, MergeMode::Pr).await?;
+    harness.auwsx_ok(&[
+        "project",
+        "remote",
+        "set",
+        &project_id.to_string(),
+        "--url",
+        "https://github.com/acme/remote",
+        "--owner",
+        "acme",
+        "--repo",
+        "remote",
+        "--auth-kind",
+        "none",
+        "--outbound-issue-create",
+        "--remote-pr-merge",
+        "--agent-comments",
+        "--subtask-comments",
+        "--finding-comments",
+        "--required-checks",
+        "require_green",
+        "--pr-base",
+        "main",
+    ])?;
+    harness.auwsx_ok(&[
+        "backlog",
+        "add",
+        &project_id.to_string(),
+        "remote e2e issue",
+    ])?;
+
+    let issue_id = wait_for_issue_status(&harness, &db, project_id, IssueStatus::ReadyToMerge)
+        .await
+        .context("waiting for issue to reach READY_TO_MERGE")?;
+    let issue_link = remote::issue_link_by_issue(db.pool(), issue_id)
+        .await?
+        .context("remote issue link should be created before PR merge")?;
+    ensure!(
+        issue_link.remote_issue_number == 101,
+        "bad issue link: {issue_link:?}"
+    );
+
+    harness.auwsx_ok(&["project", "merge", &project_id.to_string()])?;
+    wait_for_issue_status(&harness, &db, project_id, IssueStatus::Done)
+        .await
+        .context("waiting for remote PR observation to mark issue DONE")?;
+
+    let pr_link = remote::pr_link_by_issue(db.pool(), issue_id)
+        .await?
+        .context("remote PR link should be recorded")?;
+    ensure!(pr_link.remote_pr_number == 202, "bad PR link: {pr_link:?}");
+    ensure!(
+        pr_link.state == remote::RemotePrState::Merged,
+        "PR should be observed merged: {pr_link:?}"
+    );
+    ensure!(
+        pr_link.check_status == remote::RemotePrCheckStatus::Success,
+        "PR checks should be observed green: {pr_link:?}"
+    );
+
+    let sync_runs = remote::recent_sync_runs(db.pool(), project_id, 20).await?;
+    ensure!(
+        sync_runs
+            .iter()
+            .any(|run| run.kind == remote::RemoteSyncKind::Issue
+                && run.status == remote::RemoteSyncStatus::Done),
+        "missing done issue sync run: {sync_runs:?}"
+    );
+    ensure!(
+        sync_runs
+            .iter()
+            .any(|run| run.kind == remote::RemoteSyncKind::Pr
+                && run.direction == remote::RemoteSyncDirection::Outbound
+                && run.status == remote::RemoteSyncStatus::Done),
+        "missing done outbound PR sync run: {sync_runs:?}"
+    );
+    ensure!(
+        sync_runs
+            .iter()
+            .any(|run| run.kind == remote::RemoteSyncKind::Pr
+                && run.direction == remote::RemoteSyncDirection::Inbound
+                && run.status == remote::RemoteSyncStatus::Done),
+        "missing done inbound PR observation run: {sync_runs:?}"
+    );
+
+    let gh_log = fs::read_to_string(&gh_log).context("reading fake gh log")?;
+    ensure!(
+        gh_log.contains("issue create"),
+        "missing issue create:\n{gh_log}"
+    );
+    ensure!(gh_log.contains("pr create"), "missing pr create:\n{gh_log}");
+    ensure!(gh_log.contains("pr view"), "missing pr view:\n{gh_log}");
+    Ok(())
+}
+
+async fn set_project_merge_mode(db: &Db, project_id: i64, merge_mode: MergeMode) -> Result<()> {
+    let project = projects::get(db.pool(), project_id)
+        .await?
+        .with_context(|| format!("project {project_id} not found"))?;
+    projects::update(
+        db.pool(),
+        project_id,
+        UpdateProject {
+            name: &project.name,
+            repo_path: &project.repo_path,
+            default_branch: &project.default_branch,
+            arsenal_preset_name: project.arsenal_preset_name.as_deref(),
+            main_agent_cmd: &project.main_agent_cmd,
+            route_agent_cmd: &project.route_agent_cmd,
+            plan_agent_cmd: &project.plan_agent_cmd,
+            work_agent_cmd: &project.work_agent_cmd,
+            review_agent_cmd: project.review_agent_cmd.as_deref(),
+            completion_policy: project.completion_policy,
+            plan_gate_timeout_min: project.plan_gate_timeout_min,
+            completion_soft_timeout_min: project.completion_soft_timeout_min,
+            iteration_timeout_min: project.iteration_timeout_min,
+            main_job_timeout_min: project.main_job_timeout_min,
+            review_max_rounds: project.review_max_rounds,
+            conflict_max_attempts: project.conflict_max_attempts,
+            max_concurrency: project.max_concurrency,
+            schedule_interval_min: project.schedule_interval_min,
+            schedule_cron: project.schedule_cron.as_deref(),
+            merge_mode,
+            skill_path: project.skill_path.as_deref(),
+            deepsleep_interval_days: project.deepsleep_interval_days,
+            deepsleep_cron: project.deepsleep_cron.as_deref(),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn wait_for_issue_status(
+    harness: &Harness,
+    db: &Db,
+    project_id: i64,
+    target: IssueStatus,
+) -> Result<i64> {
+    let mut last = Vec::new();
+    for _ in 0..220 {
+        harness.auwsx_ok(&["scheduler", "run", &project_id.to_string()])?;
+        let project_issues = issues::list_by_project(db.pool(), project_id).await?;
+        last = project_issues
+            .iter()
+            .map(|issue| (issue.id, issue.status))
+            .collect();
+        if let Some(issue) = project_issues.iter().find(|issue| issue.status == target) {
+            return Ok(issue.id);
+        }
+        if target != IssueStatus::Done {
+            if let Some((issue_id, status)) = blocked_or_failed(&last) {
+                bail!(
+                    "issue {issue_id} stopped at {status:?}\n{}",
+                    failure_context(harness, db, project_id, issue_id).await?
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    bail!("issue did not reach {target:?}; last statuses: {last:?}")
 }
 
 async fn assert_scheduler_filled_available_slots(db: &Db, project_id: i64) -> Result<()> {
@@ -330,6 +506,15 @@ impl Harness {
         env.insert("AUWSX_DATA_DIR".to_string(), data_dir.display().to_string());
         env.insert("AUWSX_SOCK".to_string(), socket_path.display().to_string());
         env.insert("AUWSX_TICK_SECS".to_string(), "60".to_string());
+        env.insert(
+            "AUWSX_E2E_GH_LOG".to_string(),
+            root.path().join("gh.log").display().to_string(),
+        );
+        let inherited_path = std::env::var("PATH").unwrap_or_default();
+        env.insert(
+            "PATH".to_string(),
+            format!("{}:{inherited_path}", root.path().display()),
+        );
 
         Ok(Self {
             root,
@@ -587,6 +772,48 @@ case "$status:$AUWSX_AGENT_ROLE" in
     ;;
   *)
     printf 'unexpected phase status=%s role=%s\n' "$status" "$AUWSX_AGENT_ROLE"
+    exit 64
+    ;;
+esac
+"#;
+
+const FAKE_GH: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$*" >> "${AUWSX_E2E_GH_LOG:?}"
+
+case "${1:-} ${2:-}" in
+  "issue create")
+    printf 'https://github.com/acme/remote/issues/101\n'
+    ;;
+  "pr create")
+    printf 'https://github.com/acme/remote/pull/202\n'
+    ;;
+  "pr view")
+    cat <<'JSON'
+{
+  "number": 202,
+  "id": "PR_fake_202",
+  "url": "https://github.com/acme/remote/pull/202",
+  "state": "MERGED",
+  "headRefName": "auwsx/issue-1",
+  "headRefOid": "head-sha",
+  "baseRefName": "main",
+  "baseRefOid": "base-sha",
+  "mergeStateStatus": "CLEAN",
+  "reviewDecision": "APPROVED",
+  "statusCheckRollup": [
+    {"conclusion": "SUCCESS"},
+    {"conclusion": "SKIPPED"}
+  ]
+}
+JSON
+    ;;
+  "issue comment"|"pr comment")
+    printf 'https://github.com/acme/remote/comments/303\n'
+    ;;
+  *)
+    printf 'unexpected fake gh invocation: %s\n' "$*" >&2
     exit 64
     ;;
 esac
