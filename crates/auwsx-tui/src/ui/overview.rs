@@ -808,7 +808,7 @@ fn render_archive_summary(frame: &mut Frame, app: &App, area: Rect) {
             &format!("{done} done  {failed} failed  {abandoned} abandoned"),
         ),
         Line::styled(
-            "low-frequency terminal history; latest items only",
+            "Enter toggles archived issue rows; terminal issues stay out of the main list.",
             theme::dim(),
         ),
         sep(),

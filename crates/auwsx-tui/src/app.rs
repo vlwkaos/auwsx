@@ -2152,8 +2152,13 @@ impl App {
             Some(TreeItem::IssuesRoot(_)) => {
                 caps.push(CapabilityAction::Drill, "Enter", "fold");
             }
-            Some(TreeItem::ArchiveRoot(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter", "fold");
+            Some(TreeItem::ArchiveRoot(project_id)) => {
+                let label = if self.archive_expanded.contains(&project_id) {
+                    "close archive"
+                } else {
+                    "open archive"
+                };
+                caps.push(CapabilityAction::Drill, "Enter", label);
             }
             Some(TreeItem::Issue { .. }) => {
                 caps.push(CapabilityAction::Drill, "Enter", "detail");
@@ -5632,6 +5637,40 @@ mod tests {
                 id: 2
             }
         )));
+    }
+
+    #[test]
+    fn given_archive_root_when_capabilities_requested_then_access_hint_is_explicit() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchiveRoot(42)))
+            .unwrap();
+
+        let closed_hints = app.capabilities();
+
+        assert!(closed_hints
+            .hints
+            .iter()
+            .any(|hint| hint.label == "(Enter) open archive"));
+
+        app.archive_expanded.insert(42);
+        let open_hints = app.capabilities();
+
+        assert!(open_hints
+            .hints
+            .iter()
+            .any(|hint| hint.label == "(Enter) close archive"));
     }
 
     #[test]
