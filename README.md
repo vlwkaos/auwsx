@@ -188,8 +188,9 @@ cargo test --package auwsx-tui --test local_merge_e2e configured_llm_agent_can_d
 The TUI is an operator console:
 
 - Left pane: a tree of all registered projects; each project expands to its
-  Routines, Backlog, and Issues. Expanded projects show counts in those child
-  rows; collapsed project rows show compact `R/B/I` counts.
+  Routines, Backlog, Issues, and Archive. Expanded projects show counts in those
+  child rows; collapsed project rows show compact `R/B/I/A` counts when archived
+  issues exist.
 - Right pane: contextual detail for the highlighted tree row. Embedded issue
   detail labels the issue plan checklist, review findings, queue messages, phase
   reports, and latest agent log tail in a compact readable form. When issue log
@@ -214,8 +215,8 @@ Useful keys:
 - `[` / `]`: move selection to the previous/next project.
 - `Ctrl-,`: open global Settings.
 - `m`: move project order/profile when a project row is selected.
-- `⏎`: enter project kanban, toggle section roots, open issue detail, or edit
-  the selected Settings row.
+- `⏎`: enter project kanban, toggle section roots including Archive, open issue
+  detail, or edit the selected Settings row.
 - `?`: ask a one-shot project question.
 - `Tab` / `BackTab`: switch compatibility views.
 - In issue log focus: `k` / `j` scroll the agent log, `PgUp` / `PgDn` page it,
