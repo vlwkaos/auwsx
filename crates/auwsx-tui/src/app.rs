@@ -1278,9 +1278,11 @@ pub struct App {
     /// and terminal-width-sensitive changes force a clear first.
     needs_redraw: bool,
     force_redraw: bool,
+    last_poll_at: Instant,
 }
 
 const LOG_CAP: usize = 500;
+const UI_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 impl App {
     pub fn new(socket: PathBuf) -> Self {
@@ -1334,6 +1336,7 @@ impl App {
             scanned_repos: Vec::new(),
             needs_redraw: true,
             force_redraw: false,
+            last_poll_at: Instant::now(),
         }
     }
 
@@ -1867,13 +1870,16 @@ impl App {
         self.selected_tree_item()
     }
 
-    pub fn clear_expired_status(&mut self) {
+    pub fn clear_expired_status(&mut self) -> bool {
         if self
             .status_until
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             self.status.clear();
             self.status_until = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -2306,16 +2312,23 @@ impl App {
     async fn refresh_last_auto_ticks(&mut self) -> Result<()> {
         self.last_auto_tick.clear();
         for pid in self.project_ids() {
-            if let Response::SchedulerRuns(runs) = self
-                .req(Command::RecentSchedulerRunsByProject {
-                    project_id: pid,
-                    limit: 8,
-                })
-                .await?
-            {
-                if let Some(run) = runs.iter().find(|r| r.source == SchedulerRunSource::Auto) {
-                    self.last_auto_tick.insert(pid, run.fired_at);
-                }
+            self.refresh_last_auto_tick(pid).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_last_auto_tick(&mut self, project_id: i64) -> Result<()> {
+        if let Response::SchedulerRuns(runs) = self
+            .req(Command::RecentSchedulerRunsByProject {
+                project_id,
+                limit: 8,
+            })
+            .await?
+        {
+            if let Some(run) = runs.iter().find(|r| r.source == SchedulerRunSource::Auto) {
+                self.last_auto_tick.insert(project_id, run.fired_at);
+            } else {
+                self.last_auto_tick.remove(&project_id);
             }
         }
         Ok(())
@@ -2645,16 +2658,24 @@ impl App {
         }
     }
 
-    fn advance_selected_text_scroll(&mut self) {
+    fn advance_selected_text_scroll(&mut self) -> bool {
         self.sync_selected_text_scroll();
         if self.selected_text_scroll_key.is_some() {
             self.selected_text_scroll_offset = self.selected_text_scroll_offset.saturating_add(1);
+            true
+        } else {
+            false
         }
     }
 
-    async fn ui_tick(&mut self) -> Result<()> {
-        self.clear_expired_status();
-        self.advance_selected_text_scroll();
+    async fn ui_tick(&mut self) -> Result<bool> {
+        let mut redraw = self.clear_expired_status();
+        redraw |= self.advance_selected_text_scroll();
+        redraw |= self.has_visible_schedule_countdown();
+        if self.last_poll_at.elapsed() < UI_POLL_INTERVAL {
+            return Ok(redraw);
+        }
+        self.last_poll_at = Instant::now();
         self.refresh_last_auto_ticks().await?;
         match self.view {
             View::Overview => {
@@ -2673,7 +2694,13 @@ impl App {
             }
             _ => {}
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn has_visible_schedule_countdown(&self) -> bool {
+        self.projects.iter().any(|project| {
+            auwsx_core::schedule::cadence_label(project.schedule_cron.as_deref()) != "manual"
+        })
     }
 
     // --- action handling ----------------------------------------------------
@@ -4129,6 +4156,7 @@ impl App {
                 }
             }
             Event::SchedulerTick { project_id } => {
+                self.refresh_last_auto_tick(project_id).await?;
                 self.refresh_project_children(project_id).await?;
                 if Some(project_id) == self.selected_project_id() {
                     self.refresh_activity().await?;
@@ -4338,8 +4366,9 @@ async fn event_loop(terminal: &mut Tui, app: &mut App, socket: &Path) -> Result<
                 app.request_redraw();
             }
             _ = tick.tick() => {
-                app.ui_tick().await?;
-                app.request_redraw();
+                if app.ui_tick().await? {
+                    app.request_redraw();
+                }
             }
         }
     }
@@ -5954,9 +5983,31 @@ mod tests {
         app.status = "cancelled".to_string();
         app.status_until = Some(Instant::now() - Duration::from_millis(1));
 
-        app.clear_expired_status();
+        assert!(app.clear_expired_status());
 
         assert_eq!(app.status, "");
+    }
+
+    #[tokio::test]
+    async fn given_idle_ui_tick_without_visible_animation_then_no_redraw() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.last_poll_at = Instant::now();
+
+        assert!(!app.ui_tick().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_visible_schedule_countdown_when_ui_tick_then_redraws_without_poll(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        let mut project = project_fixture();
+        project.schedule_cron = Some("@tick".to_string());
+        app.projects.push(project);
+        app.last_poll_at = Instant::now();
+
+        assert!(app.ui_tick().await?);
+        Ok(())
     }
 
     #[tokio::test]
