@@ -256,7 +256,6 @@ fn issue_detail_hints(section: IssueDetailSection, active: bool) -> Vec<String> 
             "issue detail".to_string(),
             key_hint("j/k", "section"),
             key_hint("h/l", "section"),
-            key_hint("Enter", "select"),
         ]
     }
 }
@@ -826,13 +825,12 @@ mod tests {
         app.issue_section = IssueDetailSection::Findings;
 
         let findings = footer_model(&app).context_text();
-        assert!(findings.contains("(Enter) select"));
+        assert!(!findings.contains("(Enter)"));
         assert!(!findings.contains("scroll log"));
 
         app.issue_section = IssueDetailSection::Log;
         let log = footer_model(&app).context_text();
         assert!(log.contains("(Enter) scroll log"));
-        assert!(!log.contains("(Enter) select"));
     }
 
     #[test]
