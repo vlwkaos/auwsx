@@ -639,6 +639,17 @@ mod tests {
             .collect()
     }
 
+    fn rendered_app_lines(app: App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .chunks(w as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect()
+    }
+
     #[test]
     fn draw_overview_normal_no_panic() {
         draw_view(View::Overview, 100, 30);
@@ -791,6 +802,24 @@ mod tests {
         assert!(global.contains("(q)uit"));
         assert!(global.contains("(Tab) view"));
         assert!(global.contains("(Ctrl-,) config"));
+    }
+
+    #[test]
+    fn given_footer_when_rendered_then_global_hints_are_right_aligned() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.connected = true;
+
+        let lines = rendered_app_lines(app, 120, 30);
+        let footer = lines.last().expect("footer line");
+        let context_pos = footer.find("(j/k) move").expect("context hint");
+        let global_pos = footer.find("(q)uit").expect("global hint");
+
+        assert!(context_pos < 8, "context hint should stay left: {footer:?}");
+        assert!(
+            global_pos > 80,
+            "global hint should be right aligned: {footer:?}"
+        );
+        assert!(footer.contains("(Ctrl-,) config"));
     }
 
     #[test]
