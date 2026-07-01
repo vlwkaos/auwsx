@@ -128,20 +128,14 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
         ),
         kv(
             "schedule",
-            &format!(
-                "{} / next {}",
-                crate::ui::schedule::interval_label(
-                    p.schedule_cron.as_deref(),
-                    app.daemon_tick_secs,
-                ),
-                crate::ui::schedule::next_due_label(
-                    p.schedule_cron.as_deref(),
-                    last_auto_ms,
-                    p.created_at,
-                    now_ms,
-                    app.daemon_tick_secs,
-                )
-            ),
+            &crate::ui::schedule::schedule_timer_label(
+                p.schedule_cron.as_deref(),
+                last_auto_ms,
+                p.created_at,
+                now_ms,
+                app.daemon_tick_secs,
+            )
+            .unwrap_or_else(|| "manual".to_string()),
         ),
         kv(
             "counts",

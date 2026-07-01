@@ -29,31 +29,6 @@ pub fn fmt_duration_ms(ms: i64) -> String {
     }
 }
 
-/// Full "next auto" label for the detail panel.
-pub fn next_due_label(
-    schedule_cron: Option<&str>,
-    last_auto_fired_at: Option<i64>,
-    created_at_ms: i64,
-    now_ms: i64,
-    tick_interval_secs: i64,
-) -> String {
-    match auwsx_core::schedule::next_due_ms(
-        schedule_cron,
-        last_auto_fired_at,
-        created_at_ms,
-        now_ms,
-        tick_interval_secs,
-    ) {
-        Ok(None) => "manual only".to_string(),
-        Ok(Some(next_ms)) => match countdown_remaining(next_ms.saturating_sub(now_ms)) {
-            CountdownRemaining::Future(dur) => format!("in {dur}"),
-            CountdownRemaining::DueNow => "due now".to_string(),
-            CountdownRemaining::Overdue(dur) => format!("overdue {dur}"),
-        },
-        Err(_) => "invalid schedule".to_string(),
-    }
-}
-
 pub fn schedule_due_for_tree(
     schedule_cron: Option<&str>,
     last_auto_fired_at: Option<i64>,
@@ -85,17 +60,32 @@ pub fn tree_schedule_label(
     now_ms: i64,
     tick_interval_secs: i64,
 ) -> String {
-    let cadence = interval_label(schedule_cron, tick_interval_secs);
-    match schedule_due_for_tree(
+    schedule_timer_label(
         schedule_cron,
         last_auto_fired_at,
         created_at_ms,
         now_ms,
         tick_interval_secs,
-    ) {
-        Some(remaining) => format!("◷ {remaining}/{cadence}"),
-        None => "manual".to_string(),
-    }
+    )
+    .unwrap_or_else(|| "manual".to_string())
+}
+
+pub fn schedule_timer_label(
+    schedule_cron: Option<&str>,
+    last_auto_fired_at: Option<i64>,
+    created_at_ms: i64,
+    now_ms: i64,
+    tick_interval_secs: i64,
+) -> Option<String> {
+    let cadence = interval_label(schedule_cron, tick_interval_secs);
+    schedule_due_for_tree(
+        schedule_cron,
+        last_auto_fired_at,
+        created_at_ms,
+        now_ms,
+        tick_interval_secs,
+    )
+    .map(|remaining| format!("◷ {remaining}/{cadence}"))
 }
 
 pub fn interval_label(schedule_cron: Option<&str>, tick_interval_secs: i64) -> String {
