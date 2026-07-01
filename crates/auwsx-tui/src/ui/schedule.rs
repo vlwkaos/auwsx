@@ -93,7 +93,7 @@ pub fn tree_schedule_label(
         now_ms,
         tick_interval_secs,
     ) {
-        Some(remaining) => format!("\u{23f1} {remaining}/{cadence}"),
+        Some(remaining) => format!("◷ {remaining}/{cadence}"),
         None => "manual".to_string(),
     }
 }
@@ -179,7 +179,7 @@ mod tests {
     fn given_auto_schedule_when_tree_label_then_countdown_and_cadence_are_joined() {
         let label = tree_schedule_label(Some("@every 30m"), Some(0), 0, 15 * 60_000, 10);
 
-        assert_eq!(label, "\u{23f1} 15m/30m");
+        assert_eq!(label, "◷ 15m/30m");
     }
 
     #[test]
