@@ -2172,9 +2172,7 @@ impl App {
                 ProjectDetailSection::Kanban => {
                     caps.push(CapabilityAction::Drill, "Enter", "kanban");
                 }
-                ProjectDetailSection::Preview => {
-                    caps.push(CapabilityAction::Drill, "Enter", "kanban");
-                }
+                ProjectDetailSection::Preview => {}
                 ProjectDetailSection::Archive => {
                     caps.push(CapabilityAction::Drill, "Enter", "archive");
                 }
@@ -3957,9 +3955,12 @@ impl App {
             ProjectDetailSection::Remote => {
                 self.open_project_remote_form().await?;
             }
-            ProjectDetailSection::Kanban | ProjectDetailSection::Preview => {
+            ProjectDetailSection::Kanban => {
                 self.focus = Focus::ProjectKanban;
                 self.clamp_kanban();
+            }
+            ProjectDetailSection::Preview => {
+                self.status = "Preview selected; no direct controls".into();
             }
             ProjectDetailSection::Archive => {
                 if let Some(project_id) = self.selected_project_id() {
