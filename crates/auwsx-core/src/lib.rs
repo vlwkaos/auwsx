@@ -10,6 +10,7 @@
 //! - [`main_jobs`]  — main-workspace lifecycle, queued ops (Plan Step 3.5)
 //! - [`main_job_runner`] — main-job agent execution + artifact recording
 //! - [`remote_plan`] — pure remote issue/PR/comment workflow decisions
+//! - [`remote_workflow`] — daemon-owned remote workflow queueing
 //! - [`routines`]   — cron routines (incl. built-ins) (Plan Step 3.6)
 //! - [`backlog`]    — backlog_items CRUD + admission gate (Plan Step 3.7)
 //! - [`routing`]    — backlog routing into issues / queue messages
@@ -49,6 +50,7 @@ pub mod project_setup;
 pub mod prompt;
 pub mod reconcile;
 pub mod remote_plan;
+pub mod remote_workflow;
 pub mod routines;
 pub mod routing;
 pub mod schedule;

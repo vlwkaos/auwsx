@@ -66,6 +66,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - `crates/auwsx-core/src/db/arsenal.rs` — global Arsenal presets for reusable per-role agent command templates, including the cheap route-agent command
 - `crates/auwsx-core/src/db/global_settings.rs` — singleton global settings such as persisted Pipeline UX Standard prompt guidance
 - `crates/auwsx-core/src/db/remote.rs` — per-project remote repo config, remote issue/PR links, webhook event idempotency, and remote sync audit rows
+- `crates/auwsx-core/src/remote_workflow.rs` — daemon-owned conversion of remote plans into idempotent queued `remote_sync_runs`
 - `crates/auwsx-core/src/ipc.rs` — Unix-socket `Command`/`Response`/`Event` protocol + `serve`/`request`/`EventStream` + unit-testable `dispatch`
 - `crates/auwsx-core/src/db/{projects,issues,subtasks,findings,agent_runs,routing_runs,ask_answers}.rs` — typed row structs + CRUD (issues/backlog/steering/findings persistence + append-only agent run/route/ask logs; `db/mod.rs` re-exports the row types)
 - `crates/auwsx-core/src/db/migrations/0001_init.sql` — full schema

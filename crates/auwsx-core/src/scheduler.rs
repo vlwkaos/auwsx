@@ -27,6 +27,7 @@ use crate::main_job_runner;
 use crate::main_jobs::{self, MainJobStatus};
 use crate::pipeline::{self, Deps};
 use crate::reconcile::{self, AgentReconcileAction, ProjectReconcileReport, ReconcileActionKind};
+use crate::remote_workflow;
 use crate::routines::{self, Routine};
 use crate::routing;
 use crate::state::{IssueStatus, SchedulerClass};
@@ -231,6 +232,18 @@ The daemon will reject any action that does not pass deterministic validation at
     ))
 }
 
+fn remote_blocker_summary(blockers: &[crate::remote_plan::RemotePlanBlocker]) -> String {
+    if blockers.is_empty() {
+        "no remote PR action planned".to_string()
+    } else {
+        blockers
+            .iter()
+            .map(|blocker| format!("{blocker:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 fn extract_answer_from_log(text: &str) -> Option<String> {
     let mut last_agent_message = None;
     for line in text.lines() {
@@ -416,6 +429,19 @@ impl Scheduler {
             }
         };
         let route_outcomes: Vec<_> = routed.iter().map(|item| item.outcome.clone()).collect();
+        for outcome in &route_outcomes {
+            if matches!(outcome, routing::RouteOutcome::CreatedIssue { .. }) {
+                if let Err(e) =
+                    remote_workflow::queue_issue_remote_workflow(pool, outcome.issue_id(), now)
+                        .await
+                {
+                    tracing::warn!(
+                        "queueing remote workflow for issue {} failed: {e:#}",
+                        outcome.issue_id()
+                    );
+                }
+            }
+        }
         let issues = issues::list_by_project(pool, project_id).await?;
         let issue_ids: HashSet<i64> = issues.iter().map(|issue| issue.id).collect();
         let project_running: HashSet<i64> = snapshot
@@ -650,6 +676,12 @@ impl Scheduler {
         let issue = issues::get(self.db.pool(), issue_id)
             .await?
             .ok_or_else(|| anyhow!("issue {issue_id} not found"))?;
+        let project = projects::get(self.db.pool(), issue.project_id)
+            .await?
+            .ok_or_else(|| anyhow!("project {} not found", issue.project_id))?;
+        if project.merge_mode == MergeMode::Pr {
+            return self.queue_remote_pr_merge_for_issue(&issue, now).await;
+        }
         self.ensure_local_merge_not_conflict_blocked(issue.project_id)
             .await?;
         if issue.status != IssueStatus::ReadyToMerge {
@@ -665,9 +697,14 @@ impl Scheduler {
 
     pub async fn approve_project_merge(&self, project_id: i64, now: i64) -> Result<Vec<i64>> {
         self.prune_inflight();
-        projects::get(self.db.pool(), project_id)
+        let project = projects::get(self.db.pool(), project_id)
             .await?
             .ok_or_else(|| anyhow!("project {project_id} not found"))?;
+        if project.merge_mode == MergeMode::Pr {
+            return self
+                .queue_remote_pr_merge_for_project(project_id, now)
+                .await;
+        }
         self.ensure_local_merge_not_conflict_blocked(project_id)
             .await?;
         let preflight = self.diagnose_project(project_id, true).await?;
@@ -714,6 +751,65 @@ impl Scheduler {
 
         self.tick_project(project_id).await?;
         Ok(released)
+    }
+
+    async fn queue_remote_pr_merge_for_issue(&self, issue: &Issue, now: i64) -> Result<Vec<i64>> {
+        if issue.status != IssueStatus::ReadyToMerge {
+            bail!(
+                "issue {} is not ready for remote PR merge; current status is {}",
+                issue.id,
+                issue.status.as_str()
+            );
+        }
+        let queued =
+            remote_workflow::queue_issue_remote_workflow(self.db.pool(), issue.id, now).await?;
+        if queued.plan.actions.iter().any(|action| {
+            matches!(
+                action,
+                crate::remote_plan::RemotePlannedAction::CreateOrUpdatePullRequest { .. }
+            )
+        }) {
+            return Ok(vec![issue.id]);
+        }
+        bail!(
+            "issue {} cannot queue remote PR merge: {}",
+            issue.id,
+            remote_blocker_summary(&queued.plan.blockers)
+        )
+    }
+
+    async fn queue_remote_pr_merge_for_project(
+        &self,
+        project_id: i64,
+        now: i64,
+    ) -> Result<Vec<i64>> {
+        let ready =
+            issues::list_by_status(self.db.pool(), project_id, IssueStatus::ReadyToMerge).await?;
+        if ready.is_empty() {
+            bail!("project {project_id} has no READY_TO_MERGE issues");
+        }
+
+        let mut queued = Vec::new();
+        let mut blockers = Vec::new();
+        for issue in ready {
+            if self.running.lock().unwrap().contains(&issue.id) {
+                continue;
+            }
+            match self.queue_remote_pr_merge_for_issue(&issue, now).await {
+                Ok(ids) => queued.extend(ids),
+                Err(e) => blockers.push(format!("issue {}: {e}", issue.id)),
+            }
+        }
+        if !blockers.is_empty() {
+            bail!(
+                "project {project_id} has remote PR blockers: {}",
+                blockers.join("; ")
+            );
+        }
+        if queued.is_empty() {
+            bail!("project {project_id} has no releasable READY_TO_MERGE issues");
+        }
+        Ok(queued)
     }
 
     async fn ensure_local_merge_not_conflict_blocked(&self, project_id: i64) -> Result<()> {

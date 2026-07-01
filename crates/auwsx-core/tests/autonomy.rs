@@ -30,6 +30,10 @@ use auwsx_core::control_outbox;
 use auwsx_core::db::agent_runs::{self, Role, StartRun};
 use auwsx_core::db::issues::{self, Issue};
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode, NewProject, Project};
+use auwsx_core::db::remote::{
+    self, RemoteAuthKind, RemoteProvider, RemoteSyncKind, RequiredChecksPolicy,
+    UpsertProjectRemoteConfig,
+};
 use auwsx_core::db::scheduler_runs;
 use auwsx_core::db::Db;
 use auwsx_core::events;
@@ -1117,6 +1121,37 @@ async fn drive_project_with_repo(pool: &SqlitePool, repo_path: &str) -> anyhow::
     Ok(id)
 }
 
+async fn enable_project_remote(pool: &SqlitePool, project_id: i64) -> anyhow::Result<()> {
+    remote::upsert_config(
+        pool,
+        UpsertProjectRemoteConfig {
+            project_id,
+            provider: RemoteProvider::Github,
+            remote_url: "https://github.com/acme/app",
+            owner: "acme",
+            repo: "app",
+            api_base_url: "https://api.github.com",
+            auth_kind: RemoteAuthKind::None,
+            auth_ref: None,
+            webhook_secret_ref: None,
+            inbound_auwsx_run_enabled: true,
+            outbound_issue_create_enabled: true,
+            remote_pr_merge_enabled: true,
+            agent_comment_sync_enabled: false,
+            subtask_comment_sync_enabled: false,
+            finding_comment_sync_enabled: false,
+            draft_pr_enabled: false,
+            required_checks_policy: RequiredChecksPolicy::Observe,
+            default_labels: None,
+            default_assignees: None,
+            pr_base_branch: Some("main"),
+        },
+        TS,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn attach_clean_issue_branch(
     pool: &SqlitePool,
     repo: &Path,
@@ -1390,6 +1425,90 @@ async fn given_ready_project_issues_when_project_merge_approved_then_all_release
         IssueStatus::Merging
     );
     release.notify_waiters();
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_pr_merge_project_when_issue_merge_approved_then_remote_pr_sync_is_queued(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    sqlx::query("UPDATE projects SET merge_mode = 'pr' WHERE id = ?")
+        .bind(project_id)
+        .execute(db.pool())
+        .await?;
+    enable_project_remote(db.pool(), project_id).await?;
+    let issue_id = issues::create(db.pool(), project_id, "ready remote pr", None, TS).await?;
+    issues::set_worktree(
+        db.pool(),
+        issue_id,
+        Some("auwsx/issue-remote-pr"),
+        Some("/worktree"),
+        None,
+        TS,
+    )
+    .await?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let released = scheduler.approve_issue_merge(issue_id, TS).await?;
+
+    let issue = issues::get(db.pool(), issue_id)
+        .await?
+        .expect("issue exists");
+    let runs = remote::recent_sync_runs(db.pool(), project_id, 10).await?;
+    assert_eq!(
+        (released, issue.status),
+        (vec![issue_id], IssueStatus::ReadyToMerge)
+    );
+    assert!(runs.iter().any(|run| run.kind == RemoteSyncKind::Pr));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_pr_merge_project_when_project_merge_approved_then_all_ready_pr_syncs_are_queued(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    sqlx::query("UPDATE projects SET merge_mode = 'pr' WHERE id = ?")
+        .bind(project_id)
+        .execute(db.pool())
+        .await?;
+    enable_project_remote(db.pool(), project_id).await?;
+    let first = issues::create(db.pool(), project_id, "first remote pr", None, TS).await?;
+    let second = issues::create(db.pool(), project_id, "second remote pr", None, TS).await?;
+    for (issue_id, branch) in [(first, "auwsx/issue-first"), (second, "auwsx/issue-second")] {
+        issues::set_worktree(
+            db.pool(),
+            issue_id,
+            Some(branch),
+            Some("/worktree"),
+            None,
+            TS,
+        )
+        .await?;
+        issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
+    }
+    let scheduler = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    let released = scheduler.approve_project_merge(project_id, TS).await?;
+
+    let runs = remote::recent_sync_runs(db.pool(), project_id, 10).await?;
+    let pr_runs = runs
+        .iter()
+        .filter(|run| run.kind == RemoteSyncKind::Pr)
+        .count();
+    assert_eq!((released, pr_runs), (vec![first, second], 2));
     Ok(())
 }
 
@@ -2559,6 +2678,36 @@ async fn given_approved_backlog_when_tick_project_then_backlog_is_consumed_into_
         (item.consumed_issue_id.is_some(), issue_count, run_count),
         (true, 1, 1)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_remote_enabled_project_when_backlog_routes_then_remote_issue_sync_is_queued(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    set_project_runtime_policy(db.pool(), project_id, 0, None).await?;
+    enable_project_remote(db.pool(), project_id).await?;
+    backlog::add(
+        db.pool(),
+        project_id,
+        "create a remote mirrored issue",
+        Source::Human,
+        None,
+        TS,
+    )
+    .await?;
+    let sched = scheduler_with(
+        db.clone(),
+        Arc::new(FixedClock(TS)),
+        Arc::new(ExitAgent),
+        Duration::from_secs(60),
+    );
+
+    sched.tick_project(project_id).await?;
+
+    let runs = remote::recent_sync_runs(db.pool(), project_id, 10).await?;
+    assert!(runs.iter().any(|run| run.kind == RemoteSyncKind::Issue));
     Ok(())
 }
 

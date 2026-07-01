@@ -702,6 +702,43 @@ pub async fn recent_sync_runs(
     rows.iter().map(sync_run_from_row).collect()
 }
 
+pub async fn has_active_sync_run(
+    pool: &SqlitePool,
+    project_id: i64,
+    issue_id: Option<i64>,
+    kind: RemoteSyncKind,
+) -> Result<bool> {
+    let count: i64 = if let Some(issue_id) = issue_id {
+        sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM remote_sync_runs
+             WHERE project_id = ?
+               AND issue_id = ?
+               AND kind = ?
+               AND status IN ('queued','running')",
+        )
+        .bind(project_id)
+        .bind(issue_id)
+        .bind(kind.as_str())
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM remote_sync_runs
+             WHERE project_id = ?
+               AND issue_id IS NULL
+               AND kind = ?
+               AND status IN ('queued','running')",
+        )
+        .bind(project_id)
+        .bind(kind.as_str())
+        .fetch_one(pool)
+        .await?
+    };
+    Ok(count > 0)
+}
+
 fn validate_config(input: &UpsertProjectRemoteConfig<'_>) -> Result<()> {
     if input.remote_url.trim().is_empty() {
         bail!("remote_url is required");
