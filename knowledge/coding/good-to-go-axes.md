@@ -131,9 +131,10 @@ the preferred final check.
 ## Project command-source contract
 
 When project agent command configuration changes, test both persisted source and
-runtime resolution. A project may store an Arsenal preset reference plus blank
-or partial per-role overrides; runtime must resolve effective commands from
-override first, then preset.
+runtime resolution. Projects should use an Arsenal preset from the TUI; command
+template editing belongs in Settings > Arsenal. The DB/CLI still support
+per-role overrides for compatibility and import paths, so runtime must continue
+to resolve override first, then preset.
 
 Required checks:
 
@@ -141,8 +142,8 @@ Required checks:
 - CRUD tests prove later Arsenal edits change linked projects' effective
   commands.
 - CRUD tests prove nonblank project overrides win over Arsenal.
-- TUI tests prove Settings opens linked projects with Arsenal selected and keeps
-  nonblank override fields visible.
+- TUI tests prove project create/edit forms require an Arsenal preset and hide
+  per-role command fields.
 
 ## Worktree lifecycle reset-collision coverage
 

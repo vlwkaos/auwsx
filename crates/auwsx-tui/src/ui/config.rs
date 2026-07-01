@@ -201,11 +201,11 @@ fn arsenal_overview_lines(app: &App) -> Vec<Line<'static>> {
         section("Arsenal"),
         kv("builtin", builtin.to_string()),
         kv("custom", custom.to_string()),
-        kv("new preset", "press n or Enter here".into()),
+        kv("new preset", "press a or Enter here".into()),
         sep(),
         section("Purpose"),
         Line::raw("Arsenal presets are global reusable per-role agent commands."),
-        Line::raw("Projects choose a preset first, then optionally override roles."),
+        Line::raw("Projects consume one preset; edit command templates here."),
     ]
 }
 

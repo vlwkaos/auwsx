@@ -677,7 +677,7 @@ fn render_backlog_summary(frame: &mut Frame, app: &App, area: Rect) {
             kv("items", &app.backlog().len().to_string()),
             kv("pending", &pending.to_string()),
             kv("approved", &approved.to_string()),
-            Line::raw("n adds a backlog item. E runs scheduler now or runs the selected item."),
+            Line::raw("a adds a backlog item. E runs scheduler now or runs the selected item."),
         ],
     );
 }

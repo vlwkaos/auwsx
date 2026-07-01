@@ -270,7 +270,6 @@ impl Form {
             .ok()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let codex = codex::DEFAULT_CMD.to_string();
         Self {
             kind: FormKind::Project,
             title: "New project",
@@ -278,12 +277,7 @@ impl Form {
                 field("name", "", false),
                 field("repo_path", &repo, false),
                 field("branch", "main", false),
-                field("arsenal", "", true),
-                field("main_cmd", &codex, true),
-                field("route_cmd", &codex, true),
-                field("plan_cmd", &codex, true),
-                field("work_cmd", &codex, true),
-                field("review_cmd", "", true),
+                field("arsenal", "", false),
                 // @tick = tick every daemon loop; blank/manual = manual-only.
                 field("schedule_cron", "@tick", true),
             ],
@@ -310,32 +304,7 @@ impl Form {
                 field(
                     "arsenal",
                     project.arsenal_preset_name.as_deref().unwrap_or(""),
-                    true,
-                ),
-                field(
-                    "main_cmd",
-                    project.main_agent_cmd_override.as_deref().unwrap_or(""),
-                    true,
-                ),
-                field(
-                    "route_cmd",
-                    project.route_agent_cmd_override.as_deref().unwrap_or(""),
-                    true,
-                ),
-                field(
-                    "plan_cmd",
-                    project.plan_agent_cmd_override.as_deref().unwrap_or(""),
-                    true,
-                ),
-                field(
-                    "work_cmd",
-                    project.work_agent_cmd_override.as_deref().unwrap_or(""),
-                    true,
-                ),
-                field(
-                    "review_cmd",
-                    project.review_agent_cmd_override.as_deref().unwrap_or(""),
-                    true,
+                    false,
                 ),
                 field("completion", project.completion_policy.as_str(), false),
                 field(
@@ -826,7 +795,7 @@ fn field(label: &'static str, value: &str, optional: bool) -> FormField {
         "arsenal" => (
             "Arsenal preset",
             "Agents",
-            "Pick an existing preset or leave blank for custom commands.",
+            "Pick an existing preset. Edit command templates in Settings > Arsenal.",
             FieldKind::Combo { free_text: false },
         ),
         "main_cmd" => ("Main command", "Agents", "", FieldKind::TextArea),
@@ -1168,21 +1137,7 @@ fn project_archive_count_label(children: &ProjectChildren) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectAgentConfig {
-    arsenal_preset_name: Option<String>,
-    main: String,
-    route: String,
-    plan: String,
-    work: String,
-    review: Option<String>,
-}
-
-fn required_cmd(form: &Form, label: &'static str, status: &mut String) -> Option<String> {
-    let value = form.get(label);
-    if value.is_empty() {
-        *status = format!("{label} is required unless an Arsenal preset is selected");
-        return None;
-    }
-    Some(value)
+    arsenal_preset_name: String,
 }
 
 fn project_agent_config_from_form(
@@ -1190,30 +1145,17 @@ fn project_agent_config_from_form(
     preset: Option<&ArsenalPreset>,
     status: &mut String,
 ) -> Option<ProjectAgentConfig> {
-    if !form.get("arsenal").is_empty() && preset.is_none() {
-        *status = format!("unknown Arsenal preset {}", form.get("arsenal"));
+    let requested = form.get("arsenal");
+    let Some(preset) = preset else {
+        *status = if requested.is_empty() {
+            "select an Arsenal preset first".into()
+        } else {
+            format!("unknown Arsenal preset {requested}")
+        };
         return None;
-    }
-    let has_preset = preset.is_some();
+    };
     Some(ProjectAgentConfig {
-        arsenal_preset_name: preset.map(|p| p.name.clone()),
-        main: form
-            .opt("main_cmd")
-            .or_else(|| has_preset.then(String::new))
-            .or_else(|| required_cmd(form, "main_cmd", status))?,
-        route: form
-            .opt("route_cmd")
-            .or_else(|| has_preset.then(String::new))
-            .or_else(|| required_cmd(form, "route_cmd", status))?,
-        plan: form
-            .opt("plan_cmd")
-            .or_else(|| has_preset.then(String::new))
-            .or_else(|| required_cmd(form, "plan_cmd", status))?,
-        work: form
-            .opt("work_cmd")
-            .or_else(|| has_preset.then(String::new))
-            .or_else(|| required_cmd(form, "work_cmd", status))?,
-        review: form.opt("review_cmd"),
+        arsenal_preset_name: preset.name.clone(),
     })
 }
 
@@ -1228,12 +1170,12 @@ fn add_project_command_from_form(
         name: form.get("name"),
         repo_path: form.get("repo_path"),
         default_branch: form.get("branch"),
-        arsenal_preset_name: agent_config.arsenal_preset_name,
-        main_agent_cmd: agent_config.main,
-        route_agent_cmd: agent_config.route,
-        plan_agent_cmd: agent_config.plan,
-        work_agent_cmd: agent_config.work,
-        review_agent_cmd: agent_config.review,
+        arsenal_preset_name: Some(agent_config.arsenal_preset_name),
+        main_agent_cmd: String::new(),
+        route_agent_cmd: String::new(),
+        plan_agent_cmd: String::new(),
+        work_agent_cmd: String::new(),
+        review_agent_cmd: None,
         completion_policy: None,
         plan_gate_timeout_min: None,
         completion_soft_timeout_min: None,
@@ -1819,22 +1761,14 @@ impl App {
             let empty = ProjectChildren::default();
             let kids = self.children.get(&p.id).unwrap_or(&empty);
             let last = self.last_auto_tick.get(&p.id).copied();
-            let interval = crate::ui::schedule::interval_label(
-                p.schedule_cron.as_deref(),
-                p.schedule_interval_min,
-                self.daemon_tick_secs,
-            );
-            let sched = match crate::ui::schedule::schedule_due_for_tree(
+            let sched = crate::ui::schedule::tree_schedule_label(
                 p.schedule_cron.as_deref(),
                 p.schedule_interval_min,
                 last,
                 p.created_at,
                 now_ms,
                 self.daemon_tick_secs,
-            ) {
-                Some(cd) => format!("\u{23f1}{interval} next {cd}"),
-                None => "manual".to_string(),
-            };
+            );
             rows.push(TreeRow {
                 item: TreeItem::Project(p.id),
                 label: project_tree_label(&p.name, &sched, kids, expanded),
@@ -3374,12 +3308,12 @@ impl App {
                         name: form.get("name"),
                         repo_path: form.get("repo_path"),
                         default_branch: form.get("branch"),
-                        arsenal_preset_name: agent_config.arsenal_preset_name,
-                        main_agent_cmd: agent_config.main,
-                        route_agent_cmd: agent_config.route,
-                        plan_agent_cmd: agent_config.plan,
-                        work_agent_cmd: agent_config.work,
-                        review_agent_cmd: agent_config.review,
+                        arsenal_preset_name: Some(agent_config.arsenal_preset_name),
+                        main_agent_cmd: String::new(),
+                        route_agent_cmd: String::new(),
+                        plan_agent_cmd: String::new(),
+                        work_agent_cmd: String::new(),
+                        review_agent_cmd: None,
                         completion_policy,
                         plan_gate_timeout_min,
                         completion_soft_timeout_min,
@@ -5758,57 +5692,12 @@ mod tests {
     }
 
     #[test]
-    fn given_project_form_with_arsenal_preset_when_building_add_command_then_manual_overrides_survive(
-    ) {
+    fn given_project_form_with_arsenal_preset_when_building_add_command_then_sends_only_preset_ref()
+    {
         let mut form = Form::project();
         form.set("name", "manual");
         form.set("repo_path", "/repo");
         form.set("arsenal", "codex");
-        form.set("main_cmd", "manual-main");
-        form.set("plan_cmd", "manual-plan");
-        form.set("work_cmd", "manual-work");
-        form.set("review_cmd", "manual-review");
-        let mut status = String::new();
-        let preset = arsenal_preset("codex", Some("codex-review {prompt}"));
-
-        let cmd = add_project_command_from_form(&form, Some(&preset), &mut status)
-            .expect("valid project command");
-
-        match cmd {
-            Command::AddProject {
-                main_agent_cmd,
-                plan_agent_cmd,
-                work_agent_cmd,
-                review_agent_cmd,
-                ..
-            } => assert_eq!(
-                (
-                    main_agent_cmd.as_str(),
-                    plan_agent_cmd.as_str(),
-                    work_agent_cmd.as_str(),
-                    review_agent_cmd.as_deref()
-                ),
-                (
-                    "manual-main",
-                    "manual-plan",
-                    "manual-work",
-                    Some("manual-review")
-                )
-            ),
-            other => panic!("expected AddProject, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn given_project_form_with_arsenal_preset_and_blank_commands_then_sends_preset_ref() {
-        let mut form = Form::project();
-        form.set("name", "preset");
-        form.set("repo_path", "/repo");
-        form.set("arsenal", "codex");
-        form.set("main_cmd", "");
-        form.set("plan_cmd", "");
-        form.set("work_cmd", "");
-        form.set("review_cmd", "");
         let mut status = String::new();
         let preset = arsenal_preset("codex", Some("codex-review {prompt}"));
 
@@ -5819,6 +5708,7 @@ mod tests {
             Command::AddProject {
                 arsenal_preset_name,
                 main_agent_cmd,
+                route_agent_cmd,
                 plan_agent_cmd,
                 work_agent_cmd,
                 review_agent_cmd,
@@ -5827,14 +5717,28 @@ mod tests {
                 (
                     arsenal_preset_name.as_deref(),
                     main_agent_cmd.as_str(),
+                    route_agent_cmd.as_str(),
                     plan_agent_cmd.as_str(),
                     work_agent_cmd.as_str(),
                     review_agent_cmd.as_deref()
                 ),
-                (Some("codex"), "", "", "", None)
+                (Some("codex"), "", "", "", "", None)
             ),
             other => panic!("expected AddProject, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn given_project_form_without_arsenal_preset_when_building_add_command_then_rejected() {
+        let mut form = Form::project();
+        form.set("name", "preset");
+        form.set("repo_path", "/repo");
+        let mut status = String::new();
+
+        let cmd = add_project_command_from_form(&form, None, &mut status);
+
+        assert!(cmd.is_none());
+        assert_eq!(status, "select an Arsenal preset first");
     }
 
     #[test]
@@ -5856,14 +5760,14 @@ mod tests {
         let form = app.project_config_form(&project);
 
         assert_eq!(form.get("arsenal"), "codex");
-        assert_eq!(form.get("main_cmd"), "");
-        assert_eq!(form.get("plan_cmd"), "");
-        assert_eq!(form.get("work_cmd"), "");
-        assert_eq!(form.get("review_cmd"), "");
+        assert!(form
+            .fields
+            .iter()
+            .all(|field| !field.label.ends_with("_cmd")));
     }
 
     #[test]
-    fn given_project_arsenal_ref_with_override_when_open_config_then_override_is_visible() {
+    fn given_project_arsenal_ref_with_override_when_open_config_then_override_is_hidden() {
         let mut app = test_app();
         let preset = arsenal_preset("codex", Some("codex-review {prompt}"));
         let mut project = project_fixture();
@@ -5881,10 +5785,10 @@ mod tests {
         let form = app.project_config_form(&project);
 
         assert_eq!(form.get("arsenal"), "codex");
-        assert_eq!(form.get("main_cmd"), "manual-main {prompt}");
-        assert_eq!(form.get("plan_cmd"), "");
-        assert_eq!(form.get("work_cmd"), "");
-        assert_eq!(form.get("review_cmd"), "");
+        assert!(form
+            .fields
+            .iter()
+            .all(|field| !field.label.ends_with("_cmd")));
     }
 
     #[test]
@@ -5965,15 +5869,15 @@ mod tests {
 
         let form = app.form.expect("form remains open");
         assert_eq!(form.get("arsenal"), "codex");
-        assert_eq!(form.get("main_cmd"), "");
-        assert_eq!(form.get("plan_cmd"), "");
-        assert_eq!(form.get("work_cmd"), "");
-        assert_eq!(form.get("review_cmd"), "");
+        assert!(form
+            .fields
+            .iter()
+            .all(|field| !field.label.ends_with("_cmd")));
         Ok(())
     }
 
     #[tokio::test]
-    async fn given_accepted_preset_without_review_when_tab_accepts_then_review_field_is_blank(
+    async fn given_accepted_preset_without_review_when_tab_accepts_then_no_command_fields_are_added(
     ) -> anyhow::Result<()> {
         let mut app = test_app();
         app.arsenal_presets = vec![arsenal_preset("codex", None)];
@@ -5986,7 +5890,10 @@ mod tests {
             .await?;
 
         let form = app.form.expect("form remains open");
-        assert_eq!(form.get("review_cmd"), "");
+        assert!(form
+            .fields
+            .iter()
+            .all(|field| !field.label.ends_with("_cmd")));
         Ok(())
     }
 }
