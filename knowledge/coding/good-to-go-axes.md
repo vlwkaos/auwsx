@@ -40,6 +40,7 @@ source of truth):
 | `db::remote::RemoteAuthKind` (snake) | `project_remote_configs.auth_kind` |
 | `db::remote::RequiredChecksPolicy` (snake) | `project_remote_configs.required_checks_policy` |
 | `db::remote::RemotePrState` (snake) | `remote_pr_links.state` |
+| `db::remote::RemotePrCheckStatus` (snake) | `remote_pr_links.check_status` |
 | `db::remote::RemoteEventStatus` (snake) | `remote_events.status` |
 | `db::remote::RemoteSyncDirection` (snake) | `remote_sync_runs.direction` |
 | `db::remote::RemoteSyncKind` (snake) | `remote_sync_runs.kind` |
