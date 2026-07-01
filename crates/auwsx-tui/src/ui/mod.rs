@@ -359,15 +359,10 @@ fn draw_form(frame: &mut Frame, app: &App) {
         }
     }
 
-    let controls = match form.mode {
-        crate::app::FormMode::Navigate => {
-            "Nav · j/k field · (Enter) edit · h/l select · (E) submit · (Esc) cancel"
-        }
-        crate::app::FormMode::Edit => {
-            "Input · type · (Tab) complete · Backspace/Delete · (Enter/Esc) done"
-        }
-    };
-    lines.push(Line::from(Span::styled(controls, theme::hint())));
+    lines.push(Line::from(Span::styled(
+        form_controls_label(form.mode),
+        theme::hint(),
+    )));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -401,6 +396,28 @@ fn form_label_width(form: &Form) -> usize {
         .max()
         .unwrap_or(0)
         .clamp(4, 18)
+}
+
+fn form_controls_label(mode: crate::app::FormMode) -> String {
+    match mode {
+        crate::app::FormMode::Navigate => [
+            "nav".to_string(),
+            key_hint("j/k", "field"),
+            key_hint("Enter", "edit"),
+            key_hint("h/l", "select"),
+            key_hint("E", "submit"),
+            key_hint("Esc", "cancel"),
+        ]
+        .join(" · "),
+        crate::app::FormMode::Edit => [
+            "input".to_string(),
+            "type".to_string(),
+            key_hint("Tab", "complete"),
+            key_hint("Backspace/Delete", "delete"),
+            key_hint("Enter/Esc", "done"),
+        ]
+        .join(" · "),
+    }
 }
 
 fn field_kind_tag(field: &crate::app::FormField) -> String {
@@ -574,7 +591,8 @@ pub(crate) fn render_list(
 #[cfg(test)]
 mod tests {
     use super::{
-        footer_context, footer_model, form_extra_rows, form_label_width, key_hint, FooterContext,
+        footer_context, footer_model, form_controls_label, form_extra_rows, form_label_width,
+        key_hint, FooterContext,
     };
     use crate::app::{App, FieldKind, Focus, Form, FormField, FormKind, IssueDetailSection, View};
     use crate::ui::draw;
@@ -881,6 +899,21 @@ mod tests {
 
         assert!(rendered.contains("> Text:"));
         assert!(!rendered.contains(">               Text:"));
+        assert!(rendered.contains("nav"));
+        assert!(rendered.contains("(j/k) field"));
+        assert!(rendered.contains("(E) submit"));
+        assert!(!rendered.contains("Nav · j/k field"));
+    }
+
+    #[test]
+    fn given_form_edit_mode_when_controls_labeled_then_keyhints_are_formatted() {
+        let label = form_controls_label(crate::app::FormMode::Edit);
+
+        assert!(label.contains("input"));
+        assert!(label.contains("(Tab) complete"));
+        assert!(label.contains("(Backspace/Delete) delete"));
+        assert!(label.contains("(Enter/Esc) done"));
+        assert!(!label.contains("Enter/Esc done"));
     }
 
     #[test]
