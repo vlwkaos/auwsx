@@ -2717,6 +2717,21 @@ impl App {
     }
 
     fn selected_text_scroll_key(&self) -> Option<String> {
+        if self.focus == Focus::IssueDetail {
+            return self
+                .detail
+                .issue
+                .as_ref()
+                .or_else(|| self.selected_issue())
+                .and_then(|issue| {
+                    issue
+                        .description
+                        .as_ref()
+                        .map(|description| (issue.id, description))
+                })
+                .filter(|(_, description)| description.lines().count() > 1)
+                .map(|(id, _)| format!("issue:{id}:description"));
+        }
         match self.selected_context_item()? {
             TreeItem::Backlog { project_id, id } => self
                 .children_of(project_id)?
@@ -4826,6 +4841,27 @@ mod tests {
 
         assert_eq!(app.selected_text_scroll_key.as_deref(), Some("backlog:2"));
         assert_eq!(app.selected_text_scroll_offset, 0);
+    }
+
+    #[test]
+    fn given_issue_detail_from_non_issue_tree_when_synced_then_description_scrolls() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(1, ProjectChildren::default());
+        app.focus = Focus::IssueDetail;
+        app.tree_sel = 0;
+        let mut issue = issue_fixture();
+        issue.description = Some("alpha\nbeta\ngamma".to_string());
+        app.detail.issue = Some(issue);
+
+        app.sync_selected_text_scroll();
+        app.advance_selected_text_scroll();
+
+        assert_eq!(
+            app.selected_text_scroll_key.as_deref(),
+            Some("issue:7:description")
+        );
+        assert_eq!(app.selected_text_scroll_offset("issue:7:description", 3), 1);
     }
 
     #[test]
