@@ -2232,12 +2232,16 @@ impl App {
         self.focus == Focus::ProjectKanban && self.selected_kanban_item() == Some(item)
     }
 
+    pub(crate) fn kanban_cards(&self) -> Vec<ui::vm::KanbanCard> {
+        ui::vm::kanban_cards_with_runs(self.backlog(), self.issues(), &self.recent_agent_runs)
+    }
+
     fn kanban_items_for_lane(&self, lane_idx: usize) -> Vec<ui::vm::KanbanItem> {
         let lane = ui::vm::KanbanLane::ALL
             .get(lane_idx)
             .copied()
             .unwrap_or(ui::vm::KanbanLane::Plan);
-        ui::vm::kanban_cards(self.backlog(), self.issues())
+        self.kanban_cards()
             .into_iter()
             .filter(|card| card.belongs_to(lane))
             .map(|card| card.item())
@@ -5953,6 +5957,31 @@ mod tests {
         assert_eq!(app.issue_return_focus, Focus::ProjectKanban);
         assert_eq!(app.issue_return_tree_sel, Some(0));
         assert_eq!(app.selected_tree_item(), Some(TreeItem::Project(1)));
+    }
+
+    #[test]
+    fn given_open_issue_run_when_app_projects_kanban_then_card_activity_is_agent() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.recent_agent_runs = vec![test_agent_run(99, 7, Some("target/agent.log"))];
+
+        let card = app
+            .kanban_cards()
+            .into_iter()
+            .find(|card| card.item() == ui::vm::KanbanItem::Issue(7))
+            .expect("issue card");
+
+        match card {
+            ui::vm::KanbanCard::Issue { activity, .. } => assert_eq!(activity, Some("agent")),
+            other => panic!("expected issue card, got {other:?}"),
+        }
     }
 
     // --- App::repo_suggestions -------------------------------------------

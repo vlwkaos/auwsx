@@ -987,8 +987,7 @@ fn render_kanban(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Percentage(25),
         ])
         .split(area);
-    let cards =
-        super::vm::kanban_cards_with_runs(app.backlog(), app.issues(), &app.recent_agent_runs);
+    let cards = app.kanban_cards();
     for (idx, lane) in super::vm::KanbanLane::ALL.iter().copied().enumerate() {
         let title = if app.focus == crate::app::Focus::ProjectKanban && app.kanban_lane_sel == idx {
             format!("{} *", lane.title())

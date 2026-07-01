@@ -113,10 +113,6 @@ impl KanbanCard {
     }
 }
 
-pub(crate) fn kanban_cards(backlog: &[BacklogItem], issues: &[Issue]) -> Vec<KanbanCard> {
-    kanban_cards_with_runs(backlog, issues, &[])
-}
-
 pub(crate) fn kanban_cards_with_runs(
     backlog: &[BacklogItem],
     issues: &[Issue],
@@ -660,11 +656,12 @@ mod tests {
 
     #[test]
     fn given_dismissed_backlog_when_projected_then_excluded() {
-        let cards = kanban_cards(
+        let cards = kanban_cards_with_runs(
             &[
                 backlog(1, Approval::Approved),
                 backlog(2, Approval::Dismissed),
             ],
+            &[],
             &[],
         );
         assert_eq!(cards.len(), 1);
@@ -673,13 +670,13 @@ mod tests {
     #[test]
     fn given_many_archived_issues_when_projected_then_archive_cards_are_capped_at_ten() {
         let issues: Vec<Issue> = (0..12).map(|i| issue(i, IssueStatus::Done)).collect();
-        let cards = kanban_cards(&[], &issues);
+        let cards = kanban_cards_with_runs(&[], &issues, &[]);
         assert_eq!(cards.len(), 10);
     }
 
     #[test]
     fn given_statuses_when_projected_then_cards_belong_to_expected_lanes() {
-        let cards = kanban_cards(
+        let cards = kanban_cards_with_runs(
             &[],
             &[
                 issue(1, IssueStatus::Planning),
@@ -687,6 +684,7 @@ mod tests {
                 issue(3, IssueStatus::ReadyToMerge),
                 issue(4, IssueStatus::Done),
             ],
+            &[],
         );
         for (id, lane) in [
             (1, KanbanLane::Plan),
@@ -704,7 +702,7 @@ mod tests {
 
     #[test]
     fn given_attention_status_when_projected_then_issue_card_marks_attention() {
-        let cards = kanban_cards(&[], &[issue(1, IssueStatus::PlanBlocked)]);
+        let cards = kanban_cards_with_runs(&[], &[issue(1, IssueStatus::PlanBlocked)], &[]);
         match &cards[0] {
             KanbanCard::Issue {
                 needs_attention, ..
