@@ -2163,7 +2163,7 @@ impl App {
             }
             match self.project_section {
                 ProjectDetailSection::Recovery => {
-                    caps.push(CapabilityAction::Execute, "E", "execute");
+                    caps.push(CapabilityAction::Execute, "E", "reconcile");
                 }
                 ProjectDetailSection::Remote => {
                     caps.push(CapabilityAction::Drill, "Enter", "remote");
@@ -2174,7 +2174,17 @@ impl App {
                 }
                 ProjectDetailSection::Preview => {}
                 ProjectDetailSection::Archive => {
-                    caps.push(CapabilityAction::Drill, "Enter", "archive");
+                    let label = self
+                        .selected_project_id()
+                        .map(|project_id| {
+                            if self.archive_expanded.contains(&project_id) {
+                                "close archive"
+                            } else {
+                                "open archive"
+                            }
+                        })
+                        .unwrap_or("archive");
+                    caps.push(CapabilityAction::Drill, "Enter", label);
                 }
             }
             return caps;
@@ -5292,6 +5302,45 @@ mod tests {
             Some(FormKind::Backlog)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn given_project_detail_recovery_when_capabilities_requested_then_reconcile_is_named() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.focus = Focus::ProjectDetail;
+        app.project_section = ProjectDetailSection::Recovery;
+
+        let hints = app.capabilities();
+
+        assert!(hints.has(CapabilityAction::Execute));
+        assert!(hints
+            .hints
+            .iter()
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(E) reconcile"));
+    }
+
+    #[test]
+    fn given_project_detail_archive_when_capabilities_requested_then_open_close_is_named() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.focus = Focus::ProjectDetail;
+        app.project_section = ProjectDetailSection::Archive;
+
+        let closed_hints = app.capabilities();
+
+        assert!(closed_hints
+            .hints
+            .iter()
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) open archive"));
+
+        app.archive_expanded.insert(1);
+        let open_hints = app.capabilities();
+
+        assert!(open_hints
+            .hints
+            .iter()
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) close archive"));
     }
 
     #[tokio::test]
