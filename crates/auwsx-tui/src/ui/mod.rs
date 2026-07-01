@@ -310,9 +310,6 @@ fn draw_form(frame: &mut Frame, app: &App) {
     let mut active_field_prefix_chars = 0usize;
     for (idx, field) in form.fields.iter().enumerate() {
         if field.section != prev_section {
-            if !prev_section.is_empty() {
-                lines.push(Line::raw(""));
-            }
             lines.push(Line::from(Span::styled(
                 field.section.to_string(),
                 theme::title(),
@@ -335,15 +332,17 @@ fn draw_form(frame: &mut Frame, app: &App) {
         }
         let mut row = vec![Span::styled(label, label_style)];
         row.extend(field_value_spans(field, form.cursor, editing));
-        row.push(Span::styled(
-            format!("  {}", field_kind_tag(field)),
-            theme::dim(),
-        ));
-        if active && !field.help.is_empty() {
-            row.extend([
-                Span::styled("  ·  ", theme::dim()),
-                Span::styled(field.help.to_string(), theme::hint()),
-            ]);
+        if active {
+            row.push(Span::styled(
+                format!("  {}", field_kind_tag(field)),
+                theme::dim(),
+            ));
+            if !field.help.is_empty() {
+                row.extend([
+                    Span::styled("  ·  ", theme::dim()),
+                    Span::styled(field.help.to_string(), theme::hint()),
+                ]);
+            }
         }
         lines.push(Line::from(row));
     }
@@ -371,13 +370,12 @@ fn draw_form(frame: &mut Frame, app: &App) {
         }
     }
 
-    lines.push(Line::raw(""));
     let controls = match form.mode {
         crate::app::FormMode::Navigate => {
-            "Navigate: j/k field · Enter edit · h/l cycle select · (E) submit · Esc cancel"
+            "Nav · j/k field · (Enter) edit · h/l select · (E) submit · (Esc) cancel"
         }
         crate::app::FormMode::Edit => {
-            "Edit: type text · Tab complete · Backspace/Delete edit · Enter/Esc done"
+            "Input · type · (Tab) complete · Backspace/Delete · (Enter/Esc) done"
         }
     };
     lines.push(Line::from(Span::styled(controls, theme::hint())));
@@ -494,7 +492,7 @@ fn form_extra_rows(form: &Form, suggestion_count: usize) -> usize {
             prev_section = field.section;
         }
     }
-    sections + suggestion_count + usize::from(suggestion_count > 0) + 3
+    sections + suggestion_count + usize::from(suggestion_count > 0) + 1
 }
 
 fn draw_confirm_quit(frame: &mut Frame, _app: &App) {
@@ -879,6 +877,7 @@ mod tests {
         let with_help = form_extra_rows(&form, 0);
         form.current = 1;
 
+        assert_eq!(with_help, 2);
         assert_eq!(with_help, form_extra_rows(&form, 0));
     }
 

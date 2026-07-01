@@ -1428,7 +1428,7 @@ impl App {
     }
 
     /// Preset-name completions for the `arsenal` field in project forms.
-    /// Tab accepts the top match and expands it into the four agent commands.
+    /// Tab accepts the top match; project forms store the preset reference only.
     pub fn arsenal_suggestions(&self) -> Vec<String> {
         let Some(form) = &self.form else {
             return Vec::new();
@@ -1569,11 +1569,6 @@ impl App {
 
     fn select_arsenal_preset(form: &mut Form, preset: &ArsenalPreset) {
         form.set("arsenal", &preset.name);
-        form.set("main_cmd", "");
-        form.set("route_cmd", "");
-        form.set("plan_cmd", "");
-        form.set("work_cmd", "");
-        form.set("review_cmd", "");
     }
 
     fn project_matching_arsenal(&self, project: &Project) -> Option<ArsenalPreset> {
@@ -6165,6 +6160,24 @@ mod tests {
             .find(|field| field.label == "arsenal")
             .expect("arsenal field exists");
         assert_eq!(arsenal.value, "");
+    }
+
+    #[test]
+    fn given_project_form_when_created_then_command_fields_are_not_shown() {
+        let form = Form::project();
+
+        assert!(form
+            .fields
+            .iter()
+            .all(|field| !field.label.ends_with("_cmd")));
+        assert_eq!(
+            form.fields
+                .iter()
+                .filter(|field| field.section == "Agents")
+                .map(|field| field.label)
+                .collect::<Vec<_>>(),
+            vec!["arsenal"]
+        );
     }
 
     #[tokio::test]
