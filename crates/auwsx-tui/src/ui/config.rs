@@ -147,10 +147,13 @@ fn runtime_default_lines(app: &App) -> Vec<Line<'static>> {
         kv("prompt phases", prompt::preview_count().to_string()),
         sep(),
         section("Project Settings"),
-        kv("where", "select a project in Overview and press e".into()),
+        kv(
+            "where",
+            "Overview project row -> Enter detail, e edits".into(),
+        ),
         kv(
             "project-only",
-            "merge, schedule, concurrency, timeouts, skill path".into(),
+            "arsenal preset, merge, schedule, concurrency, timeouts, skill path".into(),
         ),
         sep(),
         section("Pipeline Standard"),
@@ -186,7 +189,7 @@ fn memory_overview_lines(app: &App) -> Vec<Line<'static>> {
         sep(),
         section("Purpose"),
         Line::raw("Memory presets wire retrieve, save, dream, and deepsleep."),
-        Line::raw("Use Settings edit to choose a preset; CLI edits preset commands."),
+        Line::raw("Settings chooses the active preset; command templates are global config."),
     ]
 }
 
@@ -205,7 +208,7 @@ fn arsenal_overview_lines(app: &App) -> Vec<Line<'static>> {
         sep(),
         section("Purpose"),
         Line::raw("Arsenal presets are global reusable per-role agent commands."),
-        Line::raw("Projects consume one preset; edit command templates here."),
+        Line::raw("Project setup chooses one preset; command templates are edited here."),
     ]
 }
 
