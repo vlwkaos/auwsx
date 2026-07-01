@@ -96,9 +96,15 @@ fn footer_hint(app: &App) -> String {
         return format!("{prefix}{}", parts.join(" · "));
     }
     if app.move_mode {
-        return format!(
-            "{prefix}move mode · (j/k) local reorder · (h/l) move profile · (m)ove exit · (Esc) cancel"
-        );
+        let profile = if matches!(
+            app.selected_tree_item(),
+            Some(crate::app::TreeItem::Project(_))
+        ) {
+            " · (h/l) move profile"
+        } else {
+            ""
+        };
+        return format!("{prefix}move mode · (j/k) reorder{profile} · (m)ove exit · (Esc) cancel");
     }
     if app.focus == crate::app::Focus::ProjectKanban {
         let caps = app.capabilities();

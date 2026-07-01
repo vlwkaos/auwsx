@@ -74,6 +74,13 @@ pub enum IssueSectionMode {
     Active,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveScope {
+    Project,
+    Backlog,
+    Issue,
+}
+
 impl View {
     pub const ORDER: [View; 5] = [
         View::Overview,
@@ -2083,6 +2090,7 @@ impl App {
             }
             Some(TreeItem::Backlog { .. }) => {
                 caps.push(CapabilityAction::Add, "a", "add backlog");
+                caps.push(CapabilityAction::MoveMode, "m", "move");
                 caps.push(CapabilityAction::Approve, "A", "approve");
                 if self
                     .selected_backlog()
@@ -2101,6 +2109,7 @@ impl App {
             }
             Some(TreeItem::Issue { .. }) => {
                 caps.push(CapabilityAction::Drill, "Enter", "detail");
+                caps.push(CapabilityAction::MoveMode, "m", "move");
                 if self.selected_issue_accepts_queue_message() {
                     caps.push(CapabilityAction::Add, "a", "steer");
                 }
@@ -2672,9 +2681,11 @@ impl App {
         self.refresh_last_auto_ticks().await?;
         match self.view {
             View::Overview => {
-                if let Some(project_id) = self.selected_project_id() {
-                    self.refresh_project_children(project_id).await?;
-                    self.refresh_activity().await?;
+                if !self.move_mode {
+                    if let Some(project_id) = self.selected_project_id() {
+                        self.refresh_project_children(project_id).await?;
+                        self.refresh_activity().await?;
+                    }
                 }
                 if self.focus == Focus::IssueDetail || self.selected_issue().is_some() {
                     self.refresh_detail().await?;
@@ -2708,7 +2719,7 @@ impl App {
                 } else if self.view == View::Config {
                     self.move_settings_row(1);
                 } else if self.move_mode {
-                    self.move_project_order(1).await?;
+                    self.move_selected_item(1).await?;
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_card(1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
@@ -2727,7 +2738,7 @@ impl App {
                 } else if self.view == View::Config {
                     self.move_settings_row(-1);
                 } else if self.move_mode {
-                    self.move_project_order(-1).await?;
+                    self.move_selected_item(-1).await?;
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_card(-1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
@@ -2742,7 +2753,7 @@ impl App {
             }
             Action::Left => {
                 if self.move_mode {
-                    self.move_project_profile(-1).await?;
+                    self.move_selected_item_across(-1).await?;
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_lane(-1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
@@ -2751,7 +2762,7 @@ impl App {
             }
             Action::Right => {
                 if self.move_mode {
-                    self.move_project_profile(1).await?;
+                    self.move_selected_item_across(1).await?;
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_lane(1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
@@ -2889,20 +2900,31 @@ impl App {
                 self.open_project_remote_form().await?;
             }
             Action::MoveMode => {
-                if !self.capabilities().has(CapabilityAction::MoveMode) {
-                    self.status = "select a project first".into();
+                if self.move_mode {
+                    self.move_mode = false;
+                    self.status = "move mode off".into();
                     return Ok(false);
                 }
-                if matches!(self.selected_tree_item(), Some(TreeItem::Project(_))) {
-                    self.move_mode = !self.move_mode;
+                if !self.capabilities().has(CapabilityAction::MoveMode) {
+                    self.status = "select a movable project, backlog item, or issue first".into();
+                    return Ok(false);
+                }
+                if let Some(scope) = self.selected_move_scope() {
+                    self.move_mode = true;
                     self.focus = Focus::Left;
-                    self.status = if self.move_mode {
-                        "move mode: j/k reorder, h/l move profile, m exits".into()
-                    } else {
-                        "move mode off".into()
+                    self.status = match scope {
+                        MoveScope::Project => {
+                            "move mode: project j/k reorder, h/l move profile, m exits".into()
+                        }
+                        MoveScope::Backlog => {
+                            "move mode: backlog j/k reorder loaded list, m exits".into()
+                        }
+                        MoveScope::Issue => {
+                            "move mode: issue j/k reorder loaded list, m exits".into()
+                        }
                     };
                 } else {
-                    self.status = "select a project first".into();
+                    self.status = "select a movable project, backlog item, or issue first".into();
                 }
             }
             Action::PrevProject => self.select_adjacent_project(-1).await?,
@@ -3862,6 +3884,82 @@ impl App {
         Ok(())
     }
 
+    fn selected_move_scope(&self) -> Option<MoveScope> {
+        match self.selected_tree_item()? {
+            TreeItem::Project(_) => Some(MoveScope::Project),
+            TreeItem::Backlog { .. } => Some(MoveScope::Backlog),
+            TreeItem::Issue { .. } => Some(MoveScope::Issue),
+            _ => None,
+        }
+    }
+
+    async fn move_selected_item(&mut self, delta: isize) -> Result<()> {
+        match self.selected_tree_item() {
+            Some(TreeItem::Project(_)) => self.move_project_order(delta).await,
+            Some(TreeItem::Backlog { project_id, id }) => {
+                self.move_backlog_local(project_id, id, delta);
+                Ok(())
+            }
+            Some(TreeItem::Issue { project_id, id }) => {
+                self.move_issue_local(project_id, id, delta);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn move_selected_item_across(&mut self, delta: isize) -> Result<()> {
+        if matches!(self.selected_move_scope(), Some(MoveScope::Project)) {
+            self.move_project_profile(delta).await
+        } else {
+            self.status = "h/l only moves projects between profiles".into();
+            Ok(())
+        }
+    }
+
+    fn move_backlog_local(&mut self, project_id: i64, backlog_id: i64, delta: isize) {
+        let Some(children) = self.children.get_mut(&project_id) else {
+            return;
+        };
+        let Some(current) = children
+            .backlog
+            .iter()
+            .position(|item| item.id == backlog_id)
+        else {
+            return;
+        };
+        let next = (current as isize + delta)
+            .clamp(0, children.backlog.len().saturating_sub(1) as isize)
+            as usize;
+        if next == current {
+            return;
+        }
+        children.backlog.swap(current, next);
+        self.select_tree_backlog(backlog_id);
+        self.status = "reordered backlog in loaded view".into();
+    }
+
+    fn move_issue_local(&mut self, project_id: i64, issue_id: i64, delta: isize) {
+        let Some(children) = self.children.get_mut(&project_id) else {
+            return;
+        };
+        let Some(current) = children
+            .issues
+            .iter()
+            .position(|issue| issue.id == issue_id)
+        else {
+            return;
+        };
+        let next = (current as isize + delta)
+            .clamp(0, children.issues.len().saturating_sub(1) as isize) as usize;
+        if next == current {
+            return;
+        }
+        children.issues.swap(current, next);
+        self.select_tree_issue(issue_id);
+        self.status = "reordered issue in loaded view".into();
+    }
+
     fn select_tree_project(&mut self, project_id: i64) {
         if let Some(idx) = self
             .tree_rows()
@@ -4577,6 +4675,145 @@ mod tests {
 
         assert_eq!(app.selected_text_scroll_key.as_deref(), Some("backlog:2"));
         assert_eq!(app.selected_text_scroll_offset, 0);
+    }
+
+    #[test]
+    fn given_backlog_item_selected_when_capabilities_requested_then_move_visible() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                backlog: vec![backlog_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Backlog { id: 1, .. }))
+            .expect("backlog row exists");
+
+        assert!(app.capabilities().has(CapabilityAction::MoveMode));
+    }
+
+    #[test]
+    fn given_issue_item_selected_when_capabilities_requested_then_move_visible() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Issue { id: 7, .. }))
+            .expect("issue row exists");
+
+        assert!(app.capabilities().has(CapabilityAction::MoveMode));
+    }
+
+    #[tokio::test]
+    async fn given_backlog_move_mode_when_down_then_loaded_backlog_order_swaps(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        let mut first = backlog_fixture();
+        first.id = 1;
+        let mut second = backlog_fixture();
+        second.id = 2;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                backlog: vec![first, second],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Backlog { id: 1, .. }))
+            .expect("first backlog row exists");
+
+        app.apply(Action::MoveMode).await?;
+        app.apply(Action::Down).await?;
+
+        let ids: Vec<i64> = app
+            .children
+            .get(&1)
+            .unwrap()
+            .backlog
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, vec![2, 1]);
+        assert!(matches!(
+            app.selected_tree_item(),
+            Some(TreeItem::Backlog { id: 1, .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_move_mode_active_when_move_key_pressed_then_exits() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.tree_sel = 0;
+
+        app.apply(Action::MoveMode).await?;
+        app.apply(Action::MoveMode).await?;
+
+        assert!(!app.move_mode);
+        assert_eq!(app.status, "move mode off");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_issue_move_mode_when_down_then_loaded_issue_order_swaps() -> anyhow::Result<()> {
+        let mut app = test_app();
+        let mut first = issue_fixture();
+        first.id = 7;
+        let mut second = issue_fixture();
+        second.id = 8;
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![first, second],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Issue { id: 7, .. }))
+            .expect("first issue row exists");
+
+        app.apply(Action::MoveMode).await?;
+        app.apply(Action::Down).await?;
+
+        let ids: Vec<i64> = app
+            .children
+            .get(&1)
+            .unwrap()
+            .issues
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, vec![8, 7]);
+        assert!(matches!(
+            app.selected_tree_item(),
+            Some(TreeItem::Issue { id: 7, .. })
+        ));
+        Ok(())
     }
 
     #[test]

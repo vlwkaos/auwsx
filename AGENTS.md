@@ -29,6 +29,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - Active issue listing from an agent shell should use exported daemon env directly: `"$AUWSX_BIN" issue ls "$AUWSX_PROJECT_ID"`.
 - For issue-local `issue get`/`finding add`/`issue status`, use `$AUWSX_BIN`; `target/debug/auwsx` talks to the daemon and can fail on worker-only statuses.
 - Cargo test accepts one positional test filter per invocation; run multiple focused tests as separate `cargo test --package <pkg> <filter>` commands.
+- Core tests mutate process-global `AUWSX_DATA_DIR`; use `cargo test --package auwsx-core -- --test-threads=1` instead of the default parallel core test command.
 - This repo has no `crates/auwsx-tui/tests`; broad source/test scans should use existing paths such as `crates/auwsx-core/tests` and `crates/auwsx-tui/src`.
 - Shell patterns containing Markdown backticks must be single-quoted, e.g. `rg -n 'on `FAILED`' README.md`; double quotes trigger command substitution.
 - Shell patterns beginning with `--` need an option terminator, e.g. `rg -n -- "--arsenal|arsenal_preset_name|codex" crates/auwsx-tui/src/cli.rs`.
