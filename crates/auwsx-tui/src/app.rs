@@ -4488,7 +4488,6 @@ where
     let result = (|| -> Result<()> {
         if clear {
             terminal.clear()?;
-            terminal.draw(|_| {})?;
         }
         terminal.draw(f)?;
         Ok(())
