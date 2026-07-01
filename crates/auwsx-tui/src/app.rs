@@ -75,6 +75,50 @@ pub enum IssueSectionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueDetailSection {
+    Summary,
+    Findings,
+    WorkQueue,
+    Log,
+}
+
+impl IssueDetailSection {
+    pub const ALL: [Self; 4] = [Self::Summary, Self::Findings, Self::WorkQueue, Self::Log];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Summary => 0,
+            Self::Findings => 1,
+            Self::WorkQueue => 2,
+            Self::Log => 3,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Summary => "Issue Detail",
+            Self::Findings => "Findings",
+            Self::WorkQueue => "Subtasks / Queue",
+            Self::Log => "Log",
+        }
+    }
+
+    pub fn is_interactive(self) -> bool {
+        matches!(self, Self::Log)
+    }
+
+    fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or(Self::Summary)
+    }
+
+    fn step(self, delta: isize) -> Self {
+        let mut index = self.index();
+        step(&mut index, delta, Self::ALL.len());
+        Self::from_index(index)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MoveScope {
     Project,
     Backlog,
@@ -1232,7 +1276,7 @@ pub struct App {
     pub tree_sel: usize,
     pub kanban_lane_sel: usize,
     pub kanban_card_sel: usize,
-    pub issue_section_sel: usize,
+    pub issue_section: IssueDetailSection,
     pub issue_section_mode: IssueSectionMode,
     pub issue_return_focus: Focus,
     pub issue_return_tree_sel: Option<usize>,
@@ -1304,7 +1348,7 @@ impl App {
             tree_sel: 0,
             kanban_lane_sel: 0,
             kanban_card_sel: 0,
-            issue_section_sel: 0,
+            issue_section: IssueDetailSection::Summary,
             issue_section_mode: IssueSectionMode::Selected,
             issue_return_focus: Focus::Left,
             issue_return_tree_sel: None,
@@ -3746,8 +3790,12 @@ impl App {
     }
 
     fn move_issue_section(&mut self, delta: isize) {
-        step(&mut self.issue_section_sel, delta, 4);
+        self.issue_section = self.issue_section.step(delta);
         self.issue_section_mode = IssueSectionMode::Selected;
+    }
+
+    pub fn selected_issue_section(&self) -> IssueDetailSection {
+        self.issue_section
     }
 
     pub fn issue_section_is_active(&self) -> bool {
@@ -3756,16 +3804,19 @@ impl App {
 
     fn issue_log_section_active(&self) -> bool {
         self.focus == Focus::IssueDetail
-            && self.issue_section_sel == 3
+            && self.issue_section == IssueDetailSection::Log
             && self.issue_section_is_active()
     }
 
     fn activate_issue_section(&mut self) {
-        if self.issue_section_sel == 3 {
+        if self.issue_section.is_interactive() {
             self.issue_section_mode = IssueSectionMode::Active;
-            self.status = "log scroll active".into();
+            self.status = format!("{} active", self.issue_section.title().to_ascii_lowercase());
         } else {
-            self.status = "section selected; only log has interactive controls".into();
+            self.status = format!(
+                "{} selected; no direct controls",
+                self.issue_section.title().to_ascii_lowercase()
+            );
         }
     }
 
@@ -4479,12 +4530,12 @@ mod tests {
         let mut app = test_app();
         app.view = View::Overview;
         app.focus = Focus::IssueDetail;
-        app.issue_section_sel = 3;
+        app.issue_section = IssueDetailSection::Log;
         app.log_tail = "one\ntwo\nthree\n".to_string();
 
         app.apply(Action::Up).await?;
 
-        assert_eq!(app.issue_section_sel, 2);
+        assert_eq!(app.selected_issue_section(), IssueDetailSection::WorkQueue);
         assert_eq!(app.issue_log_scroll, 0);
         assert_eq!(app.issue_section_mode, IssueSectionMode::Selected);
         Ok(())
@@ -4495,13 +4546,13 @@ mod tests {
         let mut app = test_app();
         app.view = View::Overview;
         app.focus = Focus::IssueDetail;
-        app.issue_section_sel = 3;
+        app.issue_section = IssueDetailSection::Log;
         app.log_tail = "one\ntwo\nthree\n".to_string();
 
         app.apply(Action::Drill).await?;
         app.apply(Action::Up).await?;
 
-        assert_eq!(app.issue_section_sel, 3);
+        assert_eq!(app.selected_issue_section(), IssueDetailSection::Log);
         assert_eq!(app.issue_log_scroll, 1);
         assert_eq!(app.issue_section_mode, IssueSectionMode::Active);
         Ok(())
@@ -4513,16 +4564,13 @@ mod tests {
         let mut app = test_app();
         app.view = View::Overview;
         app.focus = Focus::IssueDetail;
-        app.issue_section_sel = 1;
+        app.issue_section = IssueDetailSection::Findings;
 
         app.apply(Action::Drill).await?;
 
-        assert_eq!(app.issue_section_sel, 1);
+        assert_eq!(app.selected_issue_section(), IssueDetailSection::Findings);
         assert_eq!(app.issue_section_mode, IssueSectionMode::Selected);
-        assert_eq!(
-            app.status,
-            "section selected; only log has interactive controls"
-        );
+        assert_eq!(app.status, "findings selected; no direct controls");
         Ok(())
     }
 
@@ -4532,7 +4580,7 @@ mod tests {
         let mut app = test_app();
         app.view = View::Overview;
         app.focus = Focus::IssueDetail;
-        app.issue_section_sel = 3;
+        app.issue_section = IssueDetailSection::Log;
         app.issue_section_mode = IssueSectionMode::Active;
 
         app.apply(Action::Back).await?;

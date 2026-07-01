@@ -793,7 +793,7 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(issue_section_constraints(app.issue_section_sel))
+        .constraints(issue_section_constraints(app.selected_issue_section()))
         .split(area);
     let mut lines = vec![
         kv("title", &issue.title),
@@ -825,8 +825,12 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
     panel_with_focus(
         frame,
         rows[0],
-        issue_section_title(app, 0, &format!("Issue #{}", issue.id)),
-        app.focus == crate::app::Focus::IssueDetail && app.issue_section_sel == 0,
+        issue_section_title(
+            app,
+            crate::app::IssueDetailSection::Summary,
+            &format!("Issue #{}", issue.id),
+        ),
+        issue_section_selected(app, crate::app::IssueDetailSection::Summary),
         lines,
     );
 
@@ -850,8 +854,8 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
     panel_with_focus(
         frame,
         rows[1],
-        issue_section_title(app, 1, "Findings"),
-        app.focus == crate::app::Focus::IssueDetail && app.issue_section_sel == 1,
+        issue_section_title(app, crate::app::IssueDetailSection::Findings, "Findings"),
+        issue_section_selected(app, crate::app::IssueDetailSection::Findings),
         findings,
     );
 
@@ -878,8 +882,12 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
     panel_with_focus(
         frame,
         rows[2],
-        issue_section_title(app, 2, "Subtasks / Queue"),
-        app.focus == crate::app::Focus::IssueDetail && app.issue_section_sel == 2,
+        issue_section_title(
+            app,
+            crate::app::IssueDetailSection::WorkQueue,
+            "Subtasks / Queue",
+        ),
+        issue_section_selected(app, crate::app::IssueDetailSection::WorkQueue),
         work,
     );
 
@@ -887,32 +895,32 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         rows[3],
         app,
-        issue_section_title(app, 3, "Log"),
-        app.focus == crate::app::Focus::IssueDetail && app.issue_section_sel == 3,
+        issue_section_title(app, crate::app::IssueDetailSection::Log, "Log"),
+        issue_section_selected(app, crate::app::IssueDetailSection::Log),
     );
 }
 
-fn issue_section_constraints(active: usize) -> [Constraint; 4] {
+fn issue_section_constraints(active: crate::app::IssueDetailSection) -> [Constraint; 4] {
     match active {
-        0 => [
+        crate::app::IssueDetailSection::Summary => [
             Constraint::Length(10),
             Constraint::Length(4),
             Constraint::Length(5),
             Constraint::Min(3),
         ],
-        1 => [
+        crate::app::IssueDetailSection::Findings => [
             Constraint::Length(5),
             Constraint::Length(10),
             Constraint::Length(5),
             Constraint::Min(3),
         ],
-        2 => [
+        crate::app::IssueDetailSection::WorkQueue => [
             Constraint::Length(5),
             Constraint::Length(4),
             Constraint::Length(10),
             Constraint::Min(3),
         ],
-        _ => [
+        crate::app::IssueDetailSection::Log => [
             Constraint::Length(5),
             Constraint::Length(4),
             Constraint::Length(5),
@@ -921,20 +929,18 @@ fn issue_section_constraints(active: usize) -> [Constraint; 4] {
     }
 }
 
-fn issue_section_title<'a>(app: &App, idx: usize, title: &'a str) -> &'a str {
-    if app.focus == crate::app::Focus::IssueDetail && app.issue_section_sel == idx {
-        match (idx, app.issue_section_is_active()) {
-            (0, false) => "Issue Detail *",
-            (1, false) => "Findings *",
-            (2, false) => "Subtasks / Queue *",
-            (3, false) => "Log *",
-            (0, true) => "Issue Detail active",
-            (1, true) => "Findings active",
-            (2, true) => "Subtasks / Queue active",
-            _ => "Log active",
+fn issue_section_selected(app: &App, section: crate::app::IssueDetailSection) -> bool {
+    app.focus == crate::app::Focus::IssueDetail && app.selected_issue_section() == section
+}
+
+fn issue_section_title(app: &App, section: crate::app::IssueDetailSection, title: &str) -> String {
+    if issue_section_selected(app, section) {
+        match app.issue_section_is_active() {
+            true => format!("{} active", section.title()),
+            false => format!("{} *", section.title()),
         }
     } else {
-        title
+        title.to_string()
     }
 }
 
@@ -1107,10 +1113,11 @@ fn panel(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) 
 fn panel_with_focus(
     frame: &mut Frame,
     area: Rect,
-    title: &str,
+    title: impl AsRef<str>,
     focused: bool,
     mut lines: Vec<Line<'static>>,
 ) {
+    let title = title.as_ref();
     let visible = area.height.saturating_sub(2) as usize;
     if visible > 0 && lines.len() > visible {
         let hidden = lines.len().saturating_sub(visible);

@@ -175,14 +175,15 @@ fn footer_model(app: &App) -> FooterModel {
         return model;
     }
     if app.focus == crate::app::Focus::IssueDetail {
-        if app.issue_section_sel == 3 && app.issue_section_is_active() {
+        let section = app.selected_issue_section();
+        if section.is_interactive() && app.issue_section_is_active() {
             model.context.extend([
-                "log active".to_string(),
+                format!("{} active", section.title().to_ascii_lowercase()),
                 key_hint("j/k", "scroll"),
                 key_hint("h/l", "section"),
                 key_hint("Pg", "page"),
             ]);
-        } else if app.issue_section_sel == 3 {
+        } else if section.is_interactive() {
             model.context.extend([
                 "issue detail".to_string(),
                 key_hint("j/k", "section"),
@@ -194,7 +195,7 @@ fn footer_model(app: &App) -> FooterModel {
                 "issue detail".to_string(),
                 key_hint("j/k", "section"),
                 key_hint("h/l", "section"),
-                key_hint("Enter", "activate"),
+                key_hint("Enter", "select"),
             ]);
         }
         model
@@ -527,7 +528,7 @@ pub(crate) fn render_list(
 #[cfg(test)]
 mod tests {
     use super::{footer_model, key_hint};
-    use crate::app::{App, View};
+    use crate::app::{App, Focus, IssueDetailSection, View};
     use crate::ui::draw;
     use auwsx_core::agent::ExitKind;
     use auwsx_core::db::agent_runs::{AgentRun, Role};
@@ -723,5 +724,22 @@ mod tests {
         assert!(global.contains("(q)uit"));
         assert!(global.contains("(Tab) view"));
         assert!(global.contains("(Ctrl-,) config"));
+    }
+
+    #[test]
+    fn given_issue_detail_sections_when_footer_modeled_then_only_log_advertises_focus() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.connected = true;
+        app.focus = Focus::IssueDetail;
+        app.issue_section = IssueDetailSection::Findings;
+
+        let findings = footer_model(&app).context_text();
+        assert!(findings.contains("(Enter) select"));
+        assert!(!findings.contains("scroll log"));
+
+        app.issue_section = IssueDetailSection::Log;
+        let log = footer_model(&app).context_text();
+        assert!(log.contains("(Enter) scroll log"));
+        assert!(!log.contains("(Enter) select"));
     }
 }

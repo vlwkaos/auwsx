@@ -214,10 +214,10 @@ pub(super) fn log_block_with_title_focused(
     frame: &mut Frame,
     area: Rect,
     app: &App,
-    section: &str,
+    section: impl AsRef<str>,
     focused: bool,
 ) {
-    log_block_inner(frame, area, app, Some(section), focused);
+    log_block_inner(frame, area, app, Some(section.as_ref()), focused);
 }
 
 fn log_block_inner(frame: &mut Frame, area: Rect, app: &App, section: Option<&str>, focused: bool) {
