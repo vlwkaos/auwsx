@@ -11,7 +11,7 @@ pub(crate) mod schedule;
 pub(crate) mod theme;
 pub(crate) mod vm;
 
-use crate::app::{App, FieldKind, Form, View};
+use crate::app::{App, FieldKind, Focus, Form, FormMode, IssueDetailSection, TreeItem, View};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -93,145 +93,179 @@ fn footer_model(app: &App) -> FooterModel {
     if !app.connected {
         model.context.push("offline".to_string());
     }
-    if app.confirm_quit {
-        model.context.extend(
-            [
+    model.context.extend(footer_context(app).hints(app));
+    model
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterContext {
+    ConfirmQuit,
+    Form(FormMode),
+    IssueView,
+    Config,
+    MoveMode {
+        project_scope: bool,
+    },
+    ProjectKanban,
+    IssueDetail {
+        section: IssueDetailSection,
+        active: bool,
+        return_to_kanban: bool,
+    },
+    Overview,
+}
+
+impl FooterContext {
+    fn from_app(app: &App) -> Self {
+        if app.confirm_quit {
+            return Self::ConfirmQuit;
+        }
+        if let Some(form) = app.form.as_ref() {
+            return Self::Form(form.mode);
+        }
+        if app.view == View::Issue {
+            return Self::IssueView;
+        }
+        if app.view == View::Config {
+            return Self::Config;
+        }
+        if app.move_mode {
+            return Self::MoveMode {
+                project_scope: matches!(app.selected_tree_item(), Some(TreeItem::Project(_))),
+            };
+        }
+        if app.focus == Focus::ProjectKanban {
+            return Self::ProjectKanban;
+        }
+        if app.focus == Focus::IssueDetail {
+            return Self::IssueDetail {
+                section: app.selected_issue_section(),
+                active: app.issue_section_is_active(),
+                return_to_kanban: app.issue_return_focus == Focus::ProjectKanban,
+            };
+        }
+        Self::Overview
+    }
+
+    fn hints(self, app: &App) -> Vec<String> {
+        match self {
+            Self::ConfirmQuit => vec![
                 key_hint("y/Enter", "stop daemon"),
                 key_hint("n/Esc", "cancel"),
                 key_hint("Ctrl-C", "quit only"),
-            ]
-            .map(String::from),
-        );
-        return model;
-    }
-    if let Some(form) = app.form.as_ref() {
-        match form.mode {
-            crate::app::FormMode::Navigate => model.context.extend(
-                [
-                    "form nav".to_string(),
-                    key_hint("j/k", "field"),
-                    key_hint("Enter", "edit"),
-                    key_hint("E", "submit"),
-                    key_hint("Esc", "cancel"),
-                ]
-                .map(String::from),
+            ],
+            Self::Form(FormMode::Navigate) => vec![
+                "form nav".to_string(),
+                key_hint("j/k", "field"),
+                key_hint("Enter", "edit"),
+                key_hint("E", "submit"),
+                key_hint("Esc", "cancel"),
+            ],
+            Self::Form(FormMode::Edit) => vec![
+                "form edit".to_string(),
+                key_hint("Tab", "complete"),
+                key_hint("Enter", "done"),
+                key_hint("Esc", "done"),
+            ],
+            Self::IssueView => with_capabilities(
+                vec![
+                    key_hint("k", "older"),
+                    key_hint("j", "newer"),
+                    key_hint("PgUp/PgDn", "page"),
+                    key_hint("Home", "oldest"),
+                    key_hint("End", "newest"),
+                ],
+                app,
+                Some(key_hint("Esc", "back")),
             ),
-            crate::app::FormMode::Edit => model.context.extend(
-                [
-                    "form edit".to_string(),
-                    key_hint("Tab", "complete"),
-                    key_hint("Enter", "done"),
-                    key_hint("Esc", "done"),
-                ]
-                .map(String::from),
+            Self::Config => {
+                let mut hints = vec!["settings".to_string(), key_hint("j/k", "select")];
+                hints.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
+                hints.extend([key_hint("Pg", "scroll detail"), key_hint("Esc", "main")]);
+                hints
+            }
+            Self::MoveMode { project_scope } => {
+                let mut hints = vec!["move mode".to_string(), key_hint("j/k", "reorder")];
+                if project_scope {
+                    hints.push(key_hint("h/l", "move profile"));
+                }
+                hints.extend([key_hint("m", "move exit"), key_hint("Esc", "cancel")]);
+                hints
+            }
+            Self::ProjectKanban => with_capabilities(
+                vec![
+                    "kanban".to_string(),
+                    key_hint("h/l", "column"),
+                    key_hint("j/k", "item"),
+                    key_hint("Enter", "open"),
+                ],
+                app,
+                Some(key_hint("Esc", "left")),
+            ),
+            Self::IssueDetail {
+                section,
+                active,
+                return_to_kanban,
+            } => {
+                let mut hints = issue_detail_hints(section, active);
+                hints.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
+                hints.push(issue_detail_escape_hint(active, return_to_kanban));
+                hints
+            }
+            Self::Overview => with_capabilities(
+                vec![key_hint("j/k", "move"), key_hint("[/]", "project")],
+                app,
+                None,
             ),
         }
-        return model;
     }
-    if app.view == View::Issue {
-        model.context.extend(
-            [
-                key_hint("k", "older"),
-                key_hint("j", "newer"),
-                key_hint("PgUp/PgDn", "page"),
-                key_hint("Home", "oldest"),
-                key_hint("End", "newest"),
-            ]
-            .map(String::from),
-        );
-        model
-            .context
-            .extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-        model.context.push(key_hint("Esc", "back"));
-        return model;
-    }
-    if app.view == View::Config {
-        model.context.push("settings".to_string());
-        model.context.push(key_hint("j/k", "select"));
-        model
-            .context
-            .extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-        model.context.push(key_hint("Pg", "scroll detail"));
-        model.context.push(key_hint("Esc", "main"));
-        return model;
-    }
-    if app.move_mode {
-        let profile = if matches!(
-            app.selected_tree_item(),
-            Some(crate::app::TreeItem::Project(_))
-        ) {
-            Some(key_hint("h/l", "move profile"))
-        } else {
-            None
-        };
-        model.context.push("move mode".to_string());
-        model.context.push(key_hint("j/k", "reorder"));
-        if let Some(profile) = profile {
-            model.context.push(profile);
-        }
-        model.context.push(key_hint("m", "move exit"));
-        model.context.push(key_hint("Esc", "cancel"));
-        return model;
-    }
-    if app.focus == crate::app::Focus::ProjectKanban {
-        let caps = app.capabilities();
-        model.context.extend([
-            "kanban".to_string(),
-            key_hint("h/l", "column"),
-            key_hint("j/k", "item"),
-            key_hint("Enter", "open"),
-        ]);
-        model
-            .context
-            .extend(caps.hints.into_iter().map(|hint| hint.label));
-        model.context.push(key_hint("Esc", "left"));
-        return model;
-    }
-    if app.focus == crate::app::Focus::IssueDetail {
-        let section = app.selected_issue_section();
-        if section.is_interactive() && app.issue_section_is_active() {
-            model.context.extend([
-                format!("{} active", section.title().to_ascii_lowercase()),
-                key_hint("j/k", "scroll"),
-                key_hint("h/l", "section"),
-                key_hint("Pg", "page"),
-            ]);
-        } else if section.is_interactive() {
-            model.context.extend([
-                "issue detail".to_string(),
-                key_hint("j/k", "section"),
-                key_hint("h/l", "section"),
-                key_hint("Enter", "scroll log"),
-            ]);
-        } else {
-            model.context.extend([
-                "issue detail".to_string(),
-                key_hint("j/k", "section"),
-                key_hint("h/l", "section"),
-                key_hint("Enter", "select"),
-            ]);
-        }
-        model
-            .context
-            .extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-        let esc = if app.issue_section_is_active() {
-            key_hint("Esc", "section")
-        } else if app.issue_return_focus == crate::app::Focus::ProjectKanban {
-            key_hint("Esc", "kanban")
-        } else {
-            key_hint("Esc", "left")
-        };
-        model.context.push(esc);
-        return model;
-    }
+}
 
-    model
-        .context
-        .extend([key_hint("j/k", "move"), key_hint("[/]", "project")]);
-    model
-        .context
-        .extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-    model
+fn footer_context(app: &App) -> FooterContext {
+    FooterContext::from_app(app)
+}
+
+fn with_capabilities(mut hints: Vec<String>, app: &App, trailing: Option<String>) -> Vec<String> {
+    hints.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
+    if let Some(trailing) = trailing {
+        hints.push(trailing);
+    }
+    hints
+}
+
+fn issue_detail_hints(section: IssueDetailSection, active: bool) -> Vec<String> {
+    if section.is_interactive() && active {
+        vec![
+            format!("{} active", section.title().to_ascii_lowercase()),
+            key_hint("j/k", "scroll"),
+            key_hint("h/l", "section"),
+            key_hint("Pg", "page"),
+        ]
+    } else if section.is_interactive() {
+        vec![
+            "issue detail".to_string(),
+            key_hint("j/k", "section"),
+            key_hint("h/l", "section"),
+            key_hint("Enter", "scroll log"),
+        ]
+    } else {
+        vec![
+            "issue detail".to_string(),
+            key_hint("j/k", "section"),
+            key_hint("h/l", "section"),
+            key_hint("Enter", "select"),
+        ]
+    }
+}
+
+fn issue_detail_escape_hint(active: bool, return_to_kanban: bool) -> String {
+    if active {
+        key_hint("Esc", "section")
+    } else if return_to_kanban {
+        key_hint("Esc", "kanban")
+    } else {
+        key_hint("Esc", "left")
+    }
 }
 
 fn global_footer_hints() -> Vec<String> {
@@ -543,7 +577,7 @@ pub(crate) fn render_list(
 
 #[cfg(test)]
 mod tests {
-    use super::{footer_model, form_extra_rows, key_hint};
+    use super::{footer_context, footer_model, form_extra_rows, key_hint, FooterContext};
     use crate::app::{App, FieldKind, Focus, Form, FormField, FormKind, IssueDetailSection, View};
     use crate::ui::draw;
     use auwsx_core::agent::ExitKind;
@@ -740,6 +774,59 @@ mod tests {
         assert!(global.contains("(q)uit"));
         assert!(global.contains("(Tab) view"));
         assert!(global.contains("(Ctrl-,) config"));
+    }
+
+    #[test]
+    fn given_ui_state_when_footer_context_requested_then_modal_depth_wins() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.connected = true;
+        app.focus = Focus::ProjectKanban;
+        app.confirm_quit = true;
+
+        assert_eq!(footer_context(&app), FooterContext::ConfirmQuit);
+
+        app.confirm_quit = false;
+        app.form = Some(Form {
+            kind: FormKind::Backlog,
+            title: "Backlog",
+            fields: vec![FormField {
+                label: "text",
+                display: "Text",
+                section: "Content",
+                help: "",
+                kind: FieldKind::Text,
+                value: String::new(),
+                optional: false,
+            }],
+            current: 0,
+            cursor: 0,
+            completion_sel: 0,
+            mode: crate::app::FormMode::Edit,
+        });
+
+        assert_eq!(
+            footer_context(&app),
+            FooterContext::Form(crate::app::FormMode::Edit)
+        );
+    }
+
+    #[test]
+    fn given_issue_detail_state_when_footer_context_requested_then_section_depth_is_preserved() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.connected = true;
+        app.focus = Focus::IssueDetail;
+        app.issue_section = IssueDetailSection::Log;
+        app.issue_section_mode = crate::app::IssueSectionMode::Active;
+        app.issue_return_focus = Focus::ProjectKanban;
+
+        assert_eq!(
+            footer_context(&app),
+            FooterContext::IssueDetail {
+                section: IssueDetailSection::Log,
+                active: true,
+                return_to_kanban: true,
+            }
+        );
     }
 
     #[test]
