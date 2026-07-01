@@ -613,6 +613,22 @@ mod tests {
             .iter()
             .any(|line| line.contains("required check failed")));
     }
+
+    #[test]
+    fn given_scrolled_text_when_lines_built_then_window_starts_at_offset() {
+        let mut app = App::new("socket".into());
+        app.selected_text_scroll_key = Some("backlog:9".to_string());
+        app.selected_text_scroll_offset = 1;
+
+        let text = scrolling_text_lines("text", "backlog:9", "one\ntwo\nthree", &app, 2)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text[0].contains("line 2/3"));
+        assert_eq!(text[1], "  two");
+        assert_eq!(text[2], "  three");
+    }
 }
 
 fn render_routines(frame: &mut Frame, app: &App, area: Rect) {
@@ -692,6 +708,13 @@ fn render_backlog(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     };
+    let text_lines = scrolling_text_lines(
+        "text",
+        &format!("backlog:{}", b.id),
+        &b.text,
+        app,
+        area.height.saturating_sub(10).max(3) as usize,
+    );
     let mut lines = vec![
         kv("id", &b.id.to_string()),
         kv("approval", b.approval.as_str()),
@@ -704,9 +727,9 @@ fn render_backlog(frame: &mut Frame, app: &App, area: Rect) {
         ),
         kv("created", &b.created_at.to_string()),
         sep(),
-        Line::raw(b.text.clone()),
-        sep(),
     ];
+    lines.extend(text_lines);
+    lines.extend([sep()]);
     let action = if b.consumed_issue_id.is_some() {
         "Already promoted; select linked issue to continue."
     } else if b.approval == Approval::Dismissed {
@@ -791,7 +814,13 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ];
     if let Some(desc) = &issue.description {
-        lines.push(kv("description", desc));
+        lines.extend(scrolling_text_lines(
+            "description",
+            &format!("issue:{}:description", issue.id),
+            desc,
+            app,
+            3,
+        ));
     }
     append_issue_summary_lines(&mut lines, app, issue);
     panel_with_focus(
@@ -1022,24 +1051,30 @@ fn render_kanban_preview(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     match preview {
-        super::vm::KanbanPreview::Backlog(item) => panel(
-            frame,
-            area,
-            &format!("Preview Backlog #{}", item.id),
-            vec![
-                kv("approval", item.approval.as_str()),
-                kv("source", item.source.as_str()),
-                kv(
-                    "consumed",
-                    &item
-                        .consumed_issue_id
-                        .map(|id| format!("#{id}"))
-                        .unwrap_or_else(|| "no".to_string()),
-                ),
-                sep(),
-                Line::raw(item.text.clone()),
-            ],
-        ),
+        super::vm::KanbanPreview::Backlog(item) => {
+            panel(frame, area, &format!("Preview Backlog #{}", item.id), {
+                let mut lines = vec![
+                    kv("approval", item.approval.as_str()),
+                    kv("source", item.source.as_str()),
+                    kv(
+                        "consumed",
+                        &item
+                            .consumed_issue_id
+                            .map(|id| format!("#{id}"))
+                            .unwrap_or_else(|| "no".to_string()),
+                    ),
+                    sep(),
+                ];
+                lines.extend(scrolling_text_lines(
+                    "text",
+                    &format!("backlog:{}", item.id),
+                    &item.text,
+                    app,
+                    area.height.saturating_sub(8).max(3) as usize,
+                ));
+                lines
+            })
+        }
         super::vm::KanbanPreview::Issue(issue) => {
             panel(frame, area, &format!("Preview Issue #{}", issue.id), {
                 let mut lines = vec![
@@ -1102,6 +1137,35 @@ fn kv(key: &str, val: &str) -> Line<'static> {
         Span::styled(format!("{key:>16}: "), theme::dim()),
         Span::styled(val.to_string(), Style::default().fg(theme::TEXT)),
     ])
+}
+
+fn scrolling_text_lines(
+    label: &str,
+    key: &str,
+    text: &str,
+    app: &App,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= 1 {
+        return vec![kv(label, text)];
+    }
+    let max_lines = max_lines.max(1).min(lines.len());
+    let offset = app.selected_text_scroll_offset(key, lines.len());
+    let mut out = vec![Line::from(vec![
+        Span::styled(format!("{label:>16}: "), theme::dim()),
+        Span::styled(
+            format!("line {}/{}", offset + 1, lines.len()),
+            Style::default().fg(theme::TEXT_DIM),
+        ),
+    ])];
+    for idx in 0..max_lines {
+        out.push(Line::raw(format!(
+            "  {}",
+            lines[(offset + idx) % lines.len()]
+        )));
+    }
+    out
 }
 
 fn append_issue_summary_lines(

@@ -1267,6 +1267,8 @@ pub struct App {
     pub log_tail_path: Option<String>,
     /// Issue log scroll offset measured from the newest visible line.
     pub issue_log_scroll: usize,
+    pub selected_text_scroll_key: Option<String>,
+    pub selected_text_scroll_offset: usize,
     /// Settings scroll offset for long config/prompt review content.
     pub config_scroll: usize,
     pub settings_sel: usize,
@@ -1332,6 +1334,8 @@ impl App {
             log_tail: String::new(),
             log_tail_path: None,
             issue_log_scroll: 0,
+            selected_text_scroll_key: None,
+            selected_text_scroll_offset: 0,
             config_scroll: 0,
             settings_sel: 0,
             log: VecDeque::new(),
@@ -2610,8 +2614,61 @@ impl App {
         self.config_scroll = self.config_scroll.saturating_add_signed(delta).min(10_000);
     }
 
+    pub fn selected_text_scroll_offset(&self, key: &str, total_lines: usize) -> usize {
+        if total_lines <= 1 || self.selected_text_scroll_key.as_deref() != Some(key) {
+            0
+        } else {
+            self.selected_text_scroll_offset % total_lines
+        }
+    }
+
+    fn selected_text_scroll_key(&self) -> Option<String> {
+        match self.selected_context_item()? {
+            TreeItem::Backlog { project_id, id } => self
+                .children_of(project_id)?
+                .backlog
+                .iter()
+                .find(|item| item.id == id)
+                .filter(|item| item.text.lines().count() > 1)
+                .map(|_| format!("backlog:{id}")),
+            TreeItem::Issue { project_id, id } => self
+                .children_of(project_id)?
+                .issues
+                .iter()
+                .find(|issue| issue.id == id)
+                .and_then(|issue| issue.description.as_ref())
+                .filter(|description| description.lines().count() > 1)
+                .map(|_| format!("issue:{id}:description")),
+            TreeItem::ArchivedIssue { project_id, id } => self
+                .children_of(project_id)?
+                .archived_issues
+                .iter()
+                .find(|issue| issue.id == id)
+                .and_then(|issue| issue.description.as_ref())
+                .filter(|description| description.lines().count() > 1)
+                .map(|_| format!("issue:{id}:description")),
+            _ => None,
+        }
+    }
+
+    fn sync_selected_text_scroll(&mut self) {
+        let key = self.selected_text_scroll_key();
+        if self.selected_text_scroll_key != key {
+            self.selected_text_scroll_key = key;
+            self.selected_text_scroll_offset = 0;
+        }
+    }
+
+    fn advance_selected_text_scroll(&mut self) {
+        self.sync_selected_text_scroll();
+        if self.selected_text_scroll_key.is_some() {
+            self.selected_text_scroll_offset = self.selected_text_scroll_offset.saturating_add(1);
+        }
+    }
+
     async fn ui_tick(&mut self) -> Result<()> {
         self.clear_expired_status();
+        self.advance_selected_text_scroll();
         self.refresh_last_auto_ticks().await?;
         match self.view {
             View::Overview => {
@@ -3630,6 +3687,7 @@ impl App {
         // The detail pane and per-project activity track whichever project the
         // cursor now sits in.
         self.sync_active_project();
+        self.sync_selected_text_scroll();
         self.refresh_asks().await?;
         if let Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) =
             self.selected_tree_item()
@@ -3665,11 +3723,13 @@ impl App {
             ui::vm::KanbanLane::ALL.len(),
         );
         self.clamp_kanban();
+        self.sync_selected_text_scroll();
     }
 
     fn move_kanban_card(&mut self, delta: isize) {
         let len = self.kanban_items_for_lane(self.kanban_lane_sel).len();
         step(&mut self.kanban_card_sel, delta, len);
+        self.sync_selected_text_scroll();
     }
 
     fn move_issue_section(&mut self, delta: isize) {
@@ -4452,6 +4512,71 @@ mod tests {
             label,
             "◉ PLAN #7   cursor - left/right movement in input fields"
         );
+    }
+
+    #[test]
+    fn given_multiline_backlog_selected_when_text_scroll_advances_then_offset_moves() {
+        let mut app = test_app();
+        let mut backlog = backlog_fixture();
+        backlog.text = "one\ntwo\nthree".to_string();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                backlog: vec![backlog],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Backlog { id: 1, .. }))
+            .expect("backlog row exists");
+
+        app.sync_selected_text_scroll();
+        assert_eq!(app.selected_text_scroll_offset("backlog:1", 3), 0);
+
+        app.advance_selected_text_scroll();
+
+        assert_eq!(app.selected_text_scroll_offset("backlog:1", 3), 1);
+    }
+
+    #[test]
+    fn given_selected_text_changes_when_synced_then_scroll_resets() {
+        let mut app = test_app();
+        let mut first = backlog_fixture();
+        first.id = 1;
+        first.text = "one\ntwo".to_string();
+        let mut second = backlog_fixture();
+        second.id = 2;
+        second.text = "alpha\nbeta".to_string();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                backlog: vec![first, second],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Backlog { id: 1, .. }))
+            .expect("first backlog row exists");
+        app.sync_selected_text_scroll();
+        app.advance_selected_text_scroll();
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Backlog { id: 2, .. }))
+            .expect("second backlog row exists");
+
+        app.sync_selected_text_scroll();
+
+        assert_eq!(app.selected_text_scroll_key.as_deref(), Some("backlog:2"));
+        assert_eq!(app.selected_text_scroll_offset, 0);
     }
 
     #[test]
