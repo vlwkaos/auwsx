@@ -212,8 +212,9 @@ fn header(ctx: &PromptContext) -> String {
     let _ = writeln!(
         s,
         "Phase report: before setting that status, write `.auwsx/phase-report.md` \
-         with a concise report for this run: what you changed or checked, how \
-         you verified it, key decisions/tradeoffs, and the next status/reason. \
+         with a concise report for this run. The first non-empty line is shown \
+         in the TUI issue summary, so make it a one-line outcome. Then include \
+         short bullets for Change/Check, Reason, Verification, and Next status. \
          auwsx snapshots this file onto the current agent run."
     );
     s
@@ -422,6 +423,7 @@ mod tests {
         assert!(prompt.contains("Use the injected `$AUWSX_BIN`"));
         assert!(prompt.contains("Do not use repo-local binaries"));
         assert!(prompt.contains("write `.auwsx/phase-report.md`"));
-        assert!(prompt.contains("what you changed or checked"));
+        assert!(prompt.contains("first non-empty line is shown"));
+        assert!(prompt.contains("Change/Check, Reason, Verification, and Next status"));
     }
 }
