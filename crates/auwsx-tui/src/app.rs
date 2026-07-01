@@ -126,13 +126,7 @@ enum MoveScope {
 }
 
 impl View {
-    pub const ORDER: [View; 5] = [
-        View::Overview,
-        View::Backlog,
-        View::Logs,
-        View::Config,
-        View::Ask,
-    ];
+    pub const ORDER: [View; 4] = [View::Overview, View::Backlog, View::Logs, View::Ask];
 
     fn index(self) -> usize {
         Self::ORDER.iter().position(|v| *v == self).unwrap_or(0)
@@ -4555,8 +4549,8 @@ mod tests {
     }
 
     #[test]
-    fn view_step_forward_two() {
-        assert_eq!(View::Backlog.step(2), View::Config);
+    fn view_step_skips_config() {
+        assert_eq!(View::Backlog.step(2), View::Ask);
     }
 
     #[tokio::test]
