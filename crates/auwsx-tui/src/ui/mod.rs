@@ -291,13 +291,13 @@ fn draw_form(frame: &mut Frame, app: &App) {
             format!("  {}", field_kind_tag(field)),
             theme::dim(),
         ));
-        lines.push(Line::from(row));
         if active && !field.help.is_empty() {
-            lines.push(Line::from(vec![
-                Span::raw("    "),
+            row.extend([
+                Span::styled("  ·  ", theme::dim()),
                 Span::styled(field.help.to_string(), theme::hint()),
-            ]));
+            ]);
         }
+        lines.push(Line::from(row));
     }
 
     if !suggestions.is_empty() {
@@ -441,10 +441,7 @@ fn form_extra_rows(form: &Form, suggestion_count: usize) -> usize {
             prev_section = field.section;
         }
     }
-    let help = form
-        .current_field()
-        .is_some_and(|field| !field.help.is_empty()) as usize;
-    sections + help + suggestion_count + usize::from(suggestion_count > 0) + 3
+    sections + suggestion_count + usize::from(suggestion_count > 0) + 3
 }
 
 fn draw_confirm_quit(frame: &mut Frame, _app: &App) {
@@ -527,8 +524,8 @@ pub(crate) fn render_list(
 
 #[cfg(test)]
 mod tests {
-    use super::{footer_model, key_hint};
-    use crate::app::{App, Focus, IssueDetailSection, View};
+    use super::{footer_model, form_extra_rows, key_hint};
+    use crate::app::{App, FieldKind, Focus, Form, FormField, FormKind, IssueDetailSection, View};
     use crate::ui::draw;
     use auwsx_core::agent::ExitKind;
     use auwsx_core::db::agent_runs::{AgentRun, Role};
@@ -741,5 +738,40 @@ mod tests {
         let log = footer_model(&app).context_text();
         assert!(log.contains("(Enter) scroll log"));
         assert!(!log.contains("(Enter) select"));
+    }
+
+    #[test]
+    fn given_active_form_help_when_extra_rows_counted_then_help_stays_inline() {
+        let mut form = Form {
+            kind: FormKind::Project,
+            title: "Project",
+            fields: vec![
+                FormField {
+                    label: "repo_path",
+                    display: "Repository path",
+                    section: "Repository",
+                    help: "Path to the git repository.",
+                    kind: FieldKind::Text,
+                    value: String::new(),
+                    optional: false,
+                },
+                FormField {
+                    label: "branch",
+                    display: "Default branch",
+                    section: "Repository",
+                    help: "",
+                    kind: FieldKind::Text,
+                    value: "main".into(),
+                    optional: false,
+                },
+            ],
+            current: 0,
+            cursor: 0,
+            completion_sel: 0,
+        };
+        let with_help = form_extra_rows(&form, 0);
+        form.current = 1;
+
+        assert_eq!(with_help, form_extra_rows(&form, 0));
     }
 }
