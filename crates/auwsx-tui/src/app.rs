@@ -2082,10 +2082,12 @@ impl App {
         }
         if self.focus == Focus::ProjectKanban {
             if self.selected_backlog().is_some() {
+                caps.push(CapabilityAction::Drill, "Enter", "select");
                 caps.push(CapabilityAction::Add, "a", "add backlog");
                 caps.push(CapabilityAction::Execute, "E", "execute");
                 caps.push(CapabilityAction::Delete, "d", "dismiss");
             } else if self.selected_issue().is_some() {
+                caps.push(CapabilityAction::Drill, "Enter", "detail");
                 if self.selected_issue_accepts_queue_message() {
                     caps.push(CapabilityAction::Add, "a", "steer");
                 }
@@ -5015,7 +5017,12 @@ mod tests {
         app.kanban_card_sel = 0;
 
         let hints = app.capabilities();
+        assert!(hints.has(CapabilityAction::Drill));
         assert!(hints.has(CapabilityAction::Add));
+        assert!(hints
+            .hints
+            .iter()
+            .any(|hint| hint.label == "(Enter) select"));
         assert!(hints.hints.iter().any(|hint| hint.label == "(a)dd backlog"));
 
         app.apply(Action::Add).await?;
@@ -5043,7 +5050,12 @@ mod tests {
         app.kanban_card_sel = 0;
 
         let hints = app.capabilities();
+        assert!(hints.has(CapabilityAction::Drill));
         assert!(hints.has(CapabilityAction::Add));
+        assert!(hints
+            .hints
+            .iter()
+            .any(|hint| hint.label == "(Enter) detail"));
         assert!(hints.hints.iter().any(|hint| hint.label == "(a)steer"));
 
         app.apply(Action::Add).await?;

@@ -200,7 +200,6 @@ impl FooterContext {
                     "kanban".to_string(),
                     key_hint("h/l", "column"),
                     key_hint("j/k", "item"),
-                    key_hint("Enter", "open"),
                 ],
                 app,
                 Some(key_hint("Esc", "left")),
@@ -831,6 +830,18 @@ mod tests {
         app.issue_section = IssueDetailSection::Log;
         let log = footer_model(&app).context_text();
         assert!(log.contains("(Enter) scroll log"));
+    }
+
+    #[test]
+    fn given_empty_kanban_lane_when_footer_modeled_then_enter_is_not_advertised() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.connected = true;
+        app.focus = Focus::ProjectKanban;
+
+        let context = footer_model(&app).context_text();
+
+        assert!(context.contains("kanban"));
+        assert!(!context.contains("(Enter)"));
     }
 
     #[test]
