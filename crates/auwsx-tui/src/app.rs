@@ -2158,6 +2158,8 @@ impl App {
         if self.focus == Focus::ProjectDetail {
             if self.selected_project_id().is_some() {
                 caps.push(CapabilityAction::Ask, "?", "ask");
+                caps.push(CapabilityAction::Add, "a", "add project");
+                caps.push(CapabilityAction::Edit, "e", "edit");
             }
             match self.project_section {
                 ProjectDetailSection::Recovery => {
@@ -2184,7 +2186,7 @@ impl App {
         }
         match self.selected_tree_item() {
             Some(TreeItem::Project(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter", "kanban");
+                caps.push(CapabilityAction::Drill, "Enter", "detail");
                 caps.push(CapabilityAction::Add, "a", "add project");
                 caps.push(CapabilityAction::Edit, "e", "edit");
                 caps.push(CapabilityAction::Execute, "E", "execute");
