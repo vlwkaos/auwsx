@@ -203,16 +203,16 @@ The TUI is an operator console:
 
 Useful keys:
 
-- `p`: register a project repository.
-- `n`: add backlog, add a routine from the routines section, or add a queue
-  message on an eligible active issue.
+- `a`: add in the current context: project on the project row, backlog on
+  backlog rows/sections, routine in routines, or steer an eligible issue.
+- `A`: approve a backlog item or toggle a routine.
 - `e`: edit the selected project, backlog item, routine, Arsenal preset, or
   global pipeline UX guidance when that context is editable.
-- `a`: approve a backlog item or toggle a routine.
 - `d`: dismiss backlog, delete routine, unregister project, abandon active
   issue, or archive/cleanup terminal issue worktree state.
 - `E`: execute the selected project/backlog/issue/routine now.
-- `S`: open global Settings.
+- `[` / `]`: move selection to the previous/next project.
+- `Ctrl-,`: open global Settings.
 - `m`: move project order/profile when a project row is selected.
 - `⏎`: enter project kanban, toggle section roots, open issue detail, or edit
   the selected Settings row.

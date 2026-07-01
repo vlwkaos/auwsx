@@ -32,6 +32,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - Core tests mutate process-global `AUWSX_DATA_DIR`; use `cargo test --package auwsx-core -- --test-threads=1` instead of the default parallel core test command.
 - This repo has no `crates/auwsx-tui/tests`; broad source/test scans should use existing paths such as `crates/auwsx-core/tests` and `crates/auwsx-tui/src`.
 - Shell patterns containing Markdown backticks must be single-quoted, e.g. `rg -n 'on `FAILED`' README.md`; double quotes trigger command substitution.
+- README keybinding audits with backticked keys must single-quote the whole pattern, e.g. `rg -n '`p`:|`n`:|`S`:|queue\s+message' README.md`.
 - Shell patterns beginning with `--` need an option terminator, e.g. `rg -n -- "--arsenal|arsenal_preset_name|codex" crates/auwsx-tui/src/cli.rs`.
 - Process inspection should use the plain approved form `ps -axo pid,command`; avoid filtering it with a pipe in this sandbox.
 - Package-scoped formatting avoids the sibling `wsx` path dependency: `cargo fmt --package auwsx-core --package auwsx-tui`.
