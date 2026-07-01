@@ -54,7 +54,6 @@ use std::time::{Duration, Instant};
 pub enum View {
     Overview,
     Issue,
-    Backlog,
     Logs,
     Config,
     Ask,
@@ -126,7 +125,7 @@ enum MoveScope {
 }
 
 impl View {
-    pub const ORDER: [View; 4] = [View::Overview, View::Backlog, View::Logs, View::Ask];
+    pub const ORDER: [View; 3] = [View::Overview, View::Logs, View::Ask];
 
     fn index(self) -> usize {
         Self::ORDER.iter().position(|v| *v == self).unwrap_or(0)
@@ -1287,7 +1286,6 @@ pub struct App {
     /// UX, so expanding a project does not automatically expose terminal issues.
     pub archive_expanded: HashSet<i64>,
     pub issue_sel: usize,
-    pub backlog_sel: usize,
     pub tree_sel: usize,
     pub kanban_lane_sel: usize,
     pub kanban_card_sel: usize,
@@ -1359,7 +1357,6 @@ impl App {
             expanded: HashSet::new(),
             archive_expanded: HashSet::new(),
             issue_sel: 0,
-            backlog_sel: 0,
             tree_sel: 0,
             kanban_lane_sel: 0,
             kanban_card_sel: 0,
@@ -1409,30 +1406,32 @@ impl App {
     }
 
     fn render_revision(&self) -> String {
-        format!(
-            "{:?}|{:?}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}",
-            self.view,
-            self.focus,
-            self.proj_sel,
-            self.tree_sel,
-            self.issue_sel,
-            self.backlog_sel,
-            self.kanban_lane_sel,
-            self.kanban_card_sel,
-            self.issue_section,
-            self.issue_section_mode,
-            self.issue_return_focus,
-            self.move_mode,
-            self.issue_log_scroll,
-            self.selected_text_scroll_key.as_deref().unwrap_or(""),
-            self.selected_text_scroll_offset,
-            self.config_scroll,
-            self.settings_sel,
-            self.connected,
-            self.status,
-            self.form,
-            self.confirm_quit,
-        )
+        [
+            format!("{:?}", self.view),
+            format!("{:?}", self.focus),
+            self.proj_sel.to_string(),
+            self.tree_sel.to_string(),
+            self.issue_sel.to_string(),
+            self.kanban_lane_sel.to_string(),
+            self.kanban_card_sel.to_string(),
+            format!("{:?}", self.issue_section),
+            format!("{:?}", self.issue_section_mode),
+            format!("{:?}", self.issue_return_focus),
+            self.move_mode.to_string(),
+            self.issue_log_scroll.to_string(),
+            self.selected_text_scroll_key
+                .as_deref()
+                .unwrap_or("")
+                .to_string(),
+            self.selected_text_scroll_offset.to_string(),
+            self.config_scroll.to_string(),
+            self.settings_sel.to_string(),
+            self.connected.to_string(),
+            self.status.clone(),
+            format!("{:?}", self.form),
+            self.confirm_quit.to_string(),
+        ]
+        .join("|")
     }
 
     /// Fuzzy-completion suggestions for the New-project `repo_path` field, based
@@ -2533,10 +2532,6 @@ impl App {
     async fn refresh_backlog(&mut self) -> Result<()> {
         if let Some(pid) = self.selected_project_id() {
             self.refresh_project_children(pid).await?;
-        }
-        let len = self.backlog().len();
-        if self.backlog_sel >= len {
-            self.backlog_sel = len.saturating_sub(1);
         }
         Ok(())
     }
@@ -3836,7 +3831,6 @@ impl App {
         // Entering a view freshens exactly what it shows.
         match v {
             View::Issue => self.refresh_detail().await?,
-            View::Backlog => self.refresh_backlog().await?,
             View::Config => {
                 self.refresh_arsenal().await?;
                 self.refresh_memory_presets().await?;
@@ -4639,7 +4633,7 @@ mod tests {
 
     #[test]
     fn view_step_forward_one() {
-        assert_eq!(View::Overview.step(1), View::Backlog);
+        assert_eq!(View::Overview.step(1), View::Logs);
     }
 
     #[test]
@@ -4654,7 +4648,7 @@ mod tests {
 
     #[test]
     fn view_step_skips_config() {
-        assert_eq!(View::Backlog.step(2), View::Ask);
+        assert_eq!(View::Logs.step(1), View::Ask);
     }
 
     #[tokio::test]

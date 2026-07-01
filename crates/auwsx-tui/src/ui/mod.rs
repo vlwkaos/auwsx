@@ -2,7 +2,6 @@
 //! contextual detail on the right, and a wsx-style status/footer line.
 
 mod ask;
-mod backlog;
 mod config;
 mod issue;
 mod logs;
@@ -37,7 +36,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.view {
         View::Overview => overview::render(frame, app, chunks[0]),
         View::Issue => issue::render(frame, app, chunks[0]),
-        View::Backlog => backlog::render(frame, app, chunks[0]),
         View::Logs => logs::render(frame, app, chunks[0]),
         View::Config => config::render(frame, app, chunks[0]),
         View::Ask => ask::render(frame, app, chunks[0]),
@@ -756,11 +754,6 @@ mod tests {
     }
 
     #[test]
-    fn draw_backlog_normal_no_panic() {
-        draw_view(View::Backlog, 100, 30);
-    }
-
-    #[test]
     fn draw_logs_normal_no_panic() {
         draw_view(View::Logs, 100, 30);
     }
@@ -788,11 +781,6 @@ mod tests {
     #[test]
     fn draw_issue_tiny_no_panic() {
         draw_view(View::Issue, 8, 4);
-    }
-
-    #[test]
-    fn draw_backlog_tiny_no_panic() {
-        draw_view(View::Backlog, 8, 4);
     }
 
     #[test]
