@@ -2696,7 +2696,7 @@ impl App {
                         if self.log_tail != text
                             || self.log_tail_path.as_deref() != Some(path.as_str())
                         {
-                            self.request_force_redraw();
+                            self.request_redraw();
                         }
                         self.log_tail = text;
                         self.log_tail_path = Some(path);
@@ -5987,6 +5987,8 @@ mod tests {
         app.select_issue_in_tree(7);
         app.log_tail = "stale".into();
         app.log_tail_path = Some("target/agent.log".into());
+        app.needs_redraw = false;
+        app.force_redraw = false;
 
         app.on_event(Event::IssueLog {
             issue_id: 7,
@@ -6003,6 +6005,8 @@ mod tests {
         assert_eq!(app.log_tail, "fresh\nlog");
         assert_eq!(app.detail.runs.len(), 1);
         assert_eq!(app.issue_log_scroll, 0);
+        assert!(app.needs_redraw);
+        assert!(!app.force_redraw);
     }
 
     #[tokio::test]
