@@ -3872,6 +3872,23 @@ impl App {
         self.issue_section_mode = IssueSectionMode::Selected;
     }
 
+    fn enter_issue_detail_for_issue(
+        &mut self,
+        issue_id: i64,
+        return_focus: Focus,
+        return_tree_sel: Option<usize>,
+    ) -> bool {
+        let Some(issue) = self.issue_by_id(issue_id).cloned() else {
+            return false;
+        };
+        self.detail.issue = Some(issue);
+        if let Some(idx) = self.issues().iter().position(|issue| issue.id == issue_id) {
+            self.issue_sel = idx;
+        }
+        self.enter_issue_detail(return_focus, return_tree_sel);
+        true
+    }
+
     fn enter_selected_issue_detail_from_left(&mut self) -> bool {
         if self.selected_issue_id().is_none() {
             return false;
@@ -4204,11 +4221,10 @@ impl App {
             }
             Some(ui::vm::KanbanItem::Issue(id)) => {
                 let return_tree_sel = Some(self.tree_sel);
-                self.select_tree_issue(id);
-                if let Some(idx) = self.issues().iter().position(|issue| issue.id == id) {
-                    self.issue_sel = idx;
+                if !self.enter_issue_detail_for_issue(id, Focus::ProjectKanban, return_tree_sel) {
+                    self.status = "kanban issue is no longer loaded".into();
+                    return Ok(());
                 }
-                self.enter_issue_detail(Focus::ProjectKanban, return_tree_sel);
                 self.refresh_detail().await?;
             }
             None => self.status = "kanban lane is empty".into(),
@@ -5863,6 +5879,29 @@ mod tests {
         assert_eq!(app.focus, Focus::ProjectKanban);
         assert_eq!(app.tree_sel, 3);
         Ok(())
+    }
+
+    #[test]
+    fn given_kanban_issue_with_collapsed_left_tree_when_opened_then_detail_uses_card_issue() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.focus = Focus::ProjectKanban;
+        app.tree_sel = 0;
+
+        assert!(app.enter_issue_detail_for_issue(7, Focus::ProjectKanban, Some(app.tree_sel)));
+
+        assert_eq!(app.focus, Focus::IssueDetail);
+        assert_eq!(app.selected_issue_id(), Some(7));
+        assert_eq!(app.issue_return_focus, Focus::ProjectKanban);
+        assert_eq!(app.issue_return_tree_sel, Some(0));
+        assert_eq!(app.selected_tree_item(), Some(TreeItem::Project(1)));
     }
 
     // --- App::repo_suggestions -------------------------------------------
