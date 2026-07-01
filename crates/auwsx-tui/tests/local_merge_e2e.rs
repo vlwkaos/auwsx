@@ -245,6 +245,10 @@ async fn deterministic_agent_drives_remote_issue_and_pr_pipeline() -> Result<()>
         gh_log.contains("issue create"),
         "missing issue create:\n{gh_log}"
     );
+    ensure!(
+        gh_log.contains("issue comment"),
+        "missing issue comment sync:\n{gh_log}"
+    );
     ensure!(gh_log.contains("pr create"), "missing pr create:\n{gh_log}");
     ensure!(gh_log.contains("pr view"), "missing pr view:\n{gh_log}");
     Ok(())
