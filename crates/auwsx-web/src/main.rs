@@ -1,13 +1,21 @@
-//! auwsx-web — v0.2 ship target. Thin axum translator over the daemon IPC socket.
-//!
-//! Status: DEFERRED. Stub only. See plan Step 7b / Step 8.
-//!
-//! When implemented:
-//!   - Connect to `$XDG_RUNTIME_DIR/auwsx.sock`.
-//!   - Expose REST endpoints listed in plan Step 7b.
-//!   - Stream Events as SSE on `/api/events`.
-//!   - Serve embedded React bundle from `web/dist/` via rust-embed.
+//! auwsx-web — thin HTTP translator over the daemon IPC socket.
 
-fn main() {
-    eprintln!("auwsx-web is a v0.2 placeholder. Use the TUI (`auwsx`) for v0.1.");
+use auwsx_core::ipc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "auwsx_web=info,tower_http=info".into()),
+        )
+        .init();
+
+    let addr = auwsx_web::default_addr()?;
+    let socket_path = ipc::default_socket_path();
+    tracing::info!(
+        %addr,
+        socket = %socket_path.display(),
+        "starting auwsx-web"
+    );
+    auwsx_web::serve(addr, socket_path).await
 }

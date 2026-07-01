@@ -75,6 +75,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - `crates/auwsx-tui/src/cli.rs` — `auwsx` CLI: pure `parse` (arg grammar) + `run_daemon`/`run_request` IPC client glue
 - `crates/auwsx-tui/src/app.rs` — ratatui top-level state + view router
 - `crates/auwsx-tui/src/input.rs` — keybind table
+- `crates/auwsx-web/src/lib.rs` — thin HTTP adapter over daemon IPC; parses GitHub webhook payloads, validates configured signatures, and never owns durable mutation
 
 ## Conventions
 

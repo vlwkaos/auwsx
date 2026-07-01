@@ -16,6 +16,8 @@ Pre-release, but no longer scaffold-only. The current implementation includes:
   Arsenal presets.
 - A daemon process with Unix-socket IPC. Database writes are daemon-owned.
 - A ratatui operator console with one project tree and contextual detail pane.
+- A thin `auwsx-web` GitHub webhook adapter for inbound remote `/auwsx-run`
+  comments.
 - A deterministic issue pipeline driven by issue status.
 - Automatic scheduler ticks per project, plus immediate manual run commands.
 - Routine execution through the main-job lane.
@@ -25,10 +27,17 @@ Pre-release, but no longer scaffold-only. The current implementation includes:
 ```bash
 cargo run --bin auwsx -- daemon
 cargo run --bin auwsx
+cargo run --bin auwsx-web
 ```
 
 The default binary starts the TUI. The daemon can also be started explicitly and
 kept running while the TUI reconnects as a client.
+
+`auwsx-web` listens on `AUWSX_WEB_ADDR` or `127.0.0.1:7789` and connects to the
+daemon over the normal `AUWSX_SOCK` path. GitHub issue-comment webhooks should
+target `POST /webhooks/github`. If a project remote config has
+`webhook_secret_ref`, that value is read as an environment variable name
+(`env:NAME` is also accepted) and verified against `X-Hub-Signature-256`.
 
 If SQLite state is reset outside the daemon, git may still have auwsx-managed
 issue worktrees registered. Prune those orphaned worktrees before reusing the

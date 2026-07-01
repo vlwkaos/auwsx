@@ -1139,6 +1139,48 @@ async fn given_remote_sync_runs_when_recent_dispatched_then_remote_sync_runs_res
 }
 
 #[tokio::test]
+async fn given_remote_config_when_lookup_by_repo_dispatched_then_config_response(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let project_id = backlog_seed_project(&db).await?;
+    ipc::dispatch(&db, &bus, TS, upsert_remote_config_cmd(project_id)).await;
+
+    let got = want_project_remote_config(
+        ipc::dispatch(
+            &db,
+            &bus,
+            TS,
+            Command::GetProjectRemoteConfigByRepo {
+                provider: RemoteProvider::Github,
+                owner: " acme ".to_string(),
+                repo: " repo ".to_string(),
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(got.map(|config| config.project_id), Some(project_id));
+    Ok(())
+}
+
+#[test]
+fn given_remote_config_by_repo_command_when_json_roundtripped_then_unchanged() -> anyhow::Result<()>
+{
+    let command = Command::GetProjectRemoteConfigByRepo {
+        provider: RemoteProvider::Github,
+        owner: "acme".to_string(),
+        repo: "repo".to_string(),
+    };
+
+    let json = serde_json::to_string(&command)?;
+    let got: Command = serde_json::from_str(&json)?;
+
+    assert_eq!(got, command);
+    Ok(())
+}
+
+#[tokio::test]
 async fn given_issue_when_remote_workflow_plan_dispatched_then_plan_response() -> anyhow::Result<()>
 {
     let db = Db::open_memory().await?;

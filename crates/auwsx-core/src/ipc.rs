@@ -203,6 +203,11 @@ pub enum Command {
     GetProjectRemoteConfig {
         project_id: i64,
     },
+    GetProjectRemoteConfigByRepo {
+        provider: RemoteProvider,
+        owner: String,
+        repo: String,
+    },
     UpsertProjectRemoteConfig {
         project_id: i64,
         provider: RemoteProvider,
@@ -808,6 +813,13 @@ async fn dispatch_inner(
         Command::GetProjectRemoteConfig { project_id } => {
             Response::ProjectRemoteConfig(remote::get_config(pool, project_id).await?)
         }
+        Command::GetProjectRemoteConfigByRepo {
+            provider,
+            owner,
+            repo,
+        } => Response::ProjectRemoteConfig(
+            remote::get_config_by_repo(pool, provider, &owner, &repo).await?,
+        ),
         Command::UpsertProjectRemoteConfig {
             project_id,
             provider,
