@@ -232,7 +232,7 @@ pub struct ContextCapabilities {
 impl ContextCapabilities {
     fn push(&mut self, action: CapabilityAction, key: impl Into<String>, label: impl Into<String>) {
         let key = key.into();
-        let label = format_key_hint(&key, &label.into());
+        let label = label.into();
         self.hints.push(ActionHint { action, key, label });
     }
 
@@ -5123,8 +5123,11 @@ mod tests {
         assert!(hints
             .hints
             .iter()
-            .any(|hint| hint.label == "(Enter) select"));
-        assert!(hints.hints.iter().any(|hint| hint.label == "(a)dd backlog"));
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) select"));
+        assert!(hints
+            .hints
+            .iter()
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(a)dd backlog"));
 
         app.apply(Action::Add).await?;
 
@@ -5156,8 +5159,11 @@ mod tests {
         assert!(hints
             .hints
             .iter()
-            .any(|hint| hint.label == "(Enter) detail"));
-        assert!(hints.hints.iter().any(|hint| hint.label == "(a)steer"));
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) detail"));
+        assert!(hints
+            .hints
+            .iter()
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(a)steer"));
 
         app.apply(Action::Add).await?;
 
@@ -5184,7 +5190,10 @@ mod tests {
 
         let hints = app.capabilities();
         assert!(hints.has(CapabilityAction::Add));
-        assert!(hints.hints.iter().any(|hint| hint.label == "(a)steer"));
+        assert!(hints
+            .hints
+            .iter()
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(a)steer"));
 
         app.apply(Action::Add).await?;
 
@@ -5216,7 +5225,12 @@ mod tests {
         let hints = app.capabilities();
 
         assert!(hints.has(CapabilityAction::Approve));
-        assert!(hints.hints.iter().any(|hint| hint.label == "(A)pprove"));
+        assert!(hints.hints.iter().any(|hint| {
+            hint.action == CapabilityAction::Approve
+                && hint.key == "A"
+                && hint.label == "approve"
+                && format_key_hint(&hint.key, &hint.label) == "(A)pprove"
+        }));
     }
 
     #[tokio::test]
@@ -5779,7 +5793,7 @@ mod tests {
         assert!(closed_hints
             .hints
             .iter()
-            .any(|hint| hint.label == "(Enter) open archive"));
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) open archive"));
 
         app.archive_expanded.insert(42);
         let open_hints = app.capabilities();
@@ -5787,7 +5801,7 @@ mod tests {
         assert!(open_hints
             .hints
             .iter()
-            .any(|hint| hint.label == "(Enter) close archive"));
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) close archive"));
     }
 
     #[test]
@@ -6081,7 +6095,7 @@ mod tests {
             .capabilities()
             .hints
             .iter()
-            .any(|hint| hint.label == "(R)emote"));
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(R)emote"));
     }
 
     #[test]

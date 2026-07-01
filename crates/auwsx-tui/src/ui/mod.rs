@@ -92,7 +92,6 @@ impl FooterModel {
 enum FooterHint {
     Text(String),
     Key { key: String, label: String },
-    Rendered(String),
 }
 
 impl FooterHint {
@@ -107,13 +106,9 @@ impl FooterHint {
         }
     }
 
-    fn rendered(text: impl Into<String>) -> Self {
-        Self::Rendered(text.into())
-    }
-
     fn render(&self) -> String {
         match self {
-            Self::Text(text) | Self::Rendered(text) => text.clone(),
+            Self::Text(text) => text.clone(),
             Self::Key { key, label } => key_hint(key, label),
         }
     }
@@ -229,7 +224,7 @@ impl FooterContext {
                     app.capabilities()
                         .hints
                         .into_iter()
-                        .map(|hint| FooterHint::rendered(hint.label)),
+                        .map(|hint| FooterHint::key(hint.key, hint.label)),
                 );
                 hints.extend([
                     FooterHint::key("Pg", "scroll detail"),
@@ -270,7 +265,7 @@ impl FooterContext {
                     app.capabilities()
                         .hints
                         .into_iter()
-                        .map(|hint| FooterHint::rendered(hint.label)),
+                        .map(|hint| FooterHint::key(hint.key, hint.label)),
                 );
                 hints.push(issue_detail_escape_hint(active, return_to_kanban));
                 hints
@@ -300,7 +295,7 @@ fn with_capabilities(
         app.capabilities()
             .hints
             .into_iter()
-            .map(|hint| FooterHint::rendered(hint.label)),
+            .map(|hint| FooterHint::key(hint.key, hint.label)),
     );
     if let Some(trailing) = trailing {
         hints.push(trailing);
