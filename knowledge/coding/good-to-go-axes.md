@@ -2,10 +2,10 @@
 slug: good-to-go-axes
 kind: coding
 title: auwsx good-to-go axes
-description: Project-specific verification axes for auwsx changes, including enum/SQL parity, TUI action/view wiring, theme constraints, singleton settings, IPC routes, and prompt-policy safety.
-keywords: [good-to-go axes, enum SQL CHECK parity, IssueStatus, AskMode, TUI action view exhaustiveness, render smoke tests, theme single source of truth, Color grep, cargo test no-run, struct signature change, test target coverage, singleton settings, IPC response coverage, prompt policy, issue-local proxy, TUI capability mismatch]
+description: Project-specific verification axes for auwsx changes, including enum/SQL parity, TUI action/view wiring, theme constraints, singleton settings, remote repo config, IPC routes, and prompt-policy safety.
+keywords: [good-to-go axes, enum SQL CHECK parity, IssueStatus, AskMode, remote repository config, RemoteProvider, RemoteAuthKind, remote_events status, remote_sync_runs status, TUI action view exhaustiveness, render smoke tests, theme single source of truth, Color grep, cargo test no-run, struct signature change, test target coverage, singleton settings, IPC response coverage, prompt policy, issue-local proxy, TUI capability mismatch]
 created: 2026-06-09
-modified: 2026-06-29
+modified: 2026-07-01
 ---
 
 # auwsx good-to-go axes
@@ -36,6 +36,14 @@ source of truth):
 | `db::agent_runs::Role` (snake) | `agent_runs.role` |
 | `agent::ExitKind` (snake) | `agent_runs.exit_kind` |
 | `db::ask_answers::AskMode` (snake) | `ask_answers.mode` |
+| `db::remote::RemoteProvider` (snake) | `project_remote_configs.provider`, `remote_issue_links.provider`, `remote_pr_links.provider`, `remote_events.provider` |
+| `db::remote::RemoteAuthKind` (snake) | `project_remote_configs.auth_kind` |
+| `db::remote::RequiredChecksPolicy` (snake) | `project_remote_configs.required_checks_policy` |
+| `db::remote::RemotePrState` (snake) | `remote_pr_links.state` |
+| `db::remote::RemoteEventStatus` (snake) | `remote_events.status` |
+| `db::remote::RemoteSyncDirection` (snake) | `remote_sync_runs.direction` |
+| `db::remote::RemoteSyncKind` (snake) | `remote_sync_runs.kind` |
+| `db::remote::RemoteSyncStatus` (snake) | `remote_sync_runs.status` |
 
 These enums use hand-rolled `as_str` plus parser helpers (NOT serde) for the SQL
 bind, mirroring `IssueStatus`. `tests/crud.rs` proves parity at runtime with a

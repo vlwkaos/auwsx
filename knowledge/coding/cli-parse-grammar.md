@@ -2,10 +2,10 @@
 slug: cli-parse-grammar
 kind: coding
 title: auwsx hand-rolled CLI parse grammar + Parsed helper
-description: Conventions for the no-clap hand-rolled `parse`/`Parsed` CLI layer — flag grammar, opt_int optional-int contract, enum-flag idiom, and the Parsed::new behavior gotchas pinned by tests.
-keywords: [parse, Parsed, opt_int, hand-rolled CLI, no clap, flag grammar, last-wins, equals-form, CliAction, arsenal, ask command, project add, schedule flag, completion_policy flag, from_str lowercase, i64 overflow]
+description: Conventions for the no-clap hand-rolled `parse`/`Parsed` CLI layer — flag grammar, opt_int optional-int contract, enum-flag idiom, project remote setup commands, and the Parsed::new behavior gotchas pinned by tests.
+keywords: [parse, Parsed, opt_int, hand-rolled CLI, no clap, project remote set, remote repository config, flag grammar, last-wins, equals-form, CliAction, arsenal, ask command, project add, schedule flag, completion_policy flag, from_str lowercase, i64 overflow]
 created: 2026-06-09
-modified: 2026-06-17
+modified: 2026-07-01
 ---
 
 # auwsx hand-rolled CLI parse grammar
@@ -85,6 +85,27 @@ the DB/IPC boundary (`db::arsenal::upsert`), not to `parse`.
 mode strings are the exact SQL enum values `recall` and `seek`. The remaining
 argv tokens are joined into one question string, so parsing stays deterministic
 without shell quoting rules beyond normal argv construction.
+
+## `project remote` config grammar
+
+Remote repository setup is a project-scoped command family:
+
+| Command | IPC |
+|---------|-----|
+| `project remote get <project_id>` | `Command::GetProjectRemoteConfig` |
+| `project remote set <project_id> --url <url> --owner <owner> --repo <repo> ...` | `Command::UpsertProjectRemoteConfig` |
+| `project remote delete <project_id>` | `Command::DeleteProjectRemoteConfig` |
+| `project remote sync-runs <project_id> [--limit <n>]` | `Command::RecentRemoteSyncRuns` |
+| `project remote plan <issue_id>` | `Command::PlanIssueRemoteWorkflow` |
+
+`set` defaults to `provider=github`, `api_base_url=https://api.github.com`,
+`auth_kind=token_env`, and `required_checks=observe`. Feature toggles are bare
+boolean flags: `--inbound-auwsx-run`, `--outbound-issue-create`,
+`--remote-pr-merge`, `--agent-comments`, `--subtask-comments`,
+`--finding-comments`, and `--draft-pr`. Validation of required fields and
+token-reference policy belongs to `db::remote::upsert_config`.
+`plan` is read-only and returns the pure `remote_plan::RemoteWorkflowPlan`
+for a local issue, using current project remote config plus issue/PR links.
 
 ## Behavior gotchas (pinned by tests)
 

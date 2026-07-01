@@ -2,10 +2,10 @@
 slug: ipc-protocol
 kind: coding
 title: auwsx IPC protocol (Unix-socket Command/Response/Event)
-description: The JSON-lines Unix-socket IPC between daemon and clients — the serde internal-vs-adjacent tagging gotcha and why, serve/request/EventStream transport, socket path resolution, and pure dispatch.
-keywords: [ipc.rs, Command Response Event, serde internal tagging tag kind, serde adjacent tagging content data, cannot serialize tagged newtype variant, JSON lines UnixListener, serve request EventStream, AskProject ListAskAnswers AskAnswered, socket path AUWSX_SOCK XDG_RUNTIME_DIR, pure dispatch unit-testable, Notify shutdown SIGINT, agent token TUI caller scoping, ipc protocol]
+description: The JSON-lines Unix-socket IPC between daemon and clients — the serde internal-vs-adjacent tagging gotcha and why, serve/request/EventStream transport, socket path resolution, remote repo config commands, and pure dispatch.
+keywords: [ipc.rs, Command Response Event, project remote config, GetProjectRemoteConfig, UpsertProjectRemoteConfig, RecentRemoteSyncRuns, serde internal tagging tag kind, serde adjacent tagging content data, cannot serialize tagged newtype variant, JSON lines UnixListener, serve request EventStream, AskProject ListAskAnswers AskAnswered, socket path AUWSX_SOCK XDG_RUNTIME_DIR, pure dispatch unit-testable, Notify shutdown SIGINT, agent token TUI caller scoping, ipc protocol]
 created: 2026-06-09
-modified: 2026-06-17
+modified: 2026-07-01
 ---
 
 # auwsx IPC protocol
@@ -18,6 +18,15 @@ TUI hit the SAME daemon ops. Agent ops ⊆ human ops; IPC enforces per-caller
 Global config commands include `ListArsenalPresets` and
 `UpsertArsenalPreset`; Arsenal presets are reusable per-role agent command
 templates consumed by project forms and stored separately from project rows.
+
+Project remote repository config is also exposed through pure dispatch:
+`GetProjectRemoteConfig`, `UpsertProjectRemoteConfig`,
+`DeleteProjectRemoteConfig`, `RecentRemoteSyncRuns`, and
+`PlanIssueRemoteWorkflow`. Config commands only read/write typed config, link,
+event, and sync-run rows. `PlanIssueRemoteWorkflow` is read-only and returns
+the pure `remote_plan::RemoteWorkflowPlan` for one local issue. Provider network
+I/O belongs in daemon runtime services layered on top of the same model. CLI/TUI
+clients must use these IPC commands instead of opening SQLite.
 
 Runtime-owned manual commands include `RunSchedulerOnce`, `RunIssueNow`,
 `RunBacklogNow`, `RunRoutineNow`, `RemoveIssue`, and `AskProject`. They require
