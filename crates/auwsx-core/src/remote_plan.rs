@@ -61,11 +61,13 @@ pub struct RemoteWorkflowPlan {
     pub blockers: Vec<RemotePlanBlocker>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RemoteNotesPresence {
     pub agent_summary: bool,
     pub subtasks: bool,
     pub findings: bool,
+    pub subtask_lines: Vec<String>,
+    pub finding_lines: Vec<String>,
 }
 
 impl RemoteNotesPresence {
@@ -74,17 +76,19 @@ impl RemoteNotesPresence {
             agent_summary: issue.agent_summary.as_deref().is_some_and(non_blank),
             subtasks: false,
             findings: false,
+            subtask_lines: Vec::new(),
+            finding_lines: Vec::new(),
         }
     }
 
-    fn any_enabled(self, config: &ProjectRemoteConfig) -> bool {
+    fn any_enabled(&self, config: &ProjectRemoteConfig) -> bool {
         (self.agent_summary && config.agent_comment_sync_enabled)
             || (self.subtasks && config.subtask_comment_sync_enabled)
             || (self.findings && config.finding_comment_sync_enabled)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RemoteWorkflowInput<'a> {
     pub config: Option<&'a ProjectRemoteConfig>,
     pub issue: &'a Issue,
@@ -106,7 +110,7 @@ pub fn plan_issue_remote_workflow(input: RemoteWorkflowInput<'_>) -> RemoteWorkf
         input.issue,
         input.issue_link,
         input.pr_link,
-        input.notes,
+        &input.notes,
         &mut plan,
     );
     plan_pull_request(config, input.issue, input.pr_link, &mut plan);
@@ -142,7 +146,7 @@ fn plan_progress_comment(
     issue: &Issue,
     issue_link: Option<&RemoteIssueLink>,
     pr_link: Option<&RemotePrLink>,
-    notes: RemoteNotesPresence,
+    notes: &RemoteNotesPresence,
     plan: &mut RemoteWorkflowPlan,
 ) {
     if !notes.any_enabled(config) {
@@ -314,7 +318,7 @@ fn pull_request_body(issue: &Issue) -> String {
     body
 }
 
-fn progress_comment_body(issue: &Issue, notes: RemoteNotesPresence) -> String {
+fn progress_comment_body(issue: &Issue, notes: &RemoteNotesPresence) -> String {
     let mut lines = vec![
         format!("auwsx issue #{}", issue.id),
         format!("status: {}", issue.status.as_str()),
@@ -325,10 +329,20 @@ fn progress_comment_body(issue: &Issue, notes: RemoteNotesPresence) -> String {
         }
     }
     if notes.subtasks {
-        lines.push("subtasks changed".to_string());
+        lines.push("subtasks:".to_string());
+        if notes.subtask_lines.is_empty() {
+            lines.push("- changed".to_string());
+        } else {
+            lines.extend(notes.subtask_lines.iter().map(|line| format!("- {line}")));
+        }
     }
     if notes.findings {
-        lines.push("findings changed".to_string());
+        lines.push("findings:".to_string());
+        if notes.finding_lines.is_empty() {
+            lines.push("- changed".to_string());
+        } else {
+            lines.extend(notes.finding_lines.iter().map(|line| format!("- {line}")));
+        }
     }
     lines.join("\n")
 }
@@ -518,6 +532,39 @@ mod tests {
             InboundAuwsxRunDecision::Accept { ref title, .. }
                 if title == "add retry telemetry"
         ));
+    }
+
+    #[test]
+    fn given_note_sync_enabled_when_planning_comment_then_body_contains_subtasks_and_findings() {
+        let config = config();
+        let issue = issue(IssueStatus::Working);
+        let link = issue_link();
+        let notes = RemoteNotesPresence {
+            agent_summary: true,
+            subtasks: true,
+            findings: true,
+            subtask_lines: vec!["[x] write executor".to_string()],
+            finding_lines: vec!["[open/major] add stale guard (src/lib.rs)".to_string()],
+        };
+
+        let plan = plan_issue_remote_workflow(RemoteWorkflowInput {
+            config: Some(&config),
+            issue: &issue,
+            issue_link: Some(&link),
+            pr_link: None,
+            notes,
+        });
+
+        let body = plan
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                RemotePlannedAction::PostProgressComment { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("comment action exists");
+        assert!(body.contains("- [x] write executor"));
+        assert!(body.contains("- [open/major] add stale guard (src/lib.rs)"));
     }
 
     #[test]

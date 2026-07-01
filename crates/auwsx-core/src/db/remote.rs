@@ -702,6 +702,81 @@ pub async fn recent_sync_runs(
     rows.iter().map(sync_run_from_row).collect()
 }
 
+pub async fn queued_sync_runs(
+    pool: &SqlitePool,
+    project_id: i64,
+    limit: i64,
+) -> Result<Vec<RemoteSyncRun>> {
+    let rows = sqlx::query(
+        "SELECT * FROM remote_sync_runs
+         WHERE project_id = ?
+           AND status = 'queued'
+         ORDER BY id ASC
+         LIMIT ?",
+    )
+    .bind(project_id)
+    .bind(limit.clamp(1, 100))
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(sync_run_from_row).collect()
+}
+
+pub async fn sync_run(pool: &SqlitePool, id: i64) -> Result<Option<RemoteSyncRun>> {
+    let row = sqlx::query("SELECT * FROM remote_sync_runs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|row| sync_run_from_row(&row)).transpose()
+}
+
+pub async fn mark_sync_run_running(pool: &SqlitePool, id: i64, now: i64) -> Result<bool> {
+    let changed = sqlx::query(
+        "UPDATE remote_sync_runs
+         SET status = 'running', started_at = ?, error = NULL
+         WHERE id = ?
+           AND status = 'queued'",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(changed > 0)
+}
+
+pub async fn finish_sync_run(
+    pool: &SqlitePool,
+    id: i64,
+    status: RemoteSyncStatus,
+    error: Option<&str>,
+    remote_issue_link_id: Option<i64>,
+    remote_pr_link_id: Option<i64>,
+    now: i64,
+) -> Result<()> {
+    if matches!(status, RemoteSyncStatus::Queued | RemoteSyncStatus::Running) {
+        bail!("finish_sync_run requires a terminal status");
+    }
+    sqlx::query(
+        "UPDATE remote_sync_runs
+         SET status = ?,
+             error = ?,
+             remote_issue_link_id = COALESCE(?, remote_issue_link_id),
+             remote_pr_link_id = COALESCE(?, remote_pr_link_id),
+             ended_at = ?
+         WHERE id = ?
+           AND status = 'running'",
+    )
+    .bind(status.as_str())
+    .bind(trimmed_opt(error))
+    .bind(remote_issue_link_id)
+    .bind(remote_pr_link_id)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn has_active_sync_run(
     pool: &SqlitePool,
     project_id: i64,

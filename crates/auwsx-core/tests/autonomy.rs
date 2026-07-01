@@ -31,7 +31,7 @@ use auwsx_core::db::agent_runs::{self, Role, StartRun};
 use auwsx_core::db::issues::{self, Issue};
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode, NewProject, Project};
 use auwsx_core::db::remote::{
-    self, RemoteAuthKind, RemoteProvider, RemoteSyncKind, RequiredChecksPolicy,
+    self, RemoteAuthKind, RemoteProvider, RemoteSyncKind, RemoteSyncStatus, RequiredChecksPolicy,
     UpsertProjectRemoteConfig,
 };
 use auwsx_core::db::scheduler_runs;
@@ -40,6 +40,11 @@ use auwsx_core::events;
 use auwsx_core::issue_control::ControlOutcome;
 use auwsx_core::main_jobs::{self, MainJobStatus};
 use auwsx_core::prompt::{self, MemoryInvocation, PromptContext};
+use auwsx_core::remote_executor::{
+    CreatedRemoteIssue, CreatedRemotePr, RemoteProviderEffect, RemoteProviderExecutor,
+    RemoteSyncRequest,
+};
+use auwsx_core::remote_plan::RemotePlannedAction;
 use auwsx_core::routines::{self, NewRoutine, RoutineType};
 use auwsx_core::scheduler::{decide, Decision, Scheduler};
 use auwsx_core::state::IssueStatus;
@@ -342,6 +347,17 @@ fn given_ready_to_merge_issue_under_soft_policy_unarmed_when_decide_then_soft_ga
     let proj = project_with(1, CompletionPolicy::Soft);
     let got = decide(&issues, &proj, &empty_running(), TS);
     assert_eq!(got, vec![Decision::SoftGate(4)]);
+}
+
+#[test]
+fn given_ready_to_merge_issue_under_pr_merge_mode_when_decide_then_no_local_soft_gate() {
+    let issues = [issue_at(4, IssueStatus::ReadyToMerge)];
+    let mut proj = project_with(1, CompletionPolicy::Auto);
+    proj.merge_mode = MergeMode::Pr;
+
+    let got = decide(&issues, &proj, &empty_running(), TS);
+
+    assert_eq!(got, Vec::<Decision>::new());
 }
 
 #[test]
@@ -1037,6 +1053,42 @@ impl AgentExecutor for ExitAgent {
     }
 }
 
+#[derive(Default)]
+struct TestRemoteExecutor {
+    seen: Arc<Mutex<Vec<RemoteSyncKind>>>,
+}
+
+#[async_trait]
+impl RemoteProviderExecutor for TestRemoteExecutor {
+    async fn execute(&self, request: RemoteSyncRequest) -> anyhow::Result<RemoteProviderEffect> {
+        self.seen.lock().unwrap().push(request.run.kind);
+        match request.action {
+            RemotePlannedAction::CreateIssue { .. } => {
+                Ok(RemoteProviderEffect::Issue(CreatedRemoteIssue {
+                    number: 177,
+                    node_id: None,
+                    url: "https://github.com/acme/app/issues/177".to_string(),
+                }))
+            }
+            RemotePlannedAction::CreateOrUpdatePullRequest {
+                head_branch,
+                base_branch,
+                ..
+            } => Ok(RemoteProviderEffect::PullRequest(CreatedRemotePr {
+                number: request.issue.id,
+                node_id: None,
+                url: format!("https://github.com/acme/app/pull/{}", request.issue.id),
+                head_branch,
+                head_sha: None,
+                base_branch,
+                base_sha: None,
+                state: auwsx_core::db::remote::RemotePrState::Open,
+            })),
+            RemotePlannedAction::PostProgressComment { .. } => Ok(RemoteProviderEffect::Comment),
+        }
+    }
+}
+
 struct RecordingAgent {
     cmd_template: Arc<Mutex<Option<String>>>,
 }
@@ -1379,6 +1431,25 @@ fn scheduler_with_worktrees(
     )
 }
 
+fn scheduler_with_remote_executor(
+    db: Db,
+    clock: Arc<dyn Clock>,
+    executor: Arc<dyn AgentExecutor>,
+    remote_executor: Arc<dyn RemoteProviderExecutor>,
+    tick_interval: Duration,
+) -> Scheduler {
+    Scheduler::new_with_remote_executor(
+        db,
+        clock,
+        executor,
+        remote_executor,
+        Arc::new(FakeWorktrees(PathBuf::from("/tmp/auwsx-test-worktree"))),
+        events::channel(),
+        PathBuf::from("/tmp/unused.sock"),
+        tick_interval,
+    )
+}
+
 #[tokio::test]
 async fn given_ready_project_issues_when_project_merge_approved_then_all_release_oldest_first(
 ) -> anyhow::Result<()> {
@@ -1449,24 +1520,32 @@ async fn given_pr_merge_project_when_issue_merge_approved_then_remote_pr_sync_is
     )
     .await?;
     issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
-    let scheduler = scheduler_with(
+    let remote_executor = Arc::new(TestRemoteExecutor::default());
+    let scheduler = scheduler_with_remote_executor(
         db.clone(),
         Arc::new(FixedClock(TS)),
         Arc::new(ExitAgent),
+        remote_executor,
         Duration::from_secs(60),
     );
 
     let released = scheduler.approve_issue_merge(issue_id, TS).await?;
+    scheduler.tick_project(project_id).await?;
 
     let issue = issues::get(db.pool(), issue_id)
         .await?
         .expect("issue exists");
     let runs = remote::recent_sync_runs(db.pool(), project_id, 10).await?;
+    let pr_link = remote::pr_link_by_issue(db.pool(), issue_id)
+        .await?
+        .expect("PR link exists");
     assert_eq!(
-        (released, issue.status),
-        (vec![issue_id], IssueStatus::ReadyToMerge)
+        (released, issue.status, pr_link.remote_pr_number),
+        (vec![issue_id], IssueStatus::ReadyToMerge, issue_id)
     );
-    assert!(runs.iter().any(|run| run.kind == RemoteSyncKind::Pr));
+    assert!(runs
+        .iter()
+        .any(|run| run.kind == RemoteSyncKind::Pr && run.status == RemoteSyncStatus::Done));
     Ok(())
 }
 
@@ -2697,17 +2776,30 @@ async fn given_remote_enabled_project_when_backlog_routes_then_remote_issue_sync
         TS,
     )
     .await?;
-    let sched = scheduler_with(
+    let remote_executor = Arc::new(TestRemoteExecutor::default());
+    let sched = scheduler_with_remote_executor(
         db.clone(),
         Arc::new(FixedClock(TS)),
         Arc::new(ExitAgent),
+        remote_executor,
         Duration::from_secs(60),
     );
 
     sched.tick_project(project_id).await?;
 
     let runs = remote::recent_sync_runs(db.pool(), project_id, 10).await?;
-    assert!(runs.iter().any(|run| run.kind == RemoteSyncKind::Issue));
+    let issue_run = runs
+        .iter()
+        .find(|run| run.kind == RemoteSyncKind::Issue)
+        .expect("issue sync run exists");
+    let issues = issues::list_by_project(db.pool(), project_id).await?;
+    let issue_link = remote::issue_link_by_issue(db.pool(), issues[0].id)
+        .await?
+        .expect("remote issue link exists");
+    assert_eq!(
+        (issue_run.status, issue_link.remote_issue_number),
+        (RemoteSyncStatus::Done, 177)
+    );
     Ok(())
 }
 

@@ -41,7 +41,7 @@ use crate::main_jobs::{self, MainJob};
 use crate::memory;
 use crate::project_setup;
 use crate::reconcile::ProjectReconcileReport;
-use crate::remote_plan::{self, RemoteNotesPresence, RemoteWorkflowInput, RemoteWorkflowPlan};
+use crate::remote_plan::{self, RemoteWorkflowInput, RemoteWorkflowPlan};
 use crate::routines::{self, OutputRoute, Routine};
 use crate::routing;
 use crate::scheduler::Scheduler;
@@ -857,13 +857,14 @@ async fn dispatch_inner(
             let config = remote::get_config(pool, issue.project_id).await?;
             let issue_link = remote::issue_link_by_issue(pool, issue_id).await?;
             let pr_link = remote::pr_link_by_issue(pool, issue_id).await?;
+            let notes = crate::remote_workflow::notes_presence(pool, &issue).await?;
             Response::IssueRemoteWorkflowPlan(remote_plan::plan_issue_remote_workflow(
                 RemoteWorkflowInput {
                     config: config.as_ref(),
                     issue: &issue,
                     issue_link: issue_link.as_ref(),
                     pr_link: pr_link.as_ref(),
-                    notes: RemoteNotesPresence::from_issue(&issue),
+                    notes,
                 },
             ))
         }

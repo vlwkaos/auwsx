@@ -27,6 +27,7 @@ use crate::main_job_runner;
 use crate::main_jobs::{self, MainJobStatus};
 use crate::pipeline::{self, Deps};
 use crate::reconcile::{self, AgentReconcileAction, ProjectReconcileReport, ReconcileActionKind};
+use crate::remote_executor::{self, GithubCliRemoteExecutor, RemoteProviderExecutor};
 use crate::remote_workflow;
 use crate::routines::{self, Routine};
 use crate::routing;
@@ -131,10 +132,13 @@ pub fn decide(
 fn soft_releasable(issue: &Issue, project: &Project) -> bool {
     match issue.status {
         IssueStatus::PlanReady => true,
-        IssueStatus::ReadyToMerge => matches!(
-            project.completion_policy,
-            CompletionPolicy::Soft | CompletionPolicy::Auto
-        ),
+        IssueStatus::ReadyToMerge => {
+            project.merge_mode == MergeMode::Local
+                && matches!(
+                    project.completion_policy,
+                    CompletionPolicy::Soft | CompletionPolicy::Auto
+                )
+        }
         _ => false,
     }
 }
@@ -281,6 +285,7 @@ pub struct Scheduler {
     db: crate::db::Db,
     clock: Arc<dyn Clock>,
     executor: Arc<dyn AgentExecutor>,
+    remote_executor: Arc<dyn RemoteProviderExecutor>,
     worktrees: Arc<dyn Worktrees>,
     events: broadcast::Sender<Event>,
     socket: PathBuf,
@@ -316,10 +321,34 @@ impl Scheduler {
         socket: PathBuf,
         tick_interval: Duration,
     ) -> Self {
+        Self::new_with_remote_executor(
+            db,
+            clock,
+            executor,
+            Arc::new(GithubCliRemoteExecutor),
+            worktrees,
+            events,
+            socket,
+            tick_interval,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_remote_executor(
+        db: crate::db::Db,
+        clock: Arc<dyn Clock>,
+        executor: Arc<dyn AgentExecutor>,
+        remote_executor: Arc<dyn RemoteProviderExecutor>,
+        worktrees: Arc<dyn Worktrees>,
+        events: broadcast::Sender<Event>,
+        socket: PathBuf,
+        tick_interval: Duration,
+    ) -> Self {
         Scheduler {
             db,
             clock,
             executor,
+            remote_executor,
             worktrees,
             events,
             socket,
@@ -441,6 +470,17 @@ impl Scheduler {
                     );
                 }
             }
+        }
+        if let Err(e) = remote_executor::execute_queued_project_syncs(
+            pool,
+            self.remote_executor.as_ref(),
+            project_id,
+            now,
+            25,
+        )
+        .await
+        {
+            tracing::warn!("executing remote syncs for project {project_id} failed: {e:#}");
         }
         let issues = issues::list_by_project(pool, project_id).await?;
         let issue_ids: HashSet<i64> = issues.iter().map(|issue| issue.id).collect();

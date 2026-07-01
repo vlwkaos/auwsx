@@ -6,7 +6,7 @@
 use crate::db::remote::{
     self, NewRemoteSyncRun, RemoteSyncDirection, RemoteSyncKind, RemoteSyncStatus,
 };
-use crate::db::{issues, Db};
+use crate::db::{findings, issues, subtasks, Db, Issue};
 use crate::remote_plan::{
     self, RemoteNotesPresence, RemotePlannedAction, RemoteWorkflowInput, RemoteWorkflowPlan,
 };
@@ -32,12 +32,13 @@ pub async fn queue_issue_remote_workflow(
     let config = remote::get_config(pool, issue.project_id).await?;
     let issue_link = remote::issue_link_by_issue(pool, issue_id).await?;
     let pr_link = remote::pr_link_by_issue(pool, issue_id).await?;
+    let notes = notes_presence(pool, &issue).await?;
     let plan = remote_plan::plan_issue_remote_workflow(RemoteWorkflowInput {
         config: config.as_ref(),
         issue: &issue,
         issue_link: issue_link.as_ref(),
         pr_link: pr_link.as_ref(),
-        notes: RemoteNotesPresence::from_issue(&issue),
+        notes,
     });
 
     let mut queued_run_ids = Vec::new();
@@ -87,6 +88,43 @@ pub async fn queue_issues_remote_workflow(
         out.push(queue_issue_remote_workflow(db.pool(), issue_id, now).await?);
     }
     Ok(out)
+}
+
+pub async fn notes_presence(pool: &SqlitePool, issue: &Issue) -> Result<RemoteNotesPresence> {
+    let subtasks = subtasks::list_by_issue(pool, issue.id).await?;
+    let findings = findings::list_by_issue(pool, issue.id).await?;
+    Ok(RemoteNotesPresence {
+        agent_summary: issue.agent_summary.as_deref().is_some_and(non_blank),
+        subtasks: !subtasks.is_empty(),
+        findings: !findings.is_empty(),
+        subtask_lines: subtasks
+            .iter()
+            .map(|item| {
+                format!(
+                    "[{}] {}",
+                    if item.done { "x" } else { " " },
+                    item.text.trim()
+                )
+            })
+            .collect(),
+        finding_lines: findings
+            .iter()
+            .map(|item| {
+                let status = item.status.as_str();
+                let severity = item.severity.as_str();
+                match item.file_ref.as_deref().filter(|s| !s.trim().is_empty()) {
+                    Some(file_ref) => {
+                        format!("[{status}/{severity}] {} ({file_ref})", item.title.trim())
+                    }
+                    None => format!("[{status}/{severity}] {}", item.title.trim()),
+                }
+            })
+            .collect(),
+    })
+}
+
+fn non_blank(value: &str) -> bool {
+    !value.trim().is_empty()
 }
 
 fn action_kind(action: &RemotePlannedAction) -> RemoteSyncKind {
