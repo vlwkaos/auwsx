@@ -2717,6 +2717,18 @@ impl App {
     }
 
     fn selected_text_scroll_key(&self) -> Option<String> {
+        if self.focus == Focus::ProjectKanban {
+            return match self.selected_kanban_item_preview()? {
+                ui::vm::KanbanPreview::Backlog(item) => {
+                    (item.text.lines().count() > 1).then(|| format!("backlog:{}", item.id))
+                }
+                ui::vm::KanbanPreview::Issue(issue) => issue
+                    .description
+                    .as_ref()
+                    .filter(|description| description.lines().count() > 1)
+                    .map(|_| format!("issue:{}:description", issue.id)),
+            };
+        }
         if self.focus == Focus::IssueDetail {
             return self
                 .detail
@@ -4875,6 +4887,63 @@ mod tests {
         let mut issue = issue_fixture();
         issue.description = Some("alpha\nbeta\ngamma".to_string());
         app.detail.issue = Some(issue);
+
+        app.sync_selected_text_scroll();
+        app.advance_selected_text_scroll();
+
+        assert_eq!(
+            app.selected_text_scroll_key.as_deref(),
+            Some("issue:7:description")
+        );
+        assert_eq!(app.selected_text_scroll_offset("issue:7:description", 3), 1);
+    }
+
+    #[test]
+    fn given_kanban_backlog_when_synced_then_preview_text_scrolls() {
+        let mut app = test_app();
+        let mut backlog = backlog_fixture();
+        backlog.text = "one\ntwo\nthree".to_string();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                backlog: vec![backlog],
+                ..ProjectChildren::default()
+            },
+        );
+        app.focus = Focus::ProjectKanban;
+        app.kanban_lane_sel = 0;
+        app.kanban_card_sel = 0;
+
+        app.sync_selected_text_scroll();
+        app.advance_selected_text_scroll();
+
+        assert_eq!(app.selected_text_scroll_key.as_deref(), Some("backlog:1"));
+        assert_eq!(app.selected_text_scroll_offset("backlog:1", 3), 1);
+    }
+
+    #[test]
+    fn given_kanban_issue_when_synced_then_preview_description_scrolls() {
+        let mut app = test_app();
+        let mut issue = issue_fixture();
+        issue.description = Some("alpha\nbeta\ngamma".to_string());
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue],
+                ..ProjectChildren::default()
+            },
+        );
+        app.focus = Focus::ProjectKanban;
+        app.kanban_lane_sel = 0;
+        app.kanban_card_sel = 0;
+        let card = app
+            .kanban_items_for_lane(app.kanban_lane_sel)
+            .iter()
+            .position(|item| *item == ui::vm::KanbanItem::Issue(7))
+            .expect("issue card exists in plan lane");
+        app.kanban_card_sel = card;
 
         app.sync_selected_text_scroll();
         app.advance_selected_text_scroll();
