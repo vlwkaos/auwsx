@@ -241,7 +241,7 @@ impl ContextCapabilities {
     }
 }
 
-fn format_key_hint(key: &str, label: &str) -> String {
+pub(crate) fn format_key_hint(key: &str, label: &str) -> String {
     let mut chars = label.chars();
     if key.chars().count() == 1
         && chars

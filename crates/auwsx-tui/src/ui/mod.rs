@@ -11,7 +11,10 @@ pub(crate) mod schedule;
 pub(crate) mod theme;
 pub(crate) mod vm;
 
-use crate::app::{App, FieldKind, Focus, Form, FormMode, IssueDetailSection, TreeItem, View};
+use crate::app::{
+    format_key_hint as key_hint, App, FieldKind, Focus, Form, FormMode, IssueDetailSection,
+    TreeItem, View,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -276,19 +279,6 @@ fn global_footer_hints() -> Vec<String> {
         key_hint("Q", "stop+quit"),
         format!("v{}", env!("CARGO_PKG_VERSION")),
     ]
-}
-
-fn key_hint(key: &str, label: &str) -> String {
-    let mut chars = label.chars();
-    if key.chars().count() == 1
-        && chars
-            .next()
-            .is_some_and(|first| first.eq_ignore_ascii_case(&key.chars().next().unwrap()))
-    {
-        format!("({key}){}", chars.as_str())
-    } else {
-        format!("({key}) {label}")
-    }
 }
 
 fn draw_form(frame: &mut Frame, app: &App) {
@@ -749,6 +739,7 @@ mod tests {
     fn given_matching_single_key_when_key_hint_then_parenthesizes_initial() {
         assert_eq!(key_hint("m", "move"), "(m)ove");
         assert_eq!(key_hint("E", "execute"), "(E)xecute");
+        assert_eq!(key_hint("a", "steer"), "(a)steer");
     }
 
     #[test]
