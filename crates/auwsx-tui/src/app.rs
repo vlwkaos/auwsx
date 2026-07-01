@@ -3835,8 +3835,12 @@ impl App {
     }
 
     async fn move_sel(&mut self, delta: isize) -> Result<()> {
+        let previous = self.tree_sel;
         let len = self.tree_rows().len();
         step(&mut self.tree_sel, delta, len);
+        if self.tree_sel == previous {
+            return Ok(());
+        }
         // The detail pane and per-project activity track whichever project the
         // cursor now sits in.
         self.sync_active_project();
@@ -6489,6 +6493,21 @@ mod tests {
         let before = app.render_revision();
 
         app.apply(Action::Down).await?;
+
+        assert_eq!(app.render_revision(), before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_boundary_tree_movement_when_applied_then_no_daemon_refresh() -> anyhow::Result<()>
+    {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.focus = Focus::Left;
+        app.tree_sel = 0;
+        let before = app.render_revision();
+
+        app.apply(Action::Up).await?;
 
         assert_eq!(app.render_revision(), before);
         Ok(())
