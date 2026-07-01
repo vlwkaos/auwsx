@@ -296,6 +296,7 @@ fn draw_form(frame: &mut Frame, app: &App) {
     let mut prev_section = "";
     let mut active_field_line = None;
     let mut active_field_prefix_chars = 0usize;
+    let label_width = form_label_width(form);
     for (idx, field) in form.fields.iter().enumerate() {
         if field.section != prev_section {
             lines.push(Line::from(Span::styled(
@@ -313,7 +314,7 @@ fn draw_form(frame: &mut Frame, app: &App) {
         } else {
             theme::dim()
         };
-        let label = format!("{marker} {:>18}{optional}: ", field.display);
+        let label = format!("{marker} {:<label_width$}{optional}: ", field.display);
         if editing && field_accepts_cursor(field) {
             active_field_line = Some(lines.len());
             active_field_prefix_chars = label.chars().count();
@@ -391,6 +392,15 @@ fn draw_form(frame: &mut Frame, app: &App) {
             .min(area.y.saturating_add(area.height.saturating_sub(2)));
         frame.set_cursor_position((x, y));
     }
+}
+
+fn form_label_width(form: &Form) -> usize {
+    form.fields
+        .iter()
+        .map(|field| field.display.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(4, 18)
 }
 
 fn field_kind_tag(field: &crate::app::FormField) -> String {
@@ -563,7 +573,9 @@ pub(crate) fn render_list(
 
 #[cfg(test)]
 mod tests {
-    use super::{footer_context, footer_model, form_extra_rows, key_hint, FooterContext};
+    use super::{
+        footer_context, footer_model, form_extra_rows, form_label_width, key_hint, FooterContext,
+    };
     use crate::app::{App, FieldKind, Focus, Form, FormField, FormKind, IssueDetailSection, View};
     use crate::ui::draw;
     use auwsx_core::agent::ExitKind;
@@ -842,6 +854,67 @@ mod tests {
 
         assert!(context.contains("kanban"));
         assert!(!context.contains("(Enter)"));
+    }
+
+    #[test]
+    fn given_single_field_form_when_rendered_then_label_is_compact() {
+        let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
+        app.form = Some(Form {
+            kind: FormKind::Backlog,
+            title: "Backlog",
+            fields: vec![FormField {
+                label: "text",
+                display: "Text",
+                section: "Content",
+                help: "",
+                kind: FieldKind::Text,
+                value: String::new(),
+                optional: false,
+            }],
+            current: 0,
+            cursor: 0,
+            completion_sel: 0,
+            mode: crate::app::FormMode::Navigate,
+        });
+
+        let rendered = rendered_app(app, 90, 20);
+
+        assert!(rendered.contains("> Text:"));
+        assert!(!rendered.contains(">               Text:"));
+    }
+
+    #[test]
+    fn given_project_form_when_label_width_requested_then_matches_real_fields() {
+        let form = Form {
+            kind: FormKind::Project,
+            title: "Project",
+            fields: vec![
+                FormField {
+                    label: "name",
+                    display: "Name",
+                    section: "Project",
+                    help: "",
+                    kind: FieldKind::Text,
+                    value: String::new(),
+                    optional: false,
+                },
+                FormField {
+                    label: "schedule_cron",
+                    display: "Scheduler cadence",
+                    section: "Schedule",
+                    help: "",
+                    kind: FieldKind::Text,
+                    value: String::new(),
+                    optional: true,
+                },
+            ],
+            current: 0,
+            cursor: 0,
+            completion_sel: 0,
+            mode: crate::app::FormMode::Navigate,
+        };
+
+        assert_eq!(form_label_width(&form), "Scheduler cadence".len());
     }
 
     #[test]
