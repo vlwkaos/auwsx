@@ -828,8 +828,18 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints(issue_section_constraints(app.selected_issue_section()))
         .split(area);
-    let mut lines = vec![
-        kv("title", &issue.title),
+    let mut lines = vec![kv("title", &issue.title)];
+    if let Some(desc) = &issue.description {
+        lines.extend(scrolling_text_lines(
+            "description",
+            &format!("issue:{}:description", issue.id),
+            desc,
+            app,
+            3,
+        ));
+    }
+    append_issue_summary_lines(&mut lines, app, issue);
+    lines.extend([
         kv("branch", issue.branch.as_deref().unwrap_or("(none)")),
         kv(
             "worktree",
@@ -844,17 +854,7 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
                 "no"
             },
         ),
-    ];
-    if let Some(desc) = &issue.description {
-        lines.extend(scrolling_text_lines(
-            "description",
-            &format!("issue:{}:description", issue.id),
-            desc,
-            app,
-            3,
-        ));
-    }
-    append_issue_summary_lines(&mut lines, app, issue);
+    ]);
     panel_with_focus(
         frame,
         rows[0],

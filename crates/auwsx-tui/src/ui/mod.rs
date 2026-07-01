@@ -35,7 +35,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match app.view {
         View::Overview => overview::render(frame, app, chunks[0]),
-        View::Issue => issue::render(frame, app, chunks[0]),
         View::Logs => logs::render(frame, app, chunks[0]),
         View::Config => config::render(frame, app, chunks[0]),
         View::Ask => ask::render(frame, app, chunks[0]),
@@ -136,7 +135,6 @@ fn footer_model(app: &App) -> FooterModel {
 enum FooterContext {
     ConfirmQuit,
     Form(FormMode),
-    IssueView,
     Config,
     MoveMode {
         project_scope: bool,
@@ -157,9 +155,6 @@ impl FooterContext {
         }
         if let Some(form) = app.form.as_ref() {
             return Self::Form(form.mode);
-        }
-        if app.view == View::Issue {
-            return Self::IssueView;
         }
         if app.view == View::Config {
             return Self::Config;
@@ -202,17 +197,6 @@ impl FooterContext {
                 FooterHint::key("Enter", "done"),
                 FooterHint::key("Esc", "done"),
             ],
-            Self::IssueView => with_capabilities(
-                vec![
-                    FooterHint::key("k", "older"),
-                    FooterHint::key("j", "newer"),
-                    FooterHint::key("PgUp/PgDn", "page"),
-                    FooterHint::key("Home", "oldest"),
-                    FooterHint::key("End", "newest"),
-                ],
-                app,
-                Some(FooterHint::key("Esc", "back")),
-            ),
             Self::Config => {
                 let mut hints = vec![
                     FooterHint::text("settings"),
@@ -633,11 +617,14 @@ mod tests {
         footer_context, footer_model, form_extra_rows, form_label_width, key_hint, FooterContext,
         FooterHint,
     };
-    use crate::app::{App, FieldKind, Focus, Form, FormField, FormKind, IssueDetailSection, View};
+    use crate::app::{
+        App, FieldKind, Focus, Form, FormField, FormKind, IssueDetailSection, ProjectChildren, View,
+    };
     use crate::ui::draw;
     use auwsx_core::agent::ExitKind;
     use auwsx_core::db::agent_runs::{AgentRun, Role};
     use auwsx_core::db::issues::Issue;
+    use auwsx_core::db::projects::{CompletionPolicy, MergeMode, Project};
     use auwsx_core::state::IssueStatus;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -695,15 +682,9 @@ mod tests {
     }
 
     #[test]
-    fn draw_issue_normal_no_panic() {
-        draw_view(View::Issue, 100, 30);
-    }
-
-    #[test]
     fn draw_issue_renders_phase_reports() {
         let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
-        app.view = View::Issue;
-        app.detail.issue = Some(Issue {
+        let issue = Issue {
             id: 7,
             project_id: 1,
             title: "archive view".to_string(),
@@ -721,7 +702,55 @@ mod tests {
             has_pending_steering: false,
             created_at: 1,
             updated_at: 1,
+        };
+        app.projects.push(Project {
+            id: 1,
+            profile_id: 1,
+            profile_order: 0,
+            name: "p".to_string(),
+            repo_path: ".".to_string(),
+            default_branch: "main".to_string(),
+            arsenal_preset_name: None,
+            main_agent_cmd: "agent".to_string(),
+            route_agent_cmd: "agent".to_string(),
+            plan_agent_cmd: "agent".to_string(),
+            work_agent_cmd: "agent".to_string(),
+            review_agent_cmd: None,
+            main_agent_cmd_override: None,
+            route_agent_cmd_override: None,
+            plan_agent_cmd_override: None,
+            work_agent_cmd_override: None,
+            review_agent_cmd_override: None,
+            completion_policy: CompletionPolicy::Manual,
+            completion_soft_timeout_min: 0,
+            plan_gate_timeout_min: 0,
+            iteration_timeout_min: 30,
+            main_job_timeout_min: 30,
+            review_max_rounds: 1,
+            conflict_max_attempts: 1,
+            max_concurrency: 1,
+            schedule_cron: None,
+            merge_mode: MergeMode::Local,
+            skill_path: None,
+            deepsleep_cron: None,
+            last_deepsleep_at: None,
+            created_at: 1,
         });
+        app.expanded.insert(1);
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue.clone()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, crate::app::TreeItem::Issue { id: 7, .. }))
+            .unwrap();
+        app.focus = Focus::IssueDetail;
+        app.detail.issue = Some(issue);
         app.detail.runs = vec![AgentRun {
             id: 3,
             issue_id: Some(7),
@@ -748,9 +777,8 @@ mod tests {
 
         let rendered = rendered_app(app, 120, 40);
 
-        assert!(rendered.contains("Phase notes"));
+        assert!(rendered.contains("phase report"));
         assert!(rendered.contains("Implemented archive view"));
-        assert!(rendered.contains("cargo test --package auwsx-tui"));
     }
 
     #[test]
@@ -776,11 +804,6 @@ mod tests {
     #[test]
     fn draw_overview_tiny_no_panic() {
         draw_view(View::Overview, 8, 4);
-    }
-
-    #[test]
-    fn draw_issue_tiny_no_panic() {
-        draw_view(View::Issue, 8, 4);
     }
 
     #[test]

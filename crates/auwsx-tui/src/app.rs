@@ -53,7 +53,6 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Overview,
-    Issue,
     Logs,
     Config,
     Ask,
@@ -1796,11 +1795,7 @@ impl App {
                 _ => None,
             };
         }
-        self.selected_issue_row_id().or_else(|| {
-            (self.view == View::Issue)
-                .then(|| self.issues().get(self.issue_sel).map(|i| i.id))
-                .flatten()
-        })
+        self.selected_issue_row_id()
     }
 
     fn selected_active_issue_id(&self) -> Option<i64> {
@@ -2017,7 +2012,6 @@ impl App {
                 .archived_issues
                 .iter()
                 .find(|i| i.id == id),
-            _ if self.view == View::Issue => self.issues().get(self.issue_sel),
             _ => None,
         }
     }
@@ -2080,15 +2074,6 @@ impl App {
                     caps.push(CapabilityAction::Edit, "e", "edit");
                 }
                 _ => {}
-            }
-            return caps;
-        }
-        if self.view == View::Issue {
-            if self.selected_project_id().is_some() {
-                caps.push(CapabilityAction::Ask, "?", "ask");
-            }
-            if self.selected_issue_accepts_queue_message() {
-                caps.push(CapabilityAction::Add, "a", "steer");
             }
             return caps;
         }
@@ -2806,9 +2791,6 @@ impl App {
                     self.refresh_detail().await?;
                 }
             }
-            View::Issue => {
-                self.refresh_detail().await?;
-            }
             _ => {}
         }
         Ok(true)
@@ -2837,9 +2819,7 @@ impl App {
                 self.confirm_quit = true;
             }
             Action::Down => {
-                if self.view == View::Issue {
-                    self.scroll_issue_log(-1);
-                } else if self.view == View::Config {
+                if self.view == View::Config {
                     self.move_settings_row(1);
                 } else if self.move_mode {
                     self.move_selected_item(1).await?;
@@ -2856,9 +2836,7 @@ impl App {
                 }
             }
             Action::Up => {
-                if self.view == View::Issue {
-                    self.scroll_issue_log(1);
-                } else if self.view == View::Config {
+                if self.view == View::Config {
                     self.move_settings_row(-1);
                 } else if self.move_mode {
                     self.move_selected_item(-1).await?;
@@ -2893,36 +2871,28 @@ impl App {
                 }
             }
             Action::PageDown => {
-                if self.view == View::Issue {
-                    self.scroll_issue_log(-10);
-                } else if self.view == View::Config {
+                if self.view == View::Config {
                     self.scroll_config(10);
                 } else if self.issue_log_section_active() {
                     self.scroll_issue_log(-10);
                 }
             }
             Action::PageUp => {
-                if self.view == View::Issue {
-                    self.scroll_issue_log(10);
-                } else if self.view == View::Config {
+                if self.view == View::Config {
                     self.scroll_config(-10);
                 } else if self.issue_log_section_active() {
                     self.scroll_issue_log(10);
                 }
             }
             Action::Top => {
-                if self.view == View::Issue {
-                    self.jump_issue_log_top();
-                } else if self.view == View::Config {
+                if self.view == View::Config {
                     self.jump_settings_top();
                 } else if self.issue_log_section_active() {
                     self.jump_issue_log_top();
                 }
             }
             Action::Bottom => {
-                if self.view == View::Issue {
-                    self.jump_issue_log_bottom();
-                } else if self.view == View::Config {
+                if self.view == View::Config {
                     self.jump_settings_bottom();
                 } else if self.issue_log_section_active() {
                     self.jump_issue_log_bottom();
@@ -2962,7 +2932,7 @@ impl App {
                 } else if self.view == View::Overview && self.focus == Focus::ProjectKanban {
                     self.focus = Focus::Left;
                     self.move_mode = false;
-                } else if matches!(self.view, View::Config | View::Issue) {
+                } else if matches!(self.view, View::Config) {
                     self.set_view(View::Overview).await?;
                 }
             }
@@ -3825,12 +3795,10 @@ impl App {
         self.focus = match v {
             View::Overview => Focus::Left,
             View::Config => Focus::Settings,
-            View::Issue => Focus::IssueDetail,
             _ => Focus::Left,
         };
         // Entering a view freshens exactly what it shows.
         match v {
-            View::Issue => self.refresh_detail().await?,
             View::Config => {
                 self.refresh_arsenal().await?;
                 self.refresh_memory_presets().await?;
@@ -5316,25 +5284,6 @@ mod tests {
     }
 
     #[test]
-    fn given_full_issue_view_when_no_issue_row_selected_then_issue_sel_remains_legacy_selection() {
-        let mut app = test_app();
-        app.view = View::Issue;
-        app.projects.push(project_fixture());
-        app.children.insert(
-            1,
-            ProjectChildren {
-                issues: vec![issue_fixture()],
-                ..ProjectChildren::default()
-            },
-        );
-        app.tree_sel = 0;
-        app.issue_sel = 0;
-
-        assert_eq!(app.selected_issue_id(), Some(7));
-        assert_eq!(app.selected_issue().map(|issue| issue.id), Some(7));
-    }
-
-    #[test]
     fn given_archived_issue_when_tree_rendered_then_hidden_behind_archive_section() {
         let mut app = test_app();
         let mut active = issue_fixture();
@@ -5766,30 +5715,6 @@ mod tests {
         app.submit_form().await.unwrap();
 
         assert_eq!(app.status, "select an active issue first");
-    }
-
-    #[test]
-    fn given_non_issue_row_when_issue_selection_falls_back_then_issue_row_id_is_empty() {
-        let mut app = test_app();
-        app.view = View::Issue;
-        app.projects = vec![test_project()];
-        app.expanded.insert(42);
-        app.children.insert(
-            42,
-            ProjectChildren {
-                issues: vec![test_issue(7, IssueStatus::Working, "active")],
-                ..ProjectChildren::default()
-            },
-        );
-        app.issue_sel = 0;
-        app.tree_sel = app
-            .tree_rows()
-            .iter()
-            .position(|r| matches!(r.item, TreeItem::Project(42)))
-            .unwrap();
-
-        assert_eq!(app.selected_issue_id(), Some(7));
-        assert_eq!(app.selected_issue_row_id(), None);
     }
 
     #[tokio::test]

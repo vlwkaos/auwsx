@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn given_page_down_when_mapped_then_page_down() {
         assert_eq!(
-            map_key(View::Issue, key(KeyCode::PageDown)),
+            map_key(View::Overview, key(KeyCode::PageDown)),
             Some(Action::PageDown)
         );
     }
@@ -234,20 +234,23 @@ mod tests {
     #[test]
     fn given_page_up_when_mapped_then_page_up() {
         assert_eq!(
-            map_key(View::Issue, key(KeyCode::PageUp)),
+            map_key(View::Overview, key(KeyCode::PageUp)),
             Some(Action::PageUp)
         );
     }
 
     #[test]
     fn given_home_when_mapped_then_top() {
-        assert_eq!(map_key(View::Issue, key(KeyCode::Home)), Some(Action::Top));
+        assert_eq!(
+            map_key(View::Overview, key(KeyCode::Home)),
+            Some(Action::Top)
+        );
     }
 
     #[test]
     fn given_end_when_mapped_then_bottom() {
         assert_eq!(
-            map_key(View::Issue, key(KeyCode::End)),
+            map_key(View::Overview, key(KeyCode::End)),
             Some(Action::Bottom)
         );
     }

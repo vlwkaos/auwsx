@@ -80,13 +80,6 @@ pub(crate) struct SummaryRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PhaseNote {
-    pub(crate) run_label: String,
-    pub(crate) outcome: String,
-    pub(crate) details: Vec<SummaryRow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteSyncSummary {
     pub(crate) active: usize,
     pub(crate) failures: usize,
@@ -297,18 +290,6 @@ pub(crate) fn issue_summary_rows(
     rows
 }
 
-pub(crate) fn phase_notes(runs: &[AgentRun], limit: usize) -> Vec<PhaseNote> {
-    runs.iter()
-        .rev()
-        .filter_map(|run| {
-            run.phase_report
-                .as_deref()
-                .map(|report| phase_note(run, report))
-        })
-        .take(limit)
-        .collect()
-}
-
 fn remote_pr_summary(link: &RemotePrLink) -> String {
     let mut parts = vec![
         format!("#{}", link.remote_pr_number),
@@ -453,49 +434,6 @@ fn card_sort_key(card: &KanbanCard) -> (u8, IssueSortKey, i64) {
 
 fn summary_row(label: &'static str, value: String) -> SummaryRow {
     SummaryRow { label, value }
-}
-
-fn phase_note(run: &AgentRun, report: &str) -> PhaseNote {
-    PhaseNote {
-        run_label: format!("#{} {} {}", run.id, run.role.as_str(), run.phase),
-        outcome: first_nonempty_line(report),
-        details: phase_report_details(report),
-    }
-}
-
-fn phase_report_details(report: &str) -> Vec<SummaryRow> {
-    const LABELS: [(&str, &str); 5] = [
-        ("change/check", "change"),
-        ("change", "change"),
-        ("check", "check"),
-        ("reason", "reason"),
-        ("verification", "verify"),
-    ];
-    let mut rows = Vec::new();
-    for raw in report.lines().skip(1) {
-        let line = raw
-            .trim()
-            .trim_start_matches(['-', '*', '+'])
-            .trim()
-            .trim_matches('*')
-            .trim();
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let key = key.trim().trim_matches('*').to_ascii_lowercase();
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        if key == "next status" || key == "next" {
-            rows.push(summary_row("next", value.to_string()));
-            continue;
-        }
-        if let Some((_, label)) = LABELS.iter().find(|(prefix, _)| key == *prefix) {
-            rows.push(summary_row(label, value.to_string()));
-        }
-    }
-    rows
 }
 
 fn push_optional_report(rows: &mut Vec<SummaryRow>, label: &'static str, value: Option<&str>) {
@@ -953,37 +891,6 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.label == "latest run" && row.value == "#9 work WORKING exited:0 -> REVIEWING"
         }));
-    }
-
-    #[test]
-    fn given_phase_report_when_notes_requested_then_outcome_and_details_are_projected() {
-        let mut run = agent_run(9, 7, Some(TS + 1));
-        run.phase_report = Some(
-            "Implemented archive view.\n\
-             - Change/Check: added low-frequency archive section\n\
-             - Reason: keep done issues out of the main list\n\
-             - Verification: cargo test --package auwsx-tui\n\
-             - Next status: READY_TO_MERGE"
-                .to_string(),
-        );
-
-        let notes = phase_notes(&[run], 5);
-
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].run_label, "#9 work WORKING");
-        assert_eq!(notes[0].outcome, "Implemented archive view.");
-        assert_eq!(
-            notes[0].details,
-            vec![
-                summary_row("change", "added low-frequency archive section".to_string()),
-                summary_row(
-                    "reason",
-                    "keep done issues out of the main list".to_string()
-                ),
-                summary_row("verify", "cargo test --package auwsx-tui".to_string()),
-                summary_row("next", "READY_TO_MERGE".to_string()),
-            ]
-        );
     }
 
     #[test]
