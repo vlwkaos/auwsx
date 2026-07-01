@@ -288,8 +288,8 @@ runs one merge at a time and pauses later merges behind `CONFLICT_BLOCKED`.
 Project config `merge_delay` is only used by `completion=soft`: it is the number
 of minutes to wait before auto-releasing `READY_TO_MERGE` to `MERGING`.
 
-Press `S` in the TUI to open Settings. Settings is a structured navigator for
-global runtime defaults, profiles, Arsenal presets, the Prompt Catalog, and
+Press `Ctrl-,` in the TUI to open Settings. Settings is a structured navigator
+for global runtime defaults, profiles, Arsenal presets, the Prompt Catalog, and
 persisted Pipeline UX Standard guidance. Arsenal presets and the Pipeline UX
 Standard are editable there. Project-specific merge, schedule, concurrency,
 timeout, and skill-path settings stay on the project row edit form. Prompt
