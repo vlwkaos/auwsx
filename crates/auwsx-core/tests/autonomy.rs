@@ -31,8 +31,9 @@ use auwsx_core::db::agent_runs::{self, Role, StartRun};
 use auwsx_core::db::issues::{self, Issue};
 use auwsx_core::db::projects::{self, CompletionPolicy, MergeMode, NewProject, Project};
 use auwsx_core::db::remote::{
-    self, RemoteAuthKind, RemoteProvider, RemoteSyncKind, RemoteSyncStatus, RequiredChecksPolicy,
-    UpsertProjectRemoteConfig,
+    self, ProjectRemoteConfig, RemoteAuthKind, RemotePrLink, RemotePrState, RemoteProvider,
+    RemoteSyncDirection, RemoteSyncKind, RemoteSyncStatus, RequiredChecksPolicy,
+    UpsertProjectRemoteConfig, UpsertRemotePrLink,
 };
 use auwsx_core::db::scheduler_runs;
 use auwsx_core::db::Db;
@@ -1056,6 +1057,7 @@ impl AgentExecutor for ExitAgent {
 #[derive(Default)]
 struct TestRemoteExecutor {
     seen: Arc<Mutex<Vec<RemoteSyncKind>>>,
+    observed_state: Option<RemotePrState>,
 }
 
 #[async_trait]
@@ -1086,6 +1088,23 @@ impl RemoteProviderExecutor for TestRemoteExecutor {
             })),
             RemotePlannedAction::PostProgressComment { .. } => Ok(RemoteProviderEffect::Comment),
         }
+    }
+
+    async fn observe_pull_request(
+        &self,
+        _config: &ProjectRemoteConfig,
+        pr_link: &RemotePrLink,
+    ) -> anyhow::Result<CreatedRemotePr> {
+        Ok(CreatedRemotePr {
+            number: pr_link.remote_pr_number,
+            node_id: pr_link.remote_node_id.clone(),
+            url: pr_link.remote_url.clone(),
+            head_branch: pr_link.head_branch.clone(),
+            head_sha: pr_link.head_sha.clone(),
+            base_branch: pr_link.base_branch.clone(),
+            base_sha: pr_link.base_sha.clone(),
+            state: self.observed_state.unwrap_or(pr_link.state),
+        })
     }
 }
 
@@ -1546,6 +1565,84 @@ async fn given_pr_merge_project_when_issue_merge_approved_then_remote_pr_sync_is
     assert!(runs
         .iter()
         .any(|run| run.kind == RemoteSyncKind::Pr && run.status == RemoteSyncStatus::Done));
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_pr_merge_project_when_remote_pr_observed_merged_then_issue_done(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let project_id = drive_project(db.pool()).await?;
+    sqlx::query("UPDATE projects SET merge_mode = 'pr' WHERE id = ?")
+        .bind(project_id)
+        .execute(db.pool())
+        .await?;
+    enable_project_remote(db.pool(), project_id).await?;
+    let issue_id = issues::create(db.pool(), project_id, "remote merged pr", None, TS).await?;
+    issues::set_worktree(
+        db.pool(),
+        issue_id,
+        Some("auwsx/issue-remote-pr"),
+        Some("/worktree"),
+        None,
+        TS,
+    )
+    .await?;
+    issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS).await?;
+    let pr_link_id = remote::upsert_pr_link(
+        db.pool(),
+        UpsertRemotePrLink {
+            project_id,
+            issue_id,
+            provider: RemoteProvider::Github,
+            remote_owner: "acme",
+            remote_repo: "app",
+            remote_pr_number: 44,
+            remote_node_id: None,
+            remote_url: "https://github.com/acme/app/pull/44",
+            head_branch: "auwsx/issue-remote-pr",
+            head_sha: None,
+            base_branch: "main",
+            base_sha: None,
+            state: RemotePrState::Open,
+            last_synced_at: Some(TS),
+        },
+        TS,
+    )
+    .await?;
+    let remote_executor = Arc::new(TestRemoteExecutor {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        observed_state: Some(RemotePrState::Merged),
+    });
+    let scheduler = scheduler_with_remote_executor(
+        db.clone(),
+        Arc::new(FixedClock(TS + 1)),
+        Arc::new(ExitAgent),
+        remote_executor,
+        Duration::from_secs(60),
+    );
+
+    scheduler.tick_project(project_id).await?;
+
+    let issue = issues::get(db.pool(), issue_id)
+        .await?
+        .expect("issue exists");
+    let pr_link = remote::pr_link_by_issue(db.pool(), issue_id)
+        .await?
+        .expect("PR link exists");
+    let runs = remote::recent_sync_runs(db.pool(), project_id, 10).await?;
+    assert_eq!(issue.status, IssueStatus::Done);
+    assert_eq!(pr_link.state, RemotePrState::Merged);
+    assert!(issue
+        .result_report
+        .as_deref()
+        .is_some_and(|report| report.contains("Remote PR merged")));
+    assert!(runs.iter().any(|run| {
+        run.direction == RemoteSyncDirection::Inbound
+            && run.kind == RemoteSyncKind::Pr
+            && run.status == RemoteSyncStatus::Done
+            && run.remote_pr_link_id == Some(pr_link_id)
+    }));
     Ok(())
 }
 

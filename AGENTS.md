@@ -66,7 +66,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 - `crates/auwsx-core/src/db/arsenal.rs` — global Arsenal presets for reusable per-role agent command templates, including the cheap route-agent command
 - `crates/auwsx-core/src/db/global_settings.rs` — singleton global settings such as persisted Pipeline UX Standard prompt guidance
 - `crates/auwsx-core/src/db/remote.rs` — per-project remote repo config, remote issue/PR links, webhook event idempotency, and remote sync audit rows
-- `crates/auwsx-core/src/remote_executor.rs` — provider execution boundary for queued remote sync runs, with GitHub CLI adapter
+- `crates/auwsx-core/src/remote_executor.rs` — provider execution boundary for queued remote sync runs and PR-state observation, with GitHub CLI adapter
 - `crates/auwsx-core/src/remote_inbound.rs` — inbound remote event processing into approved backlog with delivery idempotency
 - `crates/auwsx-core/src/remote_workflow.rs` — daemon-owned conversion of remote plans into idempotent queued `remote_sync_runs`
 - `crates/auwsx-core/src/ipc.rs` — Unix-socket `Command`/`Response`/`Event` protocol + `serve`/`request`/`EventStream` + unit-testable `dispatch`

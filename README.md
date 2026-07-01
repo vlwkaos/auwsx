@@ -39,6 +39,11 @@ target `POST /webhooks/github`. If a project remote config has
 `webhook_secret_ref`, that value is read as an environment variable name
 (`env:NAME` is also accepted) and verified against `X-Hub-Signature-256`.
 
+When a project uses PR merge mode, approving a ready issue queues a remote PR
+sync instead of local `MERGING`. Later scheduler ticks observe linked PRs; when
+GitHub reports the PR as merged, auwsx updates the remote PR link, records an
+inbound PR sync audit row, and marks the local issue `DONE`.
+
 If SQLite state is reset outside the daemon, git may still have auwsx-managed
 issue worktrees registered. Prune those orphaned worktrees before reusing the
 repo:

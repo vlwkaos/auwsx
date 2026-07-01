@@ -482,6 +482,24 @@ impl Scheduler {
         {
             tracing::warn!("executing remote syncs for project {project_id} failed: {e:#}");
         }
+        let remote_pr_observations = if project.merge_mode == MergeMode::Pr {
+            match remote_executor::observe_project_pull_requests(
+                pool,
+                self.remote_executor.as_ref(),
+                project_id,
+                now,
+            )
+            .await
+            {
+                Ok(items) => items,
+                Err(e) => {
+                    tracing::warn!("observing remote PRs for project {project_id} failed: {e:#}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let issues = issues::list_by_project(pool, project_id).await?;
         let issue_ids: HashSet<i64> = issues.iter().map(|issue| issue.id).collect();
         let project_running: HashSet<i64> = snapshot
@@ -545,6 +563,14 @@ impl Scheduler {
                 let _ = self.events.send(Event::SteeringAdded {
                     steering_id: *message_id,
                     issue_id: *issue_id,
+                });
+            }
+        }
+        for observation in &remote_pr_observations {
+            if observation.issue_marked_done {
+                let _ = self.events.send(Event::IssueStatus {
+                    issue_id: observation.issue_id,
+                    status: IssueStatus::Done,
                 });
             }
         }

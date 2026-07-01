@@ -5,11 +5,13 @@
 //! instead of applying old assumptions.
 
 use crate::db::remote::{
-    self, ProjectRemoteConfig, RemoteIssueLink, RemotePrLink, RemotePrState, RemoteProvider,
-    RemoteSyncKind, RemoteSyncRun, RemoteSyncStatus, UpsertRemoteIssueLink, UpsertRemotePrLink,
+    self, NewRemoteSyncRun, ProjectRemoteConfig, RemoteIssueLink, RemotePrLink, RemotePrState,
+    RemoteProvider, RemoteSyncDirection, RemoteSyncKind, RemoteSyncRun, RemoteSyncStatus,
+    UpsertRemoteIssueLink, UpsertRemotePrLink,
 };
 use crate::db::{issues, Issue};
 use crate::remote_plan::{self, RemotePlannedAction, RemoteWorkflowInput, RemoteWorkflowPlan};
+use crate::state::IssueStatus;
 use crate::Result;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -63,9 +65,25 @@ pub enum RemoteProviderEffect {
     Comment,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePrObservation {
+    pub issue_id: i64,
+    pub remote_pr_link_id: i64,
+    pub state: RemotePrState,
+    pub issue_marked_done: bool,
+    pub remote_sync_run_id: i64,
+    pub error: Option<String>,
+}
+
 #[async_trait]
 pub trait RemoteProviderExecutor: Send + Sync {
     async fn execute(&self, request: RemoteSyncRequest) -> Result<RemoteProviderEffect>;
+
+    async fn observe_pull_request(
+        &self,
+        config: &ProjectRemoteConfig,
+        pr_link: &RemotePrLink,
+    ) -> Result<CreatedRemotePr>;
 }
 
 #[derive(Debug, Default)]
@@ -121,16 +139,7 @@ impl RemoteProviderExecutor for GithubCliRemoteExecutor {
                     Err(create_err) => {
                         let viewed = run_gh(
                             &request.config,
-                            vec![
-                                "pr".to_string(),
-                                "view".to_string(),
-                                head_branch.to_string(),
-                                "--repo".to_string(),
-                                repo_slug(&request.config),
-                                "--json".to_string(),
-                                "number,url,id,state,headRefName,baseRefName,headRefOid,baseRefOid"
-                                    .to_string(),
-                            ],
+                            gh_pr_view_args(&request.config, head_branch),
                         )
                         .await
                         .with_context(|| {
@@ -184,6 +193,22 @@ impl RemoteProviderExecutor for GithubCliRemoteExecutor {
             }
         }
     }
+
+    async fn observe_pull_request(
+        &self,
+        config: &ProjectRemoteConfig,
+        pr_link: &RemotePrLink,
+    ) -> Result<CreatedRemotePr> {
+        if config.provider != RemoteProvider::Github {
+            bail!("unsupported remote provider {:?}", config.provider);
+        }
+        let viewed = run_gh(
+            config,
+            gh_pr_view_args(config, &pr_link.remote_pr_number.to_string()),
+        )
+        .await?;
+        parse_pr_view_json(&viewed)
+    }
 }
 
 pub async fn execute_queued_project_syncs(
@@ -199,6 +224,150 @@ pub async fn execute_queued_project_syncs(
         out.push(execute_sync_run(pool, executor, run.id, now).await?);
     }
     Ok(out)
+}
+
+pub async fn observe_project_pull_requests(
+    pool: &SqlitePool,
+    executor: &dyn RemoteProviderExecutor,
+    project_id: i64,
+    now: i64,
+) -> Result<Vec<RemotePrObservation>> {
+    let Some(config) = remote::get_config(pool, project_id).await? else {
+        return Ok(Vec::new());
+    };
+    if !config.remote_pr_merge_enabled {
+        return Ok(Vec::new());
+    }
+    let issues = issues::list_by_status(pool, project_id, IssueStatus::ReadyToMerge).await?;
+    let mut out = Vec::new();
+    for issue in issues {
+        let Some(pr_link) = remote::pr_link_by_issue(pool, issue.id).await? else {
+            continue;
+        };
+        if pr_link.state == RemotePrState::Merged {
+            continue;
+        }
+        out.push(observe_issue_pull_request(pool, executor, &config, &issue, &pr_link, now).await?);
+    }
+    Ok(out)
+}
+
+async fn observe_issue_pull_request(
+    pool: &SqlitePool,
+    executor: &dyn RemoteProviderExecutor,
+    config: &ProjectRemoteConfig,
+    issue: &Issue,
+    pr_link: &RemotePrLink,
+    now: i64,
+) -> Result<RemotePrObservation> {
+    let run_id = remote::create_sync_run(
+        pool,
+        NewRemoteSyncRun {
+            project_id: issue.project_id,
+            issue_id: Some(issue.id),
+            backlog_item_id: None,
+            remote_issue_link_id: None,
+            remote_pr_link_id: Some(pr_link.id),
+            direction: RemoteSyncDirection::Inbound,
+            kind: RemoteSyncKind::Pr,
+            status: RemoteSyncStatus::Running,
+            summary: Some("observe remote PR merge state"),
+            error: None,
+            started_at: Some(now),
+            ended_at: None,
+        },
+        now,
+    )
+    .await?;
+
+    let observed = match executor.observe_pull_request(config, pr_link).await {
+        Ok(observed) => observed,
+        Err(e) => {
+            let error = format!("{e:#}");
+            remote::finish_sync_run(
+                pool,
+                run_id,
+                RemoteSyncStatus::Failed,
+                Some(&error),
+                None,
+                Some(pr_link.id),
+                now,
+            )
+            .await?;
+            return Ok(RemotePrObservation {
+                issue_id: issue.id,
+                remote_pr_link_id: pr_link.id,
+                state: pr_link.state,
+                issue_marked_done: false,
+                remote_sync_run_id: run_id,
+                error: Some(error),
+            });
+        }
+    };
+
+    let updated_link_id = remote::upsert_pr_link(
+        pool,
+        UpsertRemotePrLink {
+            project_id: issue.project_id,
+            issue_id: issue.id,
+            provider: config.provider,
+            remote_owner: &config.owner,
+            remote_repo: &config.repo,
+            remote_pr_number: observed.number,
+            remote_node_id: observed.node_id.as_deref(),
+            remote_url: &observed.url,
+            head_branch: &observed.head_branch,
+            head_sha: observed.head_sha.as_deref(),
+            base_branch: &observed.base_branch,
+            base_sha: observed.base_sha.as_deref(),
+            state: observed.state,
+            last_synced_at: Some(now),
+        },
+        now,
+    )
+    .await?;
+
+    let mut issue_marked_done = false;
+    if observed.state == RemotePrState::Merged {
+        issues::update_reports(
+            pool,
+            issue.id,
+            None,
+            None,
+            Some(&format!("Remote PR merged: {}", observed.url.trim())),
+            now,
+        )
+        .await?;
+        issues::force_status_if_current_project(
+            pool,
+            issue.id,
+            issue.project_id,
+            IssueStatus::ReadyToMerge,
+            IssueStatus::Done,
+            now,
+        )
+        .await?;
+        issue_marked_done = true;
+    }
+
+    remote::finish_sync_run(
+        pool,
+        run_id,
+        RemoteSyncStatus::Done,
+        None,
+        None,
+        Some(updated_link_id),
+        now,
+    )
+    .await?;
+    Ok(RemotePrObservation {
+        issue_id: issue.id,
+        remote_pr_link_id: updated_link_id,
+        state: observed.state,
+        issue_marked_done,
+        remote_sync_run_id: run_id,
+        error: None,
+    })
 }
 
 pub async fn execute_sync_run(
@@ -442,6 +611,18 @@ fn gh_pr_create_args(
     args
 }
 
+fn gh_pr_view_args(config: &ProjectRemoteConfig, selector: &str) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "view".to_string(),
+        selector.to_string(),
+        "--repo".to_string(),
+        repo_slug(config),
+        "--json".to_string(),
+        "number,url,id,state,headRefName,baseRefName,headRefOid,baseRefOid".to_string(),
+    ]
+}
+
 async fn run_gh(config: &ProjectRemoteConfig, args: Vec<String>) -> Result<String> {
     let mut command = Command::new("gh");
     command.args(args);
@@ -548,6 +729,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRemoteExecutor {
         seen: Arc<Mutex<Vec<RemoteSyncKind>>>,
+        observed_state: Option<RemotePrState>,
     }
 
     #[async_trait]
@@ -580,6 +762,23 @@ mod tests {
                     Ok(RemoteProviderEffect::Comment)
                 }
             }
+        }
+
+        async fn observe_pull_request(
+            &self,
+            _config: &ProjectRemoteConfig,
+            pr_link: &RemotePrLink,
+        ) -> Result<CreatedRemotePr> {
+            Ok(CreatedRemotePr {
+                number: pr_link.remote_pr_number,
+                node_id: pr_link.remote_node_id.clone(),
+                url: pr_link.remote_url.clone(),
+                head_branch: pr_link.head_branch.clone(),
+                head_sha: pr_link.head_sha.clone(),
+                base_branch: pr_link.base_branch.clone(),
+                base_sha: pr_link.base_sha.clone(),
+                state: self.observed_state.unwrap_or(pr_link.state),
+            })
         }
     }
 
@@ -660,6 +859,52 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn ready_issue_with_pr_link(
+        db: &crate::db::Db,
+        project_id: i64,
+        state: RemotePrState,
+    ) -> i64 {
+        let issue_id = issues::create(db.pool(), project_id, "remote pr", None, TS)
+            .await
+            .unwrap();
+        issues::set_worktree(
+            db.pool(),
+            issue_id,
+            Some("auwsx/issue-1"),
+            Some("/worktree"),
+            None,
+            TS,
+        )
+        .await
+        .unwrap();
+        issues::force_status(db.pool(), issue_id, IssueStatus::ReadyToMerge, TS)
+            .await
+            .unwrap();
+        remote::upsert_pr_link(
+            db.pool(),
+            UpsertRemotePrLink {
+                project_id,
+                issue_id,
+                provider: RemoteProvider::Github,
+                remote_owner: "acme",
+                remote_repo: "app",
+                remote_pr_number: 12,
+                remote_node_id: None,
+                remote_url: "https://github.com/acme/app/pull/12",
+                head_branch: "auwsx/issue-1",
+                head_sha: None,
+                base_branch: "main",
+                base_sha: None,
+                state,
+                last_synced_at: Some(TS),
+            },
+            TS,
+        )
+        .await
+        .unwrap();
+        issue_id
     }
 
     #[tokio::test]
@@ -783,6 +1028,72 @@ mod tests {
         assert_eq!(link.remote_pr_number, 12);
         assert_eq!(link.head_branch, "auwsx/issue-1");
         assert_eq!(link.base_branch, "main");
+    }
+
+    #[tokio::test]
+    async fn given_open_remote_pr_when_observed_merged_then_issue_is_done_and_run_recorded() {
+        let db = crate::db::Db::open_memory().await.unwrap();
+        let project_id = project(&db).await;
+        config(&db, project_id).await;
+        let issue_id = ready_issue_with_pr_link(&db, project_id, RemotePrState::Open).await;
+        let executor = FakeRemoteExecutor {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            observed_state: Some(RemotePrState::Merged),
+        };
+
+        let observations = observe_project_pull_requests(db.pool(), &executor, project_id, TS + 1)
+            .await
+            .unwrap();
+
+        let issue = issues::get(db.pool(), issue_id)
+            .await
+            .unwrap()
+            .expect("issue exists");
+        let link = remote::pr_link_by_issue(db.pool(), issue_id)
+            .await
+            .unwrap()
+            .expect("pr link exists");
+        let runs = remote::recent_sync_runs(db.pool(), project_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].state, RemotePrState::Merged);
+        assert!(observations[0].issue_marked_done);
+        assert_eq!(issue.status, IssueStatus::Done);
+        assert_eq!(link.state, RemotePrState::Merged);
+        assert!(issue
+            .result_report
+            .as_deref()
+            .is_some_and(|report| report.contains("Remote PR merged")));
+        assert!(runs.iter().any(|run| {
+            run.id == observations[0].remote_sync_run_id
+                && run.direction == RemoteSyncDirection::Inbound
+                && run.kind == RemoteSyncKind::Pr
+                && run.status == RemoteSyncStatus::Done
+                && run.remote_pr_link_id == Some(link.id)
+        }));
+    }
+
+    #[tokio::test]
+    async fn given_open_remote_pr_when_observed_still_open_then_issue_stays_ready() {
+        let db = crate::db::Db::open_memory().await.unwrap();
+        let project_id = project(&db).await;
+        config(&db, project_id).await;
+        let issue_id = ready_issue_with_pr_link(&db, project_id, RemotePrState::Open).await;
+        let executor = FakeRemoteExecutor::default();
+
+        let observations = observe_project_pull_requests(db.pool(), &executor, project_id, TS + 1)
+            .await
+            .unwrap();
+
+        let issue = issues::get(db.pool(), issue_id)
+            .await
+            .unwrap()
+            .expect("issue exists");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].state, RemotePrState::Open);
+        assert!(!observations[0].issue_marked_done);
+        assert_eq!(issue.status, IssueStatus::ReadyToMerge);
     }
 
     #[test]
