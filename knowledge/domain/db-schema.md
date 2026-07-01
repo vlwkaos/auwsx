@@ -43,7 +43,7 @@ was removed.
 | **remote_issue_links** | local↔remote issue map | links one local issue or backlog item to one provider/owner/repo issue number and URL; unique by remote issue, local issue, and backlog item |
 | **remote_pr_links** | local issue↔remote PR map | links one local issue to a remote PR, head/base branches and SHAs, and PR state `open\|closed\|merged` |
 | **remote_events** | webhook idempotency log | provider delivery id, event/action, payload hash, status `received\|processed\|ignored\|failed`; unique by provider+delivery id |
-| **remote_sync_runs** | remote sync audit log | inbound/outbound sync attempts for webhook/issue/comment/PR operations; status `queued\|running\|done\|failed\|skipped` |
+| **remote_sync_runs** | remote sync queue/audit log | inbound/outbound sync attempts for webhook/issue/comment/PR operations; status `queued\|running\|done\|failed\|skipped`; `remote_workflow` avoids duplicate active runs per issue/kind |
 
 ## Append-only / gate rules
 
