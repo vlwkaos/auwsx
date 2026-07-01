@@ -1284,7 +1284,6 @@ pub struct App {
     /// Project ids whose archive section is expanded. Archives are low-frequency
     /// UX, so expanding a project does not automatically expose terminal issues.
     pub archive_expanded: HashSet<i64>,
-    pub issue_sel: usize,
     pub tree_sel: usize,
     pub kanban_lane_sel: usize,
     pub kanban_card_sel: usize,
@@ -1355,7 +1354,6 @@ impl App {
             children: HashMap::new(),
             expanded: HashSet::new(),
             archive_expanded: HashSet::new(),
-            issue_sel: 0,
             tree_sel: 0,
             kanban_lane_sel: 0,
             kanban_card_sel: 0,
@@ -1410,7 +1408,6 @@ impl App {
             format!("{:?}", self.focus),
             self.proj_sel.to_string(),
             self.tree_sel.to_string(),
-            self.issue_sel.to_string(),
             self.kanban_lane_sel.to_string(),
             self.kanban_card_sel.to_string(),
             format!("{:?}", self.issue_section),
@@ -1799,18 +1796,9 @@ impl App {
     }
 
     fn selected_active_issue_id(&self) -> Option<i64> {
-        match self.selected_tree_item() {
-            Some(TreeItem::Issue { id, .. }) => self
-                .selected_issue()
-                .filter(|issue| !issue.status.is_terminal())
-                .map(|_| id),
-            Some(TreeItem::ArchivedIssue { .. }) => None,
-            _ => self
-                .issues()
-                .get(self.issue_sel)
-                .filter(|issue| !issue.status.is_terminal())
-                .map(|issue| issue.id),
-        }
+        self.selected_issue()
+            .filter(|issue| !issue.status.is_terminal())
+            .map(|issue| issue.id)
     }
 
     fn selected_issue_row_id(&self) -> Option<i64> {
@@ -2257,14 +2245,14 @@ impl App {
         }
 
         let rows = self.tree_rows();
-        let Some((idx, item)) = rows
+        let Some(idx) = rows
             .iter()
             .enumerate()
             .find_map(|(idx, row)| match row.item {
                 TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }
                     if id == issue_id =>
                 {
-                    Some((idx, row.item.clone()))
+                    Some(idx)
                 }
                 _ => None,
             })
@@ -2273,14 +2261,6 @@ impl App {
         };
 
         self.tree_sel = idx;
-        if let TreeItem::Issue { project_id, id } = item {
-            if let Some(idx) = self
-                .children_of(project_id)
-                .and_then(|kids| kids.issues.iter().position(|issue| issue.id == id))
-            {
-                self.issue_sel = idx;
-            }
-        }
         self.sync_active_project();
         true
     }
@@ -2503,10 +2483,6 @@ impl App {
         };
         if let Some(pid) = self.selected_project_id() {
             self.refresh_project_children(pid).await?;
-        }
-        let len = self.issues().len();
-        if self.issue_sel >= len {
-            self.issue_sel = len.saturating_sub(1);
         }
         if let Some((project_id, issue_id)) = selected_issue {
             self.preserve_tree_issue_selection(project_id, issue_id);
@@ -3822,12 +3798,9 @@ impl App {
         self.sync_active_project();
         self.sync_selected_text_scroll();
         self.refresh_asks().await?;
-        if let Some(TreeItem::Issue { id, .. } | TreeItem::ArchivedIssue { id, .. }) =
+        if let Some(TreeItem::Issue { .. } | TreeItem::ArchivedIssue { .. }) =
             self.selected_tree_item()
         {
-            if let Some(idx) = self.issues().iter().position(|i| i.id == id) {
-                self.issue_sel = idx;
-            }
             self.refresh_detail().await?;
         } else {
             self.refresh_activity().await?;
@@ -3913,9 +3886,6 @@ impl App {
             return false;
         };
         self.detail.issue = Some(issue);
-        if let Some(idx) = self.issues().iter().position(|issue| issue.id == issue_id) {
-            self.issue_sel = idx;
-        }
         self.enter_issue_detail(return_focus, return_tree_sel);
         true
     }
@@ -4150,9 +4120,6 @@ impl App {
         }
 
         self.expanded.insert(project_id);
-        if let Some(idx) = is_active {
-            self.issue_sel = idx;
-        }
         if is_archived.is_some() {
             self.archive_expanded.insert(project_id);
             if let Some(idx) = self.tree_rows().iter().position(|row| {
@@ -5057,7 +5024,7 @@ mod tests {
     }
 
     #[test]
-    fn given_project_row_selected_when_issue_sel_points_elsewhere_then_no_issue_is_selected() {
+    fn given_project_row_selected_when_issue_exists_then_no_issue_is_selected() {
         let mut app = test_app();
         app.projects.push(project_fixture());
         app.children.insert(
@@ -5073,7 +5040,6 @@ mod tests {
             .iter()
             .position(|row| row.item == TreeItem::Project(1))
             .expect("project row exists");
-        app.issue_sel = 0;
 
         assert_eq!(app.selected_issue_id(), None);
         assert!(app.selected_issue().is_none());

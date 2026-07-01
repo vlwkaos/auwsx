@@ -12,7 +12,7 @@ pub enum Action {
     Quit,
     /// Shift+Q: stop the daemon, then quit (opens a confirm popup first).
     QuitWithDaemon,
-    /// Move the active cursor: tree selection outside Issue view, log scroll in Issue view.
+    /// Move the active cursor, or scroll an active issue-detail log section.
     Down,
     Up,
     Left,
