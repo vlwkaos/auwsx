@@ -222,10 +222,12 @@ Useful keys:
 - In issue log focus: `k` / `j` scroll the agent log, `PgUp` / `PgDn` page it,
   and `Home` / `End` jump oldest/newest.
 
-Project config is edited from the project row with `e`; Arsenal is the primary
-agent-command choice and per-role command fields are overrides when a preset is
-selected. Settings is global-only: profiles, Arsenal presets, prompt catalog
-review, and persisted pipeline UX guidance. The TUI never opens SQLite directly.
+Project config is edited from the project row with `e`; the project chooses one
+Arsenal preset and does not expose per-role command templates. Edit command
+templates in Settings > Arsenal. CLI per-role command overrides remain for
+compatibility/import paths, not normal TUI setup. Settings is global-only:
+profiles, Arsenal presets, prompt catalog review, and persisted pipeline UX
+guidance. The TUI never opens SQLite directly.
 
 ## Pipeline
 
@@ -245,7 +247,7 @@ Deterministic parts:
 Instruction parts:
 
 - Per-phase prompts generated from issue/project state.
-- The subprocess agent command configured on the project.
+- The subprocess agent command resolved from the project's Arsenal preset.
 - Agent-authored transitions via the auwsx control CLI.
 
 Typical issue flow:
