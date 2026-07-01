@@ -2817,8 +2817,10 @@ impl App {
 
     /// Apply one decoded action. Returns `true` when the app should quit.
     async fn apply(&mut self, action: Action) -> Result<bool> {
-        self.status.clear();
-        self.status_until = None;
+        if !action_preserves_status(action) {
+            self.status.clear();
+            self.status_until = None;
+        }
         if !matches!(action, Action::DeleteSelected) {
             self.pending_project_delete = None;
         }
@@ -4345,6 +4347,22 @@ impl App {
         }
         Ok(())
     }
+}
+
+fn action_preserves_status(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Down
+            | Action::Up
+            | Action::Left
+            | Action::Right
+            | Action::PageDown
+            | Action::PageUp
+            | Action::Top
+            | Action::Bottom
+            | Action::PrevProject
+            | Action::NextProject
+    )
 }
 
 /// Move a selection index by `delta`, clamped to `[0, len)`. No-op on empty.
@@ -6509,6 +6527,24 @@ mod tests {
 
         app.apply(Action::Up).await?;
 
+        assert_eq!(app.render_revision(), before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_boundary_navigation_with_status_when_applied_then_status_is_preserved(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.focus = Focus::Left;
+        app.tree_sel = 0;
+        app.status = "move mode off".to_string();
+        app.status_until = Some(Instant::now() + Duration::from_secs(1));
+        let before = app.render_revision();
+
+        app.apply(Action::Up).await?;
+
+        assert_eq!(app.status, "move mode off");
         assert_eq!(app.render_revision(), before);
         Ok(())
     }
