@@ -255,6 +255,9 @@ fn format_key_hint(key: &str, label: &str) -> String {
             .is_some_and(|first| first.eq_ignore_ascii_case(&key.chars().next().unwrap()))
     {
         format!("({key}){}", chars.as_str())
+    } else if key == "a" && label == "steer" {
+        // ^ `a` is the universal add key; steering is the issue-context add action.
+        format!("({key}){label}")
     } else {
         format!("({key}) {label}")
     }
@@ -3897,6 +3900,14 @@ impl App {
             self.form = Some(Form::arsenal_preset(None));
             return;
         }
+        if self.focus == Focus::IssueDetail {
+            if self.selected_issue_id().is_some() {
+                self.form = Some(Form::steering());
+            } else {
+                self.status = "select an issue first".into();
+            }
+            return;
+        }
 
         match self.selected_context_item() {
             Some(TreeItem::Project(_)) | None => {
@@ -4977,6 +4988,113 @@ mod tests {
             Some(FormKind::QueueMessage)
         ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_kanban_backlog_when_add_then_opens_backlog_form() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                backlog: vec![backlog_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.focus = Focus::ProjectKanban;
+        app.kanban_lane_sel = 0;
+        app.kanban_card_sel = 0;
+
+        let hints = app.capabilities();
+        assert!(hints.has(CapabilityAction::Add));
+        assert!(hints.hints.iter().any(|hint| hint.label == "(a)dd backlog"));
+
+        app.apply(Action::Add).await?;
+
+        assert!(matches!(
+            app.form.as_ref().map(|form| &form.kind),
+            Some(FormKind::Backlog)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_kanban_issue_when_add_then_opens_steering_form() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.focus = Focus::ProjectKanban;
+        app.kanban_lane_sel = 0;
+        app.kanban_card_sel = 0;
+
+        let hints = app.capabilities();
+        assert!(hints.has(CapabilityAction::Add));
+        assert!(hints.hints.iter().any(|hint| hint.label == "(a)steer"));
+
+        app.apply(Action::Add).await?;
+
+        assert!(matches!(
+            app.form.as_ref().map(|form| &form.kind),
+            Some(FormKind::QueueMessage)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_issue_detail_when_add_then_opens_steering_form() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                issues: vec![issue_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.detail.issue = Some(issue_fixture());
+        app.focus = Focus::IssueDetail;
+
+        let hints = app.capabilities();
+        assert!(hints.has(CapabilityAction::Add));
+        assert!(hints.hints.iter().any(|hint| hint.label == "(a)steer"));
+
+        app.apply(Action::Add).await?;
+
+        assert!(matches!(
+            app.form.as_ref().map(|form| &form.kind),
+            Some(FormKind::QueueMessage)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_backlog_item_when_capabilities_requested_then_approve_uses_capital_a() {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.children.insert(
+            1,
+            ProjectChildren {
+                backlog: vec![backlog_fixture()],
+                ..ProjectChildren::default()
+            },
+        );
+        app.expanded.insert(1);
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Backlog { id: 1, .. }))
+            .expect("backlog row exists");
+
+        let hints = app.capabilities();
+
+        assert!(hints.has(CapabilityAction::Approve));
+        assert!(hints.hints.iter().any(|hint| hint.label == "(A)pprove"));
     }
 
     #[tokio::test]
