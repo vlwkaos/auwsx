@@ -11,8 +11,8 @@ pub(crate) mod theme;
 pub(crate) mod vm;
 
 use crate::app::{
-    format_key_hint as key_hint, App, FieldKind, Focus, Form, FormMode, IssueDetailSection,
-    ProjectDetailSection, TreeItem, View,
+    format_key_hint as key_hint, App, FieldKind, Focus, Form, FormKind, FormMode,
+    IssueDetailSection, ProjectDetailSection, TreeItem, View,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -360,12 +360,15 @@ fn draw_form(frame: &mut Frame, app: &App) {
     let mut active_field_line = None;
     let mut active_field_prefix_chars = 0usize;
     let label_width = form_label_width(form);
+    let inline_sections = form_uses_inline_sections(form);
     for (idx, field) in form.fields.iter().enumerate() {
         if field.section != prev_section {
-            lines.push(Line::from(Span::styled(
-                field.section.to_string(),
-                theme::title(),
-            )));
+            if !inline_sections {
+                lines.push(Line::from(Span::styled(
+                    field.section.to_string(),
+                    theme::title(),
+                )));
+            }
             prev_section = field.section;
         }
         let marker = if idx == form.current { ">" } else { " " };
@@ -456,6 +459,10 @@ fn form_label_width(form: &Form) -> usize {
         .clamp(4, 18)
 }
 
+fn form_uses_inline_sections(form: &Form) -> bool {
+    matches!(form.kind, FormKind::Project | FormKind::ProjectConfig)
+}
+
 fn field_kind_tag(field: &crate::app::FormField) -> String {
     match &field.kind {
         FieldKind::Text => "text".to_string(),
@@ -536,11 +543,13 @@ fn editable_value_spans(value: &str, cursor: usize) -> Vec<Span<'static>> {
 
 fn form_extra_rows(form: &Form, suggestion_count: usize) -> usize {
     let mut sections = 0;
-    let mut prev_section = "";
-    for field in &form.fields {
-        if field.section != prev_section {
-            sections += 1;
-            prev_section = field.section;
+    if !form_uses_inline_sections(form) {
+        let mut prev_section = "";
+        for field in &form.fields {
+            if field.section != prev_section {
+                sections += 1;
+                prev_section = field.section;
+            }
         }
     }
     sections + suggestion_count + usize::from(suggestion_count > 0)
@@ -1058,10 +1067,87 @@ mod tests {
     }
 
     #[test]
-    fn given_active_form_help_when_extra_rows_counted_then_help_stays_inline() {
-        let mut form = Form {
+    fn given_project_form_when_extra_rows_counted_then_sections_are_inline() {
+        let form = Form {
             kind: FormKind::Project,
             title: "Project",
+            fields: vec![
+                FormField {
+                    label: "name",
+                    display: "Name",
+                    section: "Identity",
+                    help: "",
+                    kind: FieldKind::Text,
+                    value: String::new(),
+                    optional: false,
+                },
+                FormField {
+                    label: "repo_path",
+                    display: "Repository path",
+                    section: "Repository",
+                    help: "Path to the git repository.",
+                    kind: FieldKind::Text,
+                    value: String::new(),
+                    optional: false,
+                },
+                FormField {
+                    label: "schedule_cron",
+                    display: "Scheduler cadence",
+                    section: "Schedule",
+                    help: "Use cron or shorthand.",
+                    kind: FieldKind::Text,
+                    value: "@tick".into(),
+                    optional: true,
+                },
+            ],
+            current: 0,
+            cursor: 0,
+            completion_sel: 0,
+            mode: crate::app::FormMode::Navigate,
+        };
+
+        assert_eq!(form_extra_rows(&form, 0), 0);
+    }
+
+    #[test]
+    fn given_generic_form_when_extra_rows_counted_then_sections_are_preserved() {
+        let form = Form {
+            kind: FormKind::Routine,
+            title: "Routine",
+            fields: vec![
+                FormField {
+                    label: "name",
+                    display: "Name",
+                    section: "Identity",
+                    help: "",
+                    kind: FieldKind::Text,
+                    value: String::new(),
+                    optional: false,
+                },
+                FormField {
+                    label: "cron",
+                    display: "Cadence",
+                    section: "Schedule",
+                    help: "",
+                    kind: FieldKind::Text,
+                    value: String::new(),
+                    optional: false,
+                },
+            ],
+            current: 0,
+            cursor: 0,
+            completion_sel: 0,
+            mode: crate::app::FormMode::Navigate,
+        };
+
+        assert_eq!(form_extra_rows(&form, 0), 2);
+    }
+
+    #[test]
+    fn given_active_form_help_when_extra_rows_counted_then_help_stays_inline() {
+        let mut form = Form {
+            kind: FormKind::Routine,
+            title: "Routine",
             fields: vec![
                 FormField {
                     label: "repo_path",
