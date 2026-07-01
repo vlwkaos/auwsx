@@ -5304,6 +5304,65 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn given_project_row_when_drilled_then_focuses_project_detail() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Project(1)))
+            .expect("project row exists");
+
+        app.apply(Action::Drill).await?;
+
+        assert_eq!(app.view, View::Overview);
+        assert_eq!(app.focus, Focus::ProjectDetail);
+        assert_eq!(app.selected_project_section(), ProjectDetailSection::Kanban);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_project_detail_when_jk_then_highlights_sections() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.focus = Focus::ProjectDetail;
+        app.project_section = ProjectDetailSection::Kanban;
+
+        app.apply(Action::Down).await?;
+
+        assert_eq!(app.focus, Focus::ProjectDetail);
+        assert_eq!(
+            app.selected_project_section(),
+            ProjectDetailSection::Preview
+        );
+
+        app.apply(Action::Up).await?;
+
+        assert_eq!(app.focus, Focus::ProjectDetail);
+        assert_eq!(app.selected_project_section(), ProjectDetailSection::Kanban);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_project_detail_kanban_when_drilled_then_focuses_kanban_section(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.focus = Focus::ProjectDetail;
+        app.project_section = ProjectDetailSection::Kanban;
+
+        app.apply(Action::Drill).await?;
+
+        assert_eq!(app.view, View::Overview);
+        assert_eq!(app.focus, Focus::ProjectKanban);
+
+        app.apply(Action::Back).await?;
+
+        assert_eq!(app.focus, Focus::ProjectDetail);
+        Ok(())
+    }
+
     #[test]
     fn given_project_detail_recovery_when_capabilities_requested_then_reconcile_is_named() {
         let mut app = test_app();
