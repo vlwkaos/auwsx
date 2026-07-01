@@ -2158,7 +2158,7 @@ impl App {
         if self.focus == Focus::ProjectDetail {
             if self.selected_project_id().is_some() {
                 caps.push(CapabilityAction::Ask, "?", "ask");
-                caps.push(CapabilityAction::Add, "a", "add project");
+                caps.push(CapabilityAction::Add, "a", "add backlog");
                 caps.push(CapabilityAction::Edit, "e", "edit");
             }
             match self.project_section {
@@ -4050,6 +4050,14 @@ impl App {
             }
             return;
         }
+        if self.focus == Focus::ProjectDetail {
+            if self.selected_project_id().is_some() {
+                self.form = Some(Form::backlog());
+            } else {
+                self.status = "select a project first".into();
+            }
+            return;
+        }
 
         match self.selected_context_item() {
             Some(TreeItem::Project(_)) | None => {
@@ -5250,6 +5258,28 @@ mod tests {
             .hints
             .iter()
             .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) select"));
+        assert!(hints
+            .hints
+            .iter()
+            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(a)dd backlog"));
+
+        app.apply(Action::Add).await?;
+
+        assert!(matches!(
+            app.form.as_ref().map(|form| &form.kind),
+            Some(FormKind::Backlog)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_project_detail_when_add_then_opens_backlog_form() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.focus = Focus::ProjectDetail;
+
+        let hints = app.capabilities();
+        assert!(hints.has(CapabilityAction::Add));
         assert!(hints
             .hints
             .iter()
