@@ -61,9 +61,59 @@ pub enum View {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Left,
+    ProjectDetail,
     ProjectKanban,
     IssueDetail,
     Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectDetailSection {
+    Recovery,
+    Remote,
+    Kanban,
+    Preview,
+    Archive,
+}
+
+impl ProjectDetailSection {
+    pub const ALL: [Self; 5] = [
+        Self::Recovery,
+        Self::Remote,
+        Self::Kanban,
+        Self::Preview,
+        Self::Archive,
+    ];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Recovery => 0,
+            Self::Remote => 1,
+            Self::Kanban => 2,
+            Self::Preview => 3,
+            Self::Archive => 4,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Recovery => "Recovery",
+            Self::Remote => "Remote",
+            Self::Kanban => "Kanban",
+            Self::Preview => "Preview",
+            Self::Archive => "Archive",
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or(Self::Kanban)
+    }
+
+    fn step(self, delta: isize) -> Self {
+        let mut index = self.index();
+        step(&mut index, delta, Self::ALL.len());
+        Self::from_index(index)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1285,6 +1335,7 @@ pub struct App {
     /// UX, so expanding a project does not automatically expose terminal issues.
     pub archive_expanded: HashSet<i64>,
     pub tree_sel: usize,
+    pub project_section: ProjectDetailSection,
     pub kanban_lane_sel: usize,
     pub kanban_card_sel: usize,
     pub issue_section: IssueDetailSection,
@@ -1355,6 +1406,7 @@ impl App {
             expanded: HashSet::new(),
             archive_expanded: HashSet::new(),
             tree_sel: 0,
+            project_section: ProjectDetailSection::Kanban,
             kanban_lane_sel: 0,
             kanban_card_sel: 0,
             issue_section: IssueDetailSection::Summary,
@@ -1408,6 +1460,7 @@ impl App {
             format!("{:?}", self.focus),
             self.proj_sel.to_string(),
             self.tree_sel.to_string(),
+            format!("{:?}", self.project_section),
             self.kanban_lane_sel.to_string(),
             self.kanban_card_sel.to_string(),
             format!("{:?}", self.issue_section),
@@ -2099,6 +2152,30 @@ impl App {
                 let (key, label) =
                     selected_issue_delete_hint_parts(self.selected_issue_delete_hint());
                 caps.push(CapabilityAction::Delete, key, label);
+            }
+            return caps;
+        }
+        if self.focus == Focus::ProjectDetail {
+            if self.selected_project_id().is_some() {
+                caps.push(CapabilityAction::Ask, "?", "ask");
+            }
+            match self.project_section {
+                ProjectDetailSection::Recovery => {
+                    caps.push(CapabilityAction::Execute, "E", "execute");
+                }
+                ProjectDetailSection::Remote => {
+                    caps.push(CapabilityAction::Drill, "Enter", "remote");
+                    caps.push(CapabilityAction::Remote, "R", "remote");
+                }
+                ProjectDetailSection::Kanban => {
+                    caps.push(CapabilityAction::Drill, "Enter", "kanban");
+                }
+                ProjectDetailSection::Preview => {
+                    caps.push(CapabilityAction::Drill, "Enter", "kanban");
+                }
+                ProjectDetailSection::Archive => {
+                    caps.push(CapabilityAction::Drill, "Enter", "archive");
+                }
             }
             return caps;
         }
@@ -2801,6 +2878,8 @@ impl App {
                     self.move_selected_item(1).await?;
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_card(1);
+                } else if self.focus == Focus::ProjectDetail && self.view == View::Overview {
+                    self.move_project_section(1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
                     if self.issue_log_section_active() {
                         self.scroll_issue_log(-1);
@@ -2818,6 +2897,8 @@ impl App {
                     self.move_selected_item(-1).await?;
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_card(-1);
+                } else if self.focus == Focus::ProjectDetail && self.view == View::Overview {
+                    self.move_project_section(-1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
                     if self.issue_log_section_active() {
                         self.scroll_issue_log(1);
@@ -2833,6 +2914,8 @@ impl App {
                     self.move_selected_item_across(-1).await?;
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_lane(-1);
+                } else if self.focus == Focus::ProjectDetail && self.view == View::Overview {
+                    self.move_project_section(-1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
                     self.move_issue_section(-1);
                 }
@@ -2842,6 +2925,8 @@ impl App {
                     self.move_selected_item_across(1).await?;
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_lane(1);
+                } else if self.focus == Focus::ProjectDetail && self.view == View::Overview {
+                    self.move_project_section(1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
                     self.move_issue_section(1);
                 }
@@ -2879,6 +2964,10 @@ impl App {
                     self.activate_issue_section();
                     return Ok(false);
                 }
+                if self.view == View::Overview && self.focus == Focus::ProjectDetail {
+                    self.activate_project_section().await?;
+                    return Ok(false);
+                }
                 if !self.capabilities().has(CapabilityAction::Drill) {
                     self.status = "nothing to open here".into();
                     return Ok(false);
@@ -2906,6 +2995,9 @@ impl App {
                     self.focus = self.issue_return_focus;
                     self.move_mode = false;
                 } else if self.view == View::Overview && self.focus == Focus::ProjectKanban {
+                    self.focus = Focus::ProjectDetail;
+                    self.move_mode = false;
+                } else if self.view == View::Overview && self.focus == Focus::ProjectDetail {
                     self.focus = Focus::Left;
                     self.move_mode = false;
                 } else if matches!(self.view, View::Config) {
@@ -3847,6 +3939,41 @@ impl App {
         self.issue_section
     }
 
+    pub fn selected_project_section(&self) -> ProjectDetailSection {
+        self.project_section
+    }
+
+    fn move_project_section(&mut self, delta: isize) {
+        self.project_section = self.project_section.step(delta);
+    }
+
+    async fn activate_project_section(&mut self) -> Result<()> {
+        match self.project_section {
+            ProjectDetailSection::Recovery => {
+                self.status = "Recovery is review-only; use E to reconcile or merge".into();
+            }
+            ProjectDetailSection::Remote => {
+                self.open_project_remote_form().await?;
+            }
+            ProjectDetailSection::Kanban | ProjectDetailSection::Preview => {
+                self.focus = Focus::ProjectKanban;
+                self.clamp_kanban();
+            }
+            ProjectDetailSection::Archive => {
+                if let Some(project_id) = self.selected_project_id() {
+                    if self.archive_expanded.contains(&project_id) {
+                        self.archive_expanded.remove(&project_id);
+                    } else {
+                        self.archive_expanded.insert(project_id);
+                    }
+                    self.clamp_tree();
+                    self.sync_active_project();
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn issue_section_is_active(&self) -> bool {
         self.issue_section_mode == IssueSectionMode::Active
     }
@@ -4170,13 +4297,12 @@ impl App {
             return Ok(());
         }
         match self.selected_tree_item() {
-            // Enter on a project header moves focus to the right-side kanban.
+            // Enter on a project header moves focus to the right-side project pane.
             Some(TreeItem::Project(pid)) => {
                 self.expanded.insert(pid);
                 self.clamp_tree();
                 self.sync_active_project();
-                self.focus = Focus::ProjectKanban;
-                self.clamp_kanban();
+                self.focus = Focus::ProjectDetail;
             }
             Some(
                 TreeItem::RoutinesRoot(pid)

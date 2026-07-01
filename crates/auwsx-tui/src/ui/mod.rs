@@ -12,7 +12,7 @@ pub(crate) mod vm;
 
 use crate::app::{
     format_key_hint as key_hint, App, FieldKind, Focus, Form, FormMode, IssueDetailSection,
-    TreeItem, View,
+    ProjectDetailSection, TreeItem, View,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -139,6 +139,7 @@ enum FooterContext {
     MoveMode {
         project_scope: bool,
     },
+    ProjectDetail(ProjectDetailSection),
     ProjectKanban,
     IssueDetail {
         section: IssueDetailSection,
@@ -163,6 +164,9 @@ impl FooterContext {
             return Self::MoveMode {
                 project_scope: matches!(app.selected_tree_item(), Some(TreeItem::Project(_))),
             };
+        }
+        if app.focus == Focus::ProjectDetail {
+            return Self::ProjectDetail(app.selected_project_section());
         }
         if app.focus == Focus::ProjectKanban {
             return Self::ProjectKanban;
@@ -228,6 +232,15 @@ impl FooterContext {
                 ]);
                 hints
             }
+            Self::ProjectDetail(section) => with_capabilities(
+                vec![
+                    FooterHint::text(format!("project {}", section.title().to_ascii_lowercase())),
+                    FooterHint::key("j/k", "section"),
+                    FooterHint::key("h/l", "section"),
+                ],
+                app,
+                Some(FooterHint::key("Esc", "left")),
+            ),
             Self::ProjectKanban => with_capabilities(
                 vec![
                     FooterHint::text("kanban"),

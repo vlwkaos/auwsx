@@ -1,7 +1,7 @@
 //! Operator console: one tree on the left, contextual detail on the right.
 
 use super::{render_list, theme, ACCENT};
-use crate::app::{App, TreeItem};
+use crate::app::{App, ProjectDetailSection, TreeItem};
 use auwsx_core::backlog::Approval;
 use auwsx_core::db::agent_runs::AgentRun;
 use auwsx_core::db::scheduler_runs::SchedulerRunSource;
@@ -75,7 +75,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Some(TreeItem::BacklogRoot(_)) => render_backlog_summary(frame, app, cols[1]),
         Some(TreeItem::Backlog { .. }) => render_backlog(frame, app, cols[1]),
         Some(TreeItem::IssuesRoot(_)) => render_issue_summary(frame, app, cols[1]),
-        Some(TreeItem::ArchiveRoot(_)) => render_archive_summary(frame, app, cols[1]),
+        Some(TreeItem::ArchiveRoot(_)) => render_archive_summary(frame, app, cols[1], false),
         Some(TreeItem::Issue { .. } | TreeItem::ArchivedIssue { .. }) => {
             render_issue(frame, app, cols[1])
         }
@@ -163,11 +163,42 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ];
     panel(frame, rows[0], &format!("Project {}", p.name), lines);
-    render_recovery(frame, app, p.id, rows[1]);
-    render_remote_sync(frame, app, p.id, rows[2]);
-    render_kanban(frame, app, rows[3]);
-    render_kanban_preview(frame, app, rows[4]);
-    render_archive_summary(frame, app, rows[5]);
+    render_recovery(
+        frame,
+        app,
+        p.id,
+        rows[1],
+        project_section_selected(app, ProjectDetailSection::Recovery),
+    );
+    render_remote_sync(
+        frame,
+        app,
+        p.id,
+        rows[2],
+        project_section_selected(app, ProjectDetailSection::Remote),
+    );
+    render_kanban(
+        frame,
+        app,
+        rows[3],
+        project_section_selected(app, ProjectDetailSection::Kanban),
+    );
+    render_kanban_preview(
+        frame,
+        app,
+        rows[4],
+        project_section_selected(app, ProjectDetailSection::Preview),
+    );
+    render_archive_summary(
+        frame,
+        app,
+        rows[5],
+        project_section_selected(app, ProjectDetailSection::Archive),
+    );
+}
+
+fn project_section_selected(app: &App, section: ProjectDetailSection) -> bool {
+    app.focus == crate::app::Focus::ProjectDetail && app.selected_project_section() == section
 }
 
 fn remote_summary(app: &App, project_id: i64) -> String {
@@ -204,20 +235,22 @@ fn remote_summary(app: &App, project_id: i64) -> String {
     )
 }
 
-fn render_recovery(frame: &mut Frame, app: &App, project_id: i64, area: Rect) {
+fn render_recovery(frame: &mut Frame, app: &App, project_id: i64, area: Rect, focused: bool) {
     let Some(report) = app.reconcile_reports.get(&project_id) else {
-        panel(
+        panel_with_focus(
             frame,
             area,
             "Recovery",
+            focused,
             vec![Line::styled("diagnostics unavailable", theme::dim())],
         );
         return;
     };
-    panel(
+    panel_with_focus(
         frame,
         area,
         "Recovery",
+        focused,
         recovery_lines(report, &app.recent_main_jobs, &app.recent_agent_runs),
     );
 }
@@ -290,11 +323,12 @@ fn running_issue_agents(runs: &[AgentRun]) -> usize {
         .count()
 }
 
-fn render_remote_sync(frame: &mut Frame, app: &App, project_id: i64, area: Rect) {
-    panel(
+fn render_remote_sync(frame: &mut Frame, app: &App, project_id: i64, area: Rect, focused: bool) {
+    panel_with_focus(
         frame,
         area,
         "Remote Sync",
+        focused,
         remote_sync_lines(app, project_id),
     );
 }
@@ -776,10 +810,10 @@ fn render_backlog(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_issue_summary(frame: &mut Frame, app: &App, area: Rect) {
-    render_kanban(frame, app, area);
+    render_kanban(frame, app, area, false);
 }
 
-fn render_archive_summary(frame: &mut Frame, app: &App, area: Rect) {
+fn render_archive_summary(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let done = app
         .archived_issues()
         .iter()
@@ -816,7 +850,7 @@ fn render_archive_summary(frame: &mut Frame, app: &App, area: Rect) {
             theme::dim(),
         ));
     }
-    panel(frame, area, "Archive", lines);
+    panel_with_focus(frame, area, "Archive", focused, lines);
 }
 
 fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
@@ -977,7 +1011,7 @@ fn issue_section_title(app: &App, section: crate::app::IssueDetailSection, title
     }
 }
 
-fn render_kanban(frame: &mut Frame, app: &App, area: Rect) {
+fn render_kanban(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -998,7 +1032,7 @@ fn render_kanban(frame: &mut Frame, app: &App, area: Rect) {
             frame,
             cols[idx],
             &title,
-            app.focus == crate::app::Focus::ProjectKanban && app.kanban_lane_sel == idx,
+            focused || app.focus == crate::app::Focus::ProjectKanban && app.kanban_lane_sel == idx,
             kanban_lines(app, &cards, lane),
         );
     }
@@ -1086,45 +1120,51 @@ fn kanban_lines(
     lines
 }
 
-fn render_kanban_preview(frame: &mut Frame, app: &App, area: Rect) {
+fn render_kanban_preview(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     let Some(preview) = app.selected_kanban_item_preview() else {
-        panel(
+        panel_with_focus(
             frame,
             area,
             "Preview",
+            focused,
             vec![Line::styled("empty", theme::dim())],
         );
         return;
     };
     match preview {
         super::vm::KanbanPreview::Backlog(item) => {
-            panel(frame, area, &format!("Preview Backlog #{}", item.id), {
-                let mut lines = vec![
-                    kv("approval", item.approval.as_str()),
-                    kv("source", item.source.as_str()),
-                    kv(
-                        "consumed",
-                        &item
-                            .consumed_issue_id
-                            .map(|id| format!("#{id}"))
-                            .unwrap_or_else(|| "no".to_string()),
-                    ),
-                    sep(),
-                ];
-                lines.extend(scrolling_text_lines(
-                    "text",
-                    &format!("backlog:{}", item.id),
-                    &item.text,
-                    app,
-                    area.height.saturating_sub(8).max(3) as usize,
-                ));
-                lines
-            })
+            let mut lines = vec![
+                kv("approval", item.approval.as_str()),
+                kv("source", item.source.as_str()),
+                kv(
+                    "consumed",
+                    &item
+                        .consumed_issue_id
+                        .map(|id| format!("#{id}"))
+                        .unwrap_or_else(|| "no".to_string()),
+                ),
+                sep(),
+            ];
+            lines.extend(scrolling_text_lines(
+                "text",
+                &format!("backlog:{}", item.id),
+                &item.text,
+                app,
+                area.height.saturating_sub(8).max(3) as usize,
+            ));
+            panel_with_focus(
+                frame,
+                area,
+                &format!("Preview Backlog #{}", item.id),
+                focused,
+                lines,
+            )
         }
-        super::vm::KanbanPreview::Issue(issue) => panel(
+        super::vm::KanbanPreview::Issue(issue) => panel_with_focus(
             frame,
             area,
             &format!("Preview Issue #{}", issue.id),
+            focused,
             kanban_issue_preview_lines(app, issue, area.height as usize),
         ),
     }
