@@ -68,6 +68,12 @@ pub enum Focus {
     Settings,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSectionMode {
+    Selected,
+    Active,
+}
+
 impl View {
     pub const ORDER: [View; 5] = [
         View::Overview,
@@ -1241,7 +1247,7 @@ pub struct App {
     pub kanban_lane_sel: usize,
     pub kanban_card_sel: usize,
     pub issue_section_sel: usize,
-    pub issue_section_interactive: bool,
+    pub issue_section_mode: IssueSectionMode,
     pub issue_return_focus: Focus,
     pub issue_return_tree_sel: Option<usize>,
     pub move_mode: bool,
@@ -1309,7 +1315,7 @@ impl App {
             kanban_lane_sel: 0,
             kanban_card_sel: 0,
             issue_section_sel: 0,
-            issue_section_interactive: false,
+            issue_section_mode: IssueSectionMode::Selected,
             issue_return_focus: Focus::Left,
             issue_return_tree_sel: None,
             move_mode: false,
@@ -2649,7 +2655,7 @@ impl App {
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_card(1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
-                    if self.issue_section_sel == 3 && self.issue_section_interactive {
+                    if self.issue_log_section_active() {
                         self.scroll_issue_log(-1);
                     } else {
                         self.move_issue_section(1);
@@ -2668,7 +2674,7 @@ impl App {
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_card(-1);
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
-                    if self.issue_section_sel == 3 && self.issue_section_interactive {
+                    if self.issue_log_section_active() {
                         self.scroll_issue_log(1);
                     } else {
                         self.move_issue_section(-1);
@@ -2700,10 +2706,7 @@ impl App {
                     self.scroll_issue_log(-10);
                 } else if self.view == View::Config {
                     self.scroll_config(10);
-                } else if self.focus == Focus::IssueDetail
-                    && self.issue_section_sel == 3
-                    && self.issue_section_interactive
-                {
+                } else if self.issue_log_section_active() {
                     self.scroll_issue_log(-10);
                 }
             }
@@ -2712,10 +2715,7 @@ impl App {
                     self.scroll_issue_log(10);
                 } else if self.view == View::Config {
                     self.scroll_config(-10);
-                } else if self.focus == Focus::IssueDetail
-                    && self.issue_section_sel == 3
-                    && self.issue_section_interactive
-                {
+                } else if self.issue_log_section_active() {
                     self.scroll_issue_log(10);
                 }
             }
@@ -2724,10 +2724,7 @@ impl App {
                     self.jump_issue_log_top();
                 } else if self.view == View::Config {
                     self.jump_settings_top();
-                } else if self.focus == Focus::IssueDetail
-                    && self.issue_section_sel == 3
-                    && self.issue_section_interactive
-                {
+                } else if self.issue_log_section_active() {
                     self.jump_issue_log_top();
                 }
             }
@@ -2736,20 +2733,13 @@ impl App {
                     self.jump_issue_log_bottom();
                 } else if self.view == View::Config {
                     self.jump_settings_bottom();
-                } else if self.focus == Focus::IssueDetail
-                    && self.issue_section_sel == 3
-                    && self.issue_section_interactive
-                {
+                } else if self.issue_log_section_active() {
                     self.jump_issue_log_bottom();
                 }
             }
             Action::Drill => {
-                if self.view == View::Overview
-                    && self.focus == Focus::IssueDetail
-                    && self.issue_section_sel == 3
-                {
-                    self.issue_section_interactive = true;
-                    self.status = "log scroll active".into();
+                if self.view == View::Overview && self.focus == Focus::IssueDetail {
+                    self.activate_issue_section();
                     return Ok(false);
                 }
                 if !self.capabilities().has(CapabilityAction::Drill) {
@@ -2766,8 +2756,8 @@ impl App {
             Action::PrevView => self.set_view(self.view.step(-1)).await?,
             Action::Back => {
                 if self.view == View::Overview && self.focus == Focus::IssueDetail {
-                    if self.issue_section_interactive {
-                        self.issue_section_interactive = false;
+                    if self.issue_section_is_active() {
+                        self.issue_section_mode = IssueSectionMode::Selected;
                         return Ok(false);
                     }
                     if self.issue_return_focus == Focus::ProjectKanban {
@@ -3684,14 +3674,33 @@ impl App {
 
     fn move_issue_section(&mut self, delta: isize) {
         step(&mut self.issue_section_sel, delta, 4);
-        self.issue_section_interactive = false;
+        self.issue_section_mode = IssueSectionMode::Selected;
+    }
+
+    pub fn issue_section_is_active(&self) -> bool {
+        self.issue_section_mode == IssueSectionMode::Active
+    }
+
+    fn issue_log_section_active(&self) -> bool {
+        self.focus == Focus::IssueDetail
+            && self.issue_section_sel == 3
+            && self.issue_section_is_active()
+    }
+
+    fn activate_issue_section(&mut self) {
+        if self.issue_section_sel == 3 {
+            self.issue_section_mode = IssueSectionMode::Active;
+            self.status = "log scroll active".into();
+        } else {
+            self.status = "section selected; only log has interactive controls".into();
+        }
     }
 
     fn enter_issue_detail(&mut self, return_focus: Focus, return_tree_sel: Option<usize>) {
         self.issue_return_focus = return_focus;
         self.issue_return_tree_sel = return_tree_sel;
         self.focus = Focus::IssueDetail;
-        self.issue_section_interactive = false;
+        self.issue_section_mode = IssueSectionMode::Selected;
     }
 
     fn enter_selected_issue_detail_from_left(&mut self) -> bool {
@@ -4312,6 +4321,7 @@ mod tests {
         assert_eq!(app.view, View::Overview);
         assert_eq!(app.focus, Focus::IssueDetail);
         assert_eq!(app.issue_return_focus, Focus::Left);
+        assert_eq!(app.issue_section_mode, IssueSectionMode::Selected);
         Ok(())
     }
 
@@ -4328,7 +4338,7 @@ mod tests {
 
         assert_eq!(app.issue_section_sel, 2);
         assert_eq!(app.issue_log_scroll, 0);
-        assert!(!app.issue_section_interactive);
+        assert_eq!(app.issue_section_mode, IssueSectionMode::Selected);
         Ok(())
     }
 
@@ -4345,7 +4355,26 @@ mod tests {
 
         assert_eq!(app.issue_section_sel, 3);
         assert_eq!(app.issue_log_scroll, 1);
-        assert!(app.issue_section_interactive);
+        assert_eq!(app.issue_section_mode, IssueSectionMode::Active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_non_log_issue_section_entered_then_selection_stays_noninteractive(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.view = View::Overview;
+        app.focus = Focus::IssueDetail;
+        app.issue_section_sel = 1;
+
+        app.apply(Action::Drill).await?;
+
+        assert_eq!(app.issue_section_sel, 1);
+        assert_eq!(app.issue_section_mode, IssueSectionMode::Selected);
+        assert_eq!(
+            app.status,
+            "section selected; only log has interactive controls"
+        );
         Ok(())
     }
 
@@ -4356,12 +4385,12 @@ mod tests {
         app.view = View::Overview;
         app.focus = Focus::IssueDetail;
         app.issue_section_sel = 3;
-        app.issue_section_interactive = true;
+        app.issue_section_mode = IssueSectionMode::Active;
 
         app.apply(Action::Back).await?;
 
         assert_eq!(app.focus, Focus::IssueDetail);
-        assert!(!app.issue_section_interactive);
+        assert_eq!(app.issue_section_mode, IssueSectionMode::Selected);
         Ok(())
     }
 

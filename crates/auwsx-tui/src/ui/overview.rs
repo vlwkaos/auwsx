@@ -895,11 +895,15 @@ fn issue_section_constraints(active: usize) -> [Constraint; 4] {
 
 fn issue_section_title<'a>(app: &App, idx: usize, title: &'a str) -> &'a str {
     if app.focus == crate::app::Focus::IssueDetail && app.issue_section_sel == idx {
-        match idx {
-            0 => "Issue Detail *",
-            1 => "Findings *",
-            2 => "Subtasks / Queue *",
-            _ => "Log *",
+        match (idx, app.issue_section_is_active()) {
+            (0, false) => "Issue Detail *",
+            (1, false) => "Findings *",
+            (2, false) => "Subtasks / Queue *",
+            (3, false) => "Log *",
+            (0, true) => "Issue Detail active",
+            (1, true) => "Findings active",
+            (2, true) => "Subtasks / Queue active",
+            _ => "Log active",
         }
     } else {
         title

@@ -112,7 +112,7 @@ fn footer_hint(app: &App) -> String {
         return format!("{prefix}{} · (Esc) left", parts.join(" · "));
     }
     if app.focus == crate::app::Focus::IssueDetail {
-        let mut parts = if app.issue_section_sel == 3 && app.issue_section_interactive {
+        let mut parts = if app.issue_section_sel == 3 && app.issue_section_is_active() {
             vec![
                 "log active".to_string(),
                 "(j/k) scroll".to_string(),
@@ -131,10 +131,11 @@ fn footer_hint(app: &App) -> String {
                 "issue detail".to_string(),
                 "(j/k) section".to_string(),
                 "(h/l) section".to_string(),
+                "(Enter) activate".to_string(),
             ]
         };
         parts.extend(app.capabilities().hints.into_iter().map(|hint| hint.label));
-        let esc = if app.issue_section_interactive {
+        let esc = if app.issue_section_is_active() {
             "(Esc) section"
         } else if app.issue_return_focus == crate::app::Focus::ProjectKanban {
             "(Esc) kanban"
