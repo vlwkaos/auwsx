@@ -11,6 +11,7 @@
 //! - [`main_job_runner`] — main-job agent execution + artifact recording
 //! - [`remote_plan`] — pure remote issue/PR/comment workflow decisions
 //! - [`remote_executor`] — provider execution boundary for queued remote sync runs
+//! - [`remote_inbound`] — inbound remote event processing into approved backlog
 //! - [`remote_workflow`] — daemon-owned remote workflow queueing
 //! - [`routines`]   — cron routines (incl. built-ins) (Plan Step 3.6)
 //! - [`backlog`]    — backlog_items CRUD + admission gate (Plan Step 3.7)
@@ -51,6 +52,7 @@ pub mod project_setup;
 pub mod prompt;
 pub mod reconcile;
 pub mod remote_executor;
+pub mod remote_inbound;
 pub mod remote_plan;
 pub mod remote_workflow;
 pub mod routines;

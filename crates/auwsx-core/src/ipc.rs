@@ -41,6 +41,7 @@ use crate::main_jobs::{self, MainJob};
 use crate::memory;
 use crate::project_setup;
 use crate::reconcile::ProjectReconcileReport;
+use crate::remote_inbound::{self, ProcessRemoteAuwsxRunInput, RemoteInboundOutcome};
 use crate::remote_plan::{self, RemoteWorkflowInput, RemoteWorkflowPlan};
 use crate::routines::{self, OutputRoute, Routine};
 use crate::routing;
@@ -233,6 +234,20 @@ pub enum Command {
     },
     PlanIssueRemoteWorkflow {
         issue_id: i64,
+    },
+    ProcessRemoteAuwsxRun {
+        provider: RemoteProvider,
+        delivery_id: String,
+        event_kind: String,
+        action: Option<String>,
+        payload_hash: String,
+        owner: String,
+        repo: String,
+        remote_issue_number: i64,
+        remote_issue_node_id: Option<String>,
+        remote_issue_title: String,
+        remote_issue_url: String,
+        comment_body: String,
     },
 
     // --- backlog ---
@@ -482,6 +497,7 @@ pub enum Response {
     ProjectRemoteConfig(Option<ProjectRemoteConfig>),
     RemoteSyncRuns(Vec<RemoteSyncRun>),
     IssueRemoteWorkflowPlan(RemoteWorkflowPlan),
+    RemoteInboundOutcome(RemoteInboundOutcome),
     Event(Event),
 }
 
@@ -867,6 +883,56 @@ async fn dispatch_inner(
                     notes,
                 },
             ))
+        }
+        Command::ProcessRemoteAuwsxRun {
+            provider,
+            delivery_id,
+            event_kind,
+            action,
+            payload_hash,
+            owner,
+            repo,
+            remote_issue_number,
+            remote_issue_node_id,
+            remote_issue_title,
+            remote_issue_url,
+            comment_body,
+        } => {
+            let outcome = remote_inbound::process_remote_auwsx_run(
+                pool,
+                ProcessRemoteAuwsxRunInput {
+                    provider,
+                    delivery_id: &delivery_id,
+                    event_kind: &event_kind,
+                    action: action.as_deref(),
+                    payload_hash: &payload_hash,
+                    owner: &owner,
+                    repo: &repo,
+                    remote_issue_number,
+                    remote_issue_node_id: remote_issue_node_id.as_deref(),
+                    remote_issue_title: &remote_issue_title,
+                    remote_issue_url: &remote_issue_url,
+                    comment_body: &comment_body,
+                },
+                now,
+            )
+            .await?;
+            if let RemoteInboundOutcome::Accepted {
+                backlog_item_id, ..
+            } = &outcome
+            {
+                if let Some(item) = backlog::get(pool, *backlog_item_id).await? {
+                    emit(
+                        events,
+                        Event::BacklogChanged {
+                            item_id: *backlog_item_id,
+                            project_id: item.project_id,
+                            approval: item.approval.as_str().to_string(),
+                        },
+                    );
+                }
+            }
+            Response::RemoteInboundOutcome(outcome)
         }
 
         // --- backlog ---

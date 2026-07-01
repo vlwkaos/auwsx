@@ -109,6 +109,13 @@ fn want_issue_remote_workflow_plan(r: Response) -> auwsx_core::remote_plan::Remo
     }
 }
 
+fn want_remote_inbound_outcome(r: Response) -> auwsx_core::remote_inbound::RemoteInboundOutcome {
+    match r {
+        Response::RemoteInboundOutcome(outcome) => outcome,
+        other => panic!("expected Response::RemoteInboundOutcome, got {other:?}"),
+    }
+}
+
 fn is_ok(r: &Response) -> bool {
     matches!(r, Response::Ok)
 }
@@ -1147,6 +1154,84 @@ async fn given_issue_when_remote_workflow_plan_dispatched_then_plan_response() -
     assert!(plan
         .blockers
         .contains(&auwsx_core::remote_plan::RemotePlanBlocker::OutboundIssueCreateDisabled));
+    Ok(())
+}
+
+#[test]
+fn given_remote_inbound_command_when_json_roundtripped_then_unchanged() -> anyhow::Result<()> {
+    let command = Command::ProcessRemoteAuwsxRun {
+        provider: RemoteProvider::Github,
+        delivery_id: "delivery-1".to_string(),
+        event_kind: "issue_comment".to_string(),
+        action: Some("created".to_string()),
+        payload_hash: "hash".to_string(),
+        owner: "acme".to_string(),
+        repo: "repo".to_string(),
+        remote_issue_number: 99,
+        remote_issue_node_id: Some("node-99".to_string()),
+        remote_issue_title: "Remote task".to_string(),
+        remote_issue_url: "https://github.com/acme/repo/issues/99".to_string(),
+        comment_body: "/auwsx-run handle remote task".to_string(),
+    };
+
+    let json = serde_json::to_string(&command)?;
+    let got: Command = serde_json::from_str(&json)?;
+
+    assert_eq!(got, command);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_remote_auwsx_run_when_dispatched_then_approved_backlog_is_created(
+) -> anyhow::Result<()> {
+    let db = Db::open_memory().await?;
+    let bus = events::channel();
+    let mut rx = bus.subscribe();
+    let project_id = backlog_seed_project(&db).await?;
+    ipc::dispatch(&db, &bus, TS, upsert_remote_config_cmd(project_id)).await;
+
+    let outcome = want_remote_inbound_outcome(
+        ipc::dispatch(
+            &db,
+            &bus,
+            TS,
+            Command::ProcessRemoteAuwsxRun {
+                provider: RemoteProvider::Github,
+                delivery_id: "delivery-1".to_string(),
+                event_kind: "issue_comment".to_string(),
+                action: Some("created".to_string()),
+                payload_hash: "hash".to_string(),
+                owner: "acme".to_string(),
+                repo: "repo".to_string(),
+                remote_issue_number: 99,
+                remote_issue_node_id: Some("node-99".to_string()),
+                remote_issue_title: "Remote task".to_string(),
+                remote_issue_url: "https://github.com/acme/repo/issues/99".to_string(),
+                comment_body: "/auwsx-run handle remote task".to_string(),
+            },
+        )
+        .await,
+    );
+
+    let auwsx_core::remote_inbound::RemoteInboundOutcome::Accepted {
+        backlog_item_id, ..
+    } = outcome
+    else {
+        panic!("expected accepted inbound outcome");
+    };
+    let item = backlog::get(db.pool(), backlog_item_id)
+        .await?
+        .expect("backlog item exists");
+    assert_eq!(
+        (item.project_id, item.source, item.approval),
+        (project_id, Source::Inbox, Approval::Approved)
+    );
+    assert!(item.text.contains("handle remote task"));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Event::BacklogChanged { item_id, project_id: event_project_id, approval })
+            if item_id == backlog_item_id && event_project_id == project_id && approval == "approved"
+    ));
     Ok(())
 }
 

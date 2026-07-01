@@ -409,6 +409,28 @@ pub async fn get_config(pool: &SqlitePool, project_id: i64) -> Result<Option<Pro
     row.map(|row| config_from_row(&row)).transpose()
 }
 
+pub async fn get_config_by_repo(
+    pool: &SqlitePool,
+    provider: RemoteProvider,
+    owner: &str,
+    repo: &str,
+) -> Result<Option<ProjectRemoteConfig>> {
+    let row = sqlx::query(
+        "SELECT * FROM project_remote_configs
+         WHERE provider = ?
+           AND owner = ?
+           AND repo = ?
+         ORDER BY project_id ASC
+         LIMIT 1",
+    )
+    .bind(provider.as_str())
+    .bind(owner.trim())
+    .bind(repo.trim())
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| config_from_row(&row)).transpose()
+}
+
 pub async fn upsert_config(
     pool: &SqlitePool,
     input: UpsertProjectRemoteConfig<'_>,
@@ -528,6 +550,17 @@ pub async fn issue_link_by_issue(
 ) -> Result<Option<RemoteIssueLink>> {
     let row = sqlx::query("SELECT * FROM remote_issue_links WHERE issue_id = ?")
         .bind(issue_id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|row| issue_link_from_row(&row)).transpose()
+}
+
+pub async fn issue_link_by_backlog_item(
+    pool: &SqlitePool,
+    backlog_item_id: i64,
+) -> Result<Option<RemoteIssueLink>> {
+    let row = sqlx::query("SELECT * FROM remote_issue_links WHERE backlog_item_id = ?")
+        .bind(backlog_item_id)
         .fetch_optional(pool)
         .await?;
     row.map(|row| issue_link_from_row(&row)).transpose()

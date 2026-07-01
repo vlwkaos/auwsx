@@ -1366,6 +1366,7 @@ fn print_response(resp: Response) -> bool {
                 println!("blocker\t{blocker:?}");
             }
         }
+        Response::RemoteInboundOutcome(outcome) => println!("{outcome:?}"),
         Response::LogTail { path, text } => {
             println!("==> {path}");
             print!("{text}");
