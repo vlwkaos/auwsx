@@ -60,5 +60,5 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 rust-embed = { version = "8", features = ["axum"] }
 
 # Local
-wsx-core = { path = "../wsx/crates/wsx-core" }
+wsx-core = { version = "=0.16.2", path = "../wsx/crates/wsx-core" }
 auwsx-core = { path = "crates/auwsx-core" }
