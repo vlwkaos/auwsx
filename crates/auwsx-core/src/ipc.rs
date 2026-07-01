@@ -298,10 +298,6 @@ pub enum Command {
         /// Human override: skip the legal-transition check.
         force: bool,
     },
-    AbsorbIssue {
-        issue_id: i64,
-        into_issue_id: i64,
-    },
     RemoveIssue {
         issue_id: i64,
     },
@@ -1087,12 +1083,6 @@ async fn dispatch_inner(
         Command::ApplyIssueMerge { issue_id } => {
             apply_issue_merge(pool, events, issue_id, now).await?;
             Response::Ok
-        }
-        Command::AbsorbIssue {
-            issue_id: _,
-            into_issue_id: _,
-        } => {
-            anyhow::bail!("issue absorption was replaced by backlog routing to queue messages")
         }
         Command::RunSchedulerOnce { .. }
         | Command::ExecuteProject { .. }

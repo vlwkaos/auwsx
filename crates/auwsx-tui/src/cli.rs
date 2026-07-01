@@ -542,10 +542,6 @@ fn parse_issue(args: &[String]) -> Result<CliAction> {
         "apply-merge" => Command::ApplyIssueMerge {
             issue_id: p.int(0, "issue_id")?,
         },
-        "absorb" => Command::AbsorbIssue {
-            issue_id: p.int(0, "issue_id")?,
-            into_issue_id: p.int(1, "into_issue_id")?,
-        },
         "abandon" => Command::AbandonIssue {
             issue_id: p.int(0, "issue_id")?,
         },
@@ -2313,17 +2309,6 @@ mod tests {
         assert_eq!(
             parse(&argv(&["issue", "apply-merge", "5"])).unwrap(),
             CliAction::Request(Command::ApplyIssueMerge { issue_id: 5 })
-        );
-    }
-
-    #[test]
-    fn given_issue_absorb_when_parsed_then_absorbissue() {
-        assert_eq!(
-            parse(&argv(&["issue", "absorb", "1", "2"])).unwrap(),
-            CliAction::Request(Command::AbsorbIssue {
-                issue_id: 1,
-                into_issue_id: 2,
-            })
         );
     }
 

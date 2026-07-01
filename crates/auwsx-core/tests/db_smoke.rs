@@ -192,7 +192,7 @@ async fn all_runtime_tables_exist() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn issues_agent_session_column_absent() -> anyhow::Result<()> {
+async fn issues_legacy_columns_absent() -> anyhow::Result<()> {
     let db = Db::open_memory().await?;
     let columns: Vec<String> = sqlx::query("PRAGMA table_info(issues)")
         .fetch_all(db.pool())
@@ -201,10 +201,15 @@ async fn issues_agent_session_column_absent() -> anyhow::Result<()> {
         .map(|row| row.get("name"))
         .collect();
 
-    assert!(
-        !columns.iter().any(|name| name == "agent_session"),
-        "agent_session is a removed tmux-era field"
-    );
+    for (removed, reason) in [
+        ("agent_session", "tmux-era field"),
+        ("absorbed_into_id", "pre-routing issue absorption field"),
+    ] {
+        assert!(
+            !columns.iter().any(|name| name == removed),
+            "{removed} is a removed {reason}"
+        );
+    }
     Ok(())
 }
 

@@ -23,7 +23,7 @@ cargo run --bin auwsx -- daemon     # start daemon explicitly
 
 - Repo-local auwsx file listing without shell redirection: `rg --files .auwsx`
 - SQLite string literals inside shell commands need double-quoted SQL, e.g. `sqlite3 '<db path>' "UPDATE issues SET status = 'PLANNING', updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000 WHERE id = 1 AND status = 'CONSOLIDATING';"`
-- The issues absorption column is `absorbed_into_id`; active issue inspection can use `sqlite3 '<db path>' "SELECT id, project_id, title, status, substr(COALESCE(description,''),1,120), absorbed_into_id FROM issues WHERE project_id = 1 ORDER BY id;"`
+- Active issue inspection can use `sqlite3 '<db path>' "SELECT id, project_id, title, status, substr(COALESCE(description,''),1,120) FROM issues WHERE project_id = 1 ORDER BY id;"`
 - Project path inspection uses `repo_path`, e.g. `sqlite3 '<db path>' "SELECT id, name, repo_path FROM projects ORDER BY id;"`
 - Inline env assignment does not affect same-line shell expansion; use a literal id or `env AUWSX_ISSUE_ID=1 sh -c '"$AUWSX_BIN" issue status "$AUWSX_ISSUE_ID" PLANNING'`.
 - Active issue listing from an agent shell should use exported daemon env directly: `"$AUWSX_BIN" issue ls "$AUWSX_PROJECT_ID"`.

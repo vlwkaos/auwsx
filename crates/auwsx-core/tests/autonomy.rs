@@ -84,7 +84,6 @@ fn issue_at(id: i64, status: IssueStatus) -> Issue {
         review_round: 0,
         conflict_attempts: 0,
         wait_until: None,
-        absorbed_into_id: None,
         has_pending_steering: false,
         created_at: TS,
         updated_at: TS,

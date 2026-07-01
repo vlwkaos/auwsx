@@ -409,7 +409,6 @@ mod tests {
             review_round: 0,
             conflict_attempts: 0,
             wait_until: None,
-            absorbed_into_id: None,
             has_pending_steering: false,
             created_at: 0,
             updated_at: 0,

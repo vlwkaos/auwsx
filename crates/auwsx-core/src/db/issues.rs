@@ -34,7 +34,6 @@ pub struct Issue {
     pub review_round: i64,
     pub conflict_attempts: i64,
     pub wait_until: Option<i64>,
-    pub absorbed_into_id: Option<i64>,
     pub has_pending_steering: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -59,7 +58,6 @@ impl Issue {
             review_round: row.try_get("review_round")?,
             conflict_attempts: row.try_get("conflict_attempts")?,
             wait_until: row.try_get("wait_until")?,
-            absorbed_into_id: row.try_get("absorbed_into_id")?,
             has_pending_steering: pending != 0,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -238,14 +236,6 @@ async fn write_status(pool: &SqlitePool, id: i64, to: IssueStatus, now: i64) -> 
         return Err(anyhow!("issue {id} not found"));
     }
     Ok(())
-}
-
-/// Deprecated compatibility shim. Backlog attachment now records the target on
-/// the backlog/message path instead of self-closing a donor issue.
-pub async fn mark_absorbed(_pool: &SqlitePool, id: i64, _into_id: i64, _now: i64) -> Result<()> {
-    Err(anyhow!(
-        "issue {id} absorption was replaced by backlog routing to queue messages"
-    ))
 }
 
 /// Record the worktree/branch a standalone issue acquires at PLANNING.
