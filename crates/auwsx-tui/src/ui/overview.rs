@@ -75,7 +75,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Some(TreeItem::BacklogRoot(_)) => render_backlog_summary(frame, app, cols[1]),
         Some(TreeItem::Backlog { .. }) => render_backlog(frame, app, cols[1]),
         Some(TreeItem::IssuesRoot(_)) => render_issue_summary(frame, app, cols[1]),
-        Some(TreeItem::ArchiveRoot(_)) => render_archive_summary(frame, app, cols[1], false),
+        Some(TreeItem::ArchiveRoot(_)) => render_tree_archive_summary(frame, app, cols[1]),
         Some(TreeItem::Issue { .. } | TreeItem::ArchivedIssue { .. }) => {
             render_issue(frame, app, cols[1])
         }
@@ -189,7 +189,7 @@ fn render_project(frame: &mut Frame, app: &App, area: Rect) {
         rows[4],
         project_section_selected(app, ProjectDetailSection::Preview),
     );
-    render_archive_summary(
+    render_project_archive(
         frame,
         app,
         rows[5],
@@ -501,6 +501,39 @@ mod tests {
             ended_at: Some(2),
             created_at: 1,
         }
+    }
+
+    #[test]
+    fn given_project_archive_panel_when_lines_built_then_tree_toggle_hint_is_absent() {
+        let app = App::new(std::path::PathBuf::from(
+            "target/nonexistent-auwsx-test.sock",
+        ));
+
+        let text = archive_summary_lines(&app, 3, ArchivePanelKind::ProjectDetail)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text
+            .iter()
+            .any(|line| line.contains("Project archive summary")));
+        assert!(!text.iter().any(|line| line.contains("h/l")));
+    }
+
+    #[test]
+    fn given_tree_archive_row_when_lines_built_then_toggle_hint_is_present() {
+        let app = App::new(std::path::PathBuf::from(
+            "target/nonexistent-auwsx-test.sock",
+        ));
+
+        let text = archive_summary_lines(&app, 3, ArchivePanelKind::TreeRow)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text
+            .iter()
+            .any(|line| line.contains("h/l expands or collapses")));
     }
 
     #[test]
@@ -822,8 +855,17 @@ fn render_issue_summary(frame: &mut Frame, app: &App, area: Rect) {
     render_kanban(frame, app, area, false);
 }
 
-fn render_archive_summary(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
-    let visible_issue_rows = area.height.saturating_sub(6) as usize;
+#[derive(Clone, Copy)]
+enum ArchivePanelKind {
+    ProjectDetail,
+    TreeRow,
+}
+
+fn archive_summary_lines(
+    app: &App,
+    visible_issue_rows: usize,
+    kind: ArchivePanelKind,
+) -> Vec<Line<'static>> {
     let limit = app.archive_visible_limit().min(visible_issue_rows.max(1));
     let done = app
         .archived_issues()
@@ -846,10 +888,7 @@ fn render_archive_summary(frame: &mut Frame, app: &App, area: Rect, focused: boo
             "outcomes",
             &format!("{done} done  {failed} failed  {abandoned} abandoned"),
         ),
-        Line::styled(
-            "Enter toggles archived issue rows; terminal issues stay out of the main list.",
-            theme::dim(),
-        ),
+        archive_panel_help(kind),
         sep(),
     ];
     for issue in app.archived_issues().iter().take(limit) {
@@ -864,7 +903,41 @@ fn render_archive_summary(frame: &mut Frame, app: &App, area: Rect, focused: boo
             theme::dim(),
         ));
     }
-    panel_with_focus(frame, area, "Archive", focused, lines);
+    lines
+}
+
+fn archive_panel_help(kind: ArchivePanelKind) -> Line<'static> {
+    match kind {
+        ArchivePanelKind::ProjectDetail => Line::styled(
+            "Project archive summary; terminal issues stay out of active kanban.",
+            theme::dim(),
+        ),
+        ArchivePanelKind::TreeRow => Line::styled(
+            "h/l expands or collapses archived issue rows in the project list.",
+            theme::dim(),
+        ),
+    }
+}
+
+fn render_project_archive(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
+    let visible_issue_rows = area.height.saturating_sub(6) as usize;
+    panel_with_focus(
+        frame,
+        area,
+        "Archived Issues",
+        focused,
+        archive_summary_lines(app, visible_issue_rows, ArchivePanelKind::ProjectDetail),
+    );
+}
+
+fn render_tree_archive_summary(frame: &mut Frame, app: &App, area: Rect) {
+    let visible_issue_rows = area.height.saturating_sub(6) as usize;
+    panel(
+        frame,
+        area,
+        "Project List Archive",
+        archive_summary_lines(app, visible_issue_rows, ArchivePanelKind::TreeRow),
+    );
 }
 
 fn render_issue(frame: &mut Frame, app: &App, area: Rect) {

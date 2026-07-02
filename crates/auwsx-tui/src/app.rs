@@ -4128,7 +4128,8 @@ impl App {
             }
             ProjectDetailSection::Archive => {
                 self.status =
-                    "Archive selected; use h/l on the archive row to collapse or expand".into();
+                    "Archived issues are summarized here; select an archived issue row to inspect"
+                        .into();
             }
         }
         Ok(())
@@ -5575,6 +5576,22 @@ mod tests {
             .hints
             .iter()
             .any(|hint| hint.key == "Enter" && hint.label.contains("archive")));
+    }
+
+    #[tokio::test]
+    async fn given_project_detail_archive_when_drilled_then_does_not_reference_tree_toggle(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.focus = Focus::ProjectDetail;
+        app.project_section = ProjectDetailSection::Archive;
+
+        app.apply(Action::Drill).await?;
+
+        assert!(app.status.contains("Archived issues are summarized here"));
+        assert!(!app.status.contains("h/l"));
+        assert!(!app.status.contains("archive row"));
+        Ok(())
     }
 
     #[tokio::test]
