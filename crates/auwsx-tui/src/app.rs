@@ -152,7 +152,7 @@ impl IssueDetailSection {
     }
 
     pub fn is_interactive(self) -> bool {
-        matches!(self, Self::Log)
+        true
     }
 
     fn from_index(index: usize) -> Self {
@@ -1359,6 +1359,8 @@ pub struct App {
     pub log_tail_path: Option<String>,
     /// Issue log scroll offset measured from the newest visible line.
     pub issue_log_scroll: usize,
+    /// Issue detail section scroll offset measured from the first visible line.
+    pub issue_section_scroll: usize,
     pub selected_text_scroll_key: Option<String>,
     pub selected_text_scroll_offset: usize,
     /// Settings scroll offset for long config/prompt review content.
@@ -1427,6 +1429,7 @@ impl App {
             log_tail: String::new(),
             log_tail_path: None,
             issue_log_scroll: 0,
+            issue_section_scroll: 0,
             selected_text_scroll_key: None,
             selected_text_scroll_offset: 0,
             config_scroll: 0,
@@ -1468,6 +1471,7 @@ impl App {
             format!("{:?}", self.issue_return_focus),
             self.move_mode.to_string(),
             self.issue_log_scroll.to_string(),
+            self.issue_section_scroll.to_string(),
             self.selected_text_scroll_key
                 .as_deref()
                 .unwrap_or("")
@@ -2605,8 +2609,10 @@ impl App {
     async fn refresh_detail(&mut self) -> Result<()> {
         let Some(iid) = self.selected_issue_id() else {
             self.detail = IssueDetail::default();
+            self.issue_section_scroll = 0;
             return Ok(());
         };
+        let previous_issue_id = self.detail.issue.as_ref().map(|issue| issue.id);
         let mut d = IssueDetail::default();
         if let Response::Issue(i) = self.req(Command::GetIssue { issue_id: iid }).await? {
             d.issue = i;
@@ -2639,6 +2645,10 @@ impl App {
             d.remote_links = Some(links);
         }
         self.detail = d;
+        if previous_issue_id != Some(iid) {
+            self.issue_section_scroll = 0;
+        }
+        self.clamp_issue_section_scroll();
         self.refresh_issue_runs_and_tail().await?;
         Ok(())
     }
@@ -2684,6 +2694,7 @@ impl App {
             self.log_tail.clear();
             self.log_tail_path = None;
             self.issue_log_scroll = 0;
+            self.issue_section_scroll = 0;
             return Ok(());
         };
         if let Response::AgentRuns(runs) = self
@@ -2745,6 +2756,72 @@ impl App {
 
     fn jump_issue_log_bottom(&mut self) {
         self.issue_log_scroll = 0;
+    }
+
+    fn issue_non_log_section_active(&self) -> bool {
+        self.focus == Focus::IssueDetail
+            && self.issue_section != IssueDetailSection::Log
+            && self.issue_section_is_active()
+    }
+
+    fn issue_section_line_count(&self, section: IssueDetailSection) -> usize {
+        match section {
+            IssueDetailSection::Summary => self
+                .selected_issue()
+                .map(|issue| {
+                    let remote_pr_link = self
+                        .detail
+                        .remote_links
+                        .as_ref()
+                        .and_then(|links| links.pr_link.as_ref());
+                    ui::vm::issue_summary_rows(
+                        issue,
+                        &self.detail.subtasks,
+                        &self.detail.findings,
+                        &self.detail.steering,
+                        &self.detail.runs,
+                        remote_pr_link,
+                    )
+                    .len()
+                    .saturating_add(5)
+                })
+                .unwrap_or(1),
+            IssueDetailSection::Findings => self.detail.findings.len().max(1),
+            IssueDetailSection::WorkQueue => self
+                .detail
+                .subtasks
+                .len()
+                .saturating_add(self.detail.steering.len())
+                .saturating_add(3),
+            IssueDetailSection::Log => self.log_tail.lines().count().max(1),
+        }
+    }
+
+    fn scroll_issue_section(&mut self, delta: isize) {
+        let max = self
+            .issue_section_line_count(self.issue_section)
+            .saturating_sub(1);
+        self.issue_section_scroll = self
+            .issue_section_scroll
+            .saturating_add_signed(delta)
+            .min(max);
+    }
+
+    fn clamp_issue_section_scroll(&mut self) {
+        let max = self
+            .issue_section_line_count(self.issue_section)
+            .saturating_sub(1);
+        self.issue_section_scroll = self.issue_section_scroll.min(max);
+    }
+
+    fn jump_issue_section_top(&mut self) {
+        self.issue_section_scroll = 0;
+    }
+
+    fn jump_issue_section_bottom(&mut self) {
+        self.issue_section_scroll = self
+            .issue_section_line_count(self.issue_section)
+            .saturating_sub(1);
     }
 
     fn scroll_config(&mut self, delta: isize) {
@@ -2893,6 +2970,8 @@ impl App {
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
                     if self.issue_log_section_active() {
                         self.scroll_issue_log(-1);
+                    } else if self.issue_non_log_section_active() {
+                        self.scroll_issue_section(1);
                     } else {
                         self.move_issue_section(1);
                     }
@@ -2912,6 +2991,8 @@ impl App {
                 } else if self.focus == Focus::IssueDetail && self.view == View::Overview {
                     if self.issue_log_section_active() {
                         self.scroll_issue_log(1);
+                    } else if self.issue_non_log_section_active() {
+                        self.scroll_issue_section(-1);
                     } else {
                         self.move_issue_section(-1);
                     }
@@ -2946,6 +3027,8 @@ impl App {
                     self.scroll_config(10);
                 } else if self.issue_log_section_active() {
                     self.scroll_issue_log(-10);
+                } else if self.issue_non_log_section_active() {
+                    self.scroll_issue_section(10);
                 }
             }
             Action::PageUp => {
@@ -2953,6 +3036,8 @@ impl App {
                     self.scroll_config(-10);
                 } else if self.issue_log_section_active() {
                     self.scroll_issue_log(10);
+                } else if self.issue_non_log_section_active() {
+                    self.scroll_issue_section(-10);
                 }
             }
             Action::Top => {
@@ -2960,6 +3045,8 @@ impl App {
                     self.jump_settings_top();
                 } else if self.issue_log_section_active() {
                     self.jump_issue_log_top();
+                } else if self.issue_non_log_section_active() {
+                    self.jump_issue_section_top();
                 }
             }
             Action::Bottom => {
@@ -2967,6 +3054,8 @@ impl App {
                     self.jump_settings_bottom();
                 } else if self.issue_log_section_active() {
                     self.jump_issue_log_bottom();
+                } else if self.issue_non_log_section_active() {
+                    self.jump_issue_section_bottom();
                 }
             }
             Action::Drill => {
@@ -3943,6 +4032,7 @@ impl App {
     fn move_issue_section(&mut self, delta: isize) {
         self.issue_section = self.issue_section.step(delta);
         self.issue_section_mode = IssueSectionMode::Selected;
+        self.issue_section_scroll = 0;
     }
 
     pub fn selected_issue_section(&self) -> IssueDetailSection {
@@ -3998,15 +4088,9 @@ impl App {
     }
 
     fn activate_issue_section(&mut self) {
-        if self.issue_section.is_interactive() {
-            self.issue_section_mode = IssueSectionMode::Active;
-            self.status = format!("{} active", self.issue_section.title().to_ascii_lowercase());
-        } else {
-            self.status = format!(
-                "{} selected; no direct controls",
-                self.issue_section.title().to_ascii_lowercase()
-            );
-        }
+        self.issue_section_mode = IssueSectionMode::Active;
+        self.clamp_issue_section_scroll();
+        self.status = format!("{} active", self.issue_section.title().to_ascii_lowercase());
     }
 
     fn enter_issue_detail(&mut self, return_focus: Focus, return_tree_sel: Option<usize>) {
@@ -4014,6 +4098,7 @@ impl App {
         self.issue_return_tree_sel = return_tree_sel;
         self.focus = Focus::IssueDetail;
         self.issue_section_mode = IssueSectionMode::Selected;
+        self.issue_section_scroll = 0;
     }
 
     fn enter_issue_detail_for_issue(
@@ -4797,8 +4882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_non_log_issue_section_entered_then_selection_stays_noninteractive(
-    ) -> anyhow::Result<()> {
+    async fn given_findings_section_entered_then_section_becomes_active() -> anyhow::Result<()> {
         let mut app = test_app();
         app.view = View::Overview;
         app.focus = Focus::IssueDetail;
@@ -4807,8 +4891,35 @@ mod tests {
         app.apply(Action::Drill).await?;
 
         assert_eq!(app.selected_issue_section(), IssueDetailSection::Findings);
-        assert_eq!(app.issue_section_mode, IssueSectionMode::Selected);
-        assert_eq!(app.status, "findings selected; no direct controls");
+        assert_eq!(app.issue_section_mode, IssueSectionMode::Active);
+        assert_eq!(app.status, "findings active");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_work_queue_section_active_when_jk_then_scrolls_section() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.view = View::Overview;
+        app.focus = Focus::IssueDetail;
+        app.issue_section = IssueDetailSection::WorkQueue;
+        app.detail.subtasks = (0..5)
+            .map(|idx| Subtask {
+                id: idx + 1,
+                issue_id: 7,
+                ord: idx,
+                text: format!("step {idx}"),
+                done: false,
+                created_at: 1,
+                done_at: None,
+            })
+            .collect();
+
+        app.apply(Action::Drill).await?;
+        app.apply(Action::Down).await?;
+
+        assert_eq!(app.selected_issue_section(), IssueDetailSection::WorkQueue);
+        assert_eq!(app.issue_section_mode, IssueSectionMode::Active);
+        assert_eq!(app.issue_section_scroll, 1);
         Ok(())
     }
 

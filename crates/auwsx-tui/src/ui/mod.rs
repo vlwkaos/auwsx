@@ -311,7 +311,7 @@ fn issue_detail_hints(section: IssueDetailSection, active: bool) -> Vec<FooterHi
             FooterHint::text("issue detail"),
             FooterHint::key("j/k", "section"),
             FooterHint::key("h/l", "section"),
-            FooterHint::key("Enter", "scroll log"),
+            FooterHint::key("Enter", "inspect"),
         ]
     } else {
         vec![
@@ -975,19 +975,18 @@ mod tests {
     }
 
     #[test]
-    fn given_issue_detail_sections_when_footer_modeled_then_only_log_advertises_focus() {
+    fn given_issue_detail_sections_when_footer_modeled_then_enter_inspects_any_section() {
         let mut app = App::new(std::path::PathBuf::from("/tmp/nonexistent.sock"));
         app.connected = true;
         app.focus = Focus::IssueDetail;
         app.issue_section = IssueDetailSection::Findings;
 
         let findings = footer_model(&app).context_text();
-        assert!(!findings.contains("(Enter)"));
-        assert!(!findings.contains("scroll log"));
+        assert!(findings.contains("(Enter) inspect"));
 
         app.issue_section = IssueDetailSection::Log;
         let log = footer_model(&app).context_text();
-        assert!(log.contains("(Enter) scroll log"));
+        assert!(log.contains("(Enter) inspect"));
     }
 
     #[test]

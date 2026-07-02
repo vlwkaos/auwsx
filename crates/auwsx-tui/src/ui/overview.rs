@@ -888,7 +888,7 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
             },
         ),
     ]);
-    panel_with_focus(
+    panel_with_focus_scrolled(
         frame,
         rows[0],
         issue_section_title(
@@ -897,6 +897,8 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
             &format!("Issue #{}", issue.id),
         ),
         issue_section_selected(app, crate::app::IssueDetailSection::Summary),
+        issue_section_scroll(app, crate::app::IssueDetailSection::Summary),
+        "enter section to scroll",
         lines,
     );
 
@@ -917,11 +919,13 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect()
     };
-    panel_with_focus(
+    panel_with_focus_scrolled(
         frame,
         rows[1],
         issue_section_title(app, crate::app::IssueDetailSection::Findings, "Findings"),
         issue_section_selected(app, crate::app::IssueDetailSection::Findings),
+        issue_section_scroll(app, crate::app::IssueDetailSection::Findings),
+        "enter section to scroll",
         findings,
     );
 
@@ -945,7 +949,7 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
     for s in &app.detail.steering {
         work.push(Line::raw(format!("[{}] {}", s.source.as_str(), s.note)));
     }
-    panel_with_focus(
+    panel_with_focus_scrolled(
         frame,
         rows[2],
         issue_section_title(
@@ -954,6 +958,8 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
             "Subtasks / Queue",
         ),
         issue_section_selected(app, crate::app::IssueDetailSection::WorkQueue),
+        issue_section_scroll(app, crate::app::IssueDetailSection::WorkQueue),
+        "enter section to scroll",
         work,
     );
 
@@ -997,6 +1003,17 @@ fn issue_section_constraints(active: crate::app::IssueDetailSection) -> [Constra
 
 fn issue_section_selected(app: &App, section: crate::app::IssueDetailSection) -> bool {
     app.focus == crate::app::Focus::IssueDetail && app.selected_issue_section() == section
+}
+
+fn issue_section_scroll(app: &App, section: crate::app::IssueDetailSection) -> usize {
+    if issue_section_selected(app, section)
+        && app.issue_section_is_active()
+        && section != crate::app::IssueDetailSection::Log
+    {
+        app.issue_section_scroll
+    } else {
+        0
+    }
 }
 
 fn issue_section_title(app: &App, section: crate::app::IssueDetailSection, title: &str) -> String {
@@ -1187,17 +1204,43 @@ fn panel_with_focus(
     area: Rect,
     title: impl AsRef<str>,
     focused: bool,
+    lines: Vec<Line<'static>>,
+) {
+    panel_with_focus_scrolled(
+        frame,
+        area,
+        title,
+        focused,
+        0,
+        "select section to inspect",
+        lines,
+    );
+}
+
+fn panel_with_focus_scrolled(
+    frame: &mut Frame,
+    area: Rect,
+    title: impl AsRef<str>,
+    focused: bool,
+    scroll: usize,
+    overflow_hint: &'static str,
     mut lines: Vec<Line<'static>>,
 ) {
     let title = title.as_ref();
     let visible = area.height.saturating_sub(2) as usize;
     if visible > 0 && lines.len() > visible {
-        let hidden = lines.len().saturating_sub(visible);
-        lines.truncate(visible.saturating_sub(1));
-        lines.push(Line::styled(
-            format!("... {hidden} more; select section to inspect"),
-            theme::dim(),
-        ));
+        let total = lines.len();
+        let start = scroll.min(total.saturating_sub(visible));
+        lines = lines.into_iter().skip(start).take(visible).collect();
+        if start > 0 && !lines.is_empty() {
+            lines[0] = Line::styled(format!("... {start} above"), theme::dim());
+        }
+        let bottom = start.saturating_add(visible);
+        if bottom < total && !lines.is_empty() {
+            let hidden = total.saturating_sub(bottom).saturating_add(1);
+            let last = lines.len().saturating_sub(1);
+            lines[last] = Line::styled(format!("... {hidden} more; {overflow_hint}"), theme::dim());
+        }
     }
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
