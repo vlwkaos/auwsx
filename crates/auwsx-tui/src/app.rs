@@ -2212,19 +2212,7 @@ impl App {
                     caps.push(CapabilityAction::Drill, "Enter", "kanban");
                 }
                 ProjectDetailSection::Preview => {}
-                ProjectDetailSection::Archive => {
-                    let label = self
-                        .selected_project_id()
-                        .map(|project_id| {
-                            if self.archive_expanded.contains(&project_id) {
-                                "close archive"
-                            } else {
-                                "open archive"
-                            }
-                        })
-                        .unwrap_or("archive");
-                    caps.push(CapabilityAction::Drill, "Enter", label);
-                }
+                ProjectDetailSection::Archive => {}
             }
             return caps;
         }
@@ -2242,7 +2230,6 @@ impl App {
                 caps.push(CapabilityAction::Delete, "d", "unregister");
             }
             Some(TreeItem::RoutinesRoot(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter", "fold");
                 caps.push(CapabilityAction::Add, "a", "add routine");
             }
             Some(TreeItem::Routine { .. }) => {
@@ -2252,7 +2239,6 @@ impl App {
                 caps.push(CapabilityAction::Execute, "E", "execute");
             }
             Some(TreeItem::BacklogRoot(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter", "fold");
                 caps.push(CapabilityAction::Add, "a", "add backlog");
             }
             Some(TreeItem::Backlog { .. }) => {
@@ -2268,17 +2254,8 @@ impl App {
                 }
                 caps.push(CapabilityAction::Delete, "d", "dismiss");
             }
-            Some(TreeItem::IssuesRoot(_)) => {
-                caps.push(CapabilityAction::Drill, "Enter", "fold");
-            }
-            Some(TreeItem::ArchiveRoot(project_id)) => {
-                let label = if self.archive_expanded.contains(&project_id) {
-                    "close archive"
-                } else {
-                    "open archive"
-                };
-                caps.push(CapabilityAction::Drill, "Enter", label);
-            }
+            Some(TreeItem::IssuesRoot(_)) => {}
+            Some(TreeItem::ArchiveRoot(_)) => {}
             Some(TreeItem::Issue { .. }) => {
                 caps.push(CapabilityAction::Drill, "Enter", "detail");
                 caps.push(CapabilityAction::MoveMode, "m", "move");
@@ -3047,6 +3024,8 @@ impl App {
             Action::Left => {
                 if self.move_mode {
                     self.move_selected_item_across(-1).await?;
+                } else if self.focus == Focus::Left && self.view == View::Overview {
+                    self.collapse_selected_tree_root();
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_lane(-1);
                 } else if self.focus == Focus::ProjectDetail && self.view == View::Overview {
@@ -3058,6 +3037,8 @@ impl App {
             Action::Right => {
                 if self.move_mode {
                     self.move_selected_item_across(1).await?;
+                } else if self.focus == Focus::Left && self.view == View::Overview {
+                    self.expand_selected_tree_root();
                 } else if self.focus == Focus::ProjectKanban {
                     self.move_kanban_lane(1);
                 } else if self.focus == Focus::ProjectDetail && self.view == View::Overview {
@@ -4091,6 +4072,45 @@ impl App {
         self.project_section = self.project_section.step(delta);
     }
 
+    fn collapse_selected_tree_root(&mut self) {
+        match self.selected_tree_item() {
+            Some(TreeItem::Project(pid))
+            | Some(TreeItem::RoutinesRoot(pid))
+            | Some(TreeItem::BacklogRoot(pid))
+            | Some(TreeItem::IssuesRoot(pid)) => {
+                self.expanded.remove(&pid);
+                self.clamp_tree();
+                self.sync_active_project();
+            }
+            Some(TreeItem::ArchiveRoot(pid)) => {
+                self.archive_expanded.remove(&pid);
+                self.clamp_tree();
+                self.sync_active_project();
+            }
+            _ => {}
+        }
+    }
+
+    fn expand_selected_tree_root(&mut self) {
+        match self.selected_tree_item() {
+            Some(TreeItem::Project(pid))
+            | Some(TreeItem::RoutinesRoot(pid))
+            | Some(TreeItem::BacklogRoot(pid))
+            | Some(TreeItem::IssuesRoot(pid)) => {
+                self.expanded.insert(pid);
+                self.clamp_tree();
+                self.sync_active_project();
+            }
+            Some(TreeItem::ArchiveRoot(pid)) => {
+                self.expanded.insert(pid);
+                self.archive_expanded.insert(pid);
+                self.clamp_tree();
+                self.sync_active_project();
+            }
+            _ => {}
+        }
+    }
+
     async fn activate_project_section(&mut self) -> Result<()> {
         match self.project_section {
             ProjectDetailSection::Recovery => {
@@ -4107,15 +4127,8 @@ impl App {
                 self.status = "Preview selected; no direct controls".into();
             }
             ProjectDetailSection::Archive => {
-                if let Some(project_id) = self.selected_project_id() {
-                    if self.archive_expanded.contains(&project_id) {
-                        self.archive_expanded.remove(&project_id);
-                    } else {
-                        self.archive_expanded.insert(project_id);
-                    }
-                    self.clamp_tree();
-                    self.sync_active_project();
-                }
+                self.status =
+                    "Archive selected; use h/l on the archive row to collapse or expand".into();
             }
         }
         Ok(())
@@ -4448,33 +4461,18 @@ impl App {
         }
         match self.selected_tree_item() {
             // Enter on a project header moves focus to the right-side project pane.
-            Some(TreeItem::Project(pid)) => {
-                self.expanded.insert(pid);
+            Some(TreeItem::Project(_)) => {
                 self.clamp_tree();
                 self.sync_active_project();
                 self.focus = Focus::ProjectDetail;
             }
             Some(
-                TreeItem::RoutinesRoot(pid)
-                | TreeItem::BacklogRoot(pid)
-                | TreeItem::IssuesRoot(pid),
+                TreeItem::RoutinesRoot(_) | TreeItem::BacklogRoot(_) | TreeItem::IssuesRoot(_),
             ) => {
-                if self.expanded.contains(&pid) {
-                    self.expanded.remove(&pid);
-                } else {
-                    self.expanded.insert(pid);
-                }
-                self.clamp_tree();
-                self.sync_active_project();
+                self.status = "Use h/l to collapse or expand sections".into();
             }
-            Some(TreeItem::ArchiveRoot(pid)) => {
-                if self.archive_expanded.contains(&pid) {
-                    self.archive_expanded.remove(&pid);
-                } else {
-                    self.archive_expanded.insert(pid);
-                }
-                self.clamp_tree();
-                self.sync_active_project();
+            Some(TreeItem::ArchiveRoot(_)) => {
+                self.status = "Use h/l to collapse or expand archive".into();
             }
             // Enter on an issue keeps the main screen and moves focus to the detail pane.
             Some(TreeItem::Issue { .. } | TreeItem::ArchivedIssue { .. }) => {
@@ -5474,6 +5472,28 @@ mod tests {
         assert_eq!(app.view, View::Overview);
         assert_eq!(app.focus, Focus::ProjectDetail);
         assert_eq!(app.selected_project_section(), ProjectDetailSection::Kanban);
+        assert!(!app.expanded.contains(&1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn given_project_row_when_right_left_then_project_expands_and_collapses(
+    ) -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.projects.push(project_fixture());
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|row| matches!(row.item, TreeItem::Project(1)))
+            .expect("project row exists");
+
+        app.apply(Action::Right).await?;
+
+        assert!(app.expanded.contains(&1));
+
+        app.apply(Action::Left).await?;
+
+        assert!(!app.expanded.contains(&1));
         Ok(())
     }
 
@@ -5535,7 +5555,7 @@ mod tests {
     }
 
     #[test]
-    fn given_project_detail_archive_when_capabilities_requested_then_open_close_is_named() {
+    fn given_project_detail_archive_when_capabilities_requested_then_enter_is_not_fold_hint() {
         let mut app = test_app();
         app.projects.push(project_fixture());
         app.focus = Focus::ProjectDetail;
@@ -5543,18 +5563,18 @@ mod tests {
 
         let closed_hints = app.capabilities();
 
-        assert!(closed_hints
+        assert!(!closed_hints
             .hints
             .iter()
-            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) open archive"));
+            .any(|hint| hint.key == "Enter" && hint.label.contains("archive")));
 
         app.archive_expanded.insert(1);
         let open_hints = app.capabilities();
 
-        assert!(open_hints
+        assert!(!open_hints
             .hints
             .iter()
-            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) close archive"));
+            .any(|hint| hint.key == "Enter" && hint.label.contains("archive")));
     }
 
     #[tokio::test]
@@ -6131,7 +6151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_archive_root_when_drilled_then_archived_issue_rows_toggle() {
+    async fn given_archive_root_when_right_left_then_archived_issue_rows_toggle() {
         let mut app = test_app();
         app.projects = vec![test_project()];
         app.expanded.insert(42);
@@ -6148,7 +6168,7 @@ mod tests {
             .position(|r| matches!(r.item, TreeItem::ArchiveRoot(42)))
             .unwrap();
 
-        app.drill().await.unwrap();
+        app.apply(Action::Right).await.unwrap();
 
         assert!(app.archive_expanded.contains(&42));
         assert!(app.tree_rows().iter().any(|r| matches!(
@@ -6159,7 +6179,42 @@ mod tests {
             }
         )));
 
-        app.drill().await.unwrap();
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchiveRoot(42)))
+            .unwrap();
+        app.apply(Action::Left).await.unwrap();
+
+        assert!(!app.archive_expanded.contains(&42));
+        assert!(!app.tree_rows().iter().any(|r| matches!(
+            r.item,
+            TreeItem::ArchivedIssue {
+                project_id: 42,
+                id: 2
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn given_archive_root_when_enter_pressed_then_archive_does_not_expand() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: vec![test_issue(2, IssueStatus::Done, "archived")],
+                ..ProjectChildren::default()
+            },
+        );
+        app.tree_sel = app
+            .tree_rows()
+            .iter()
+            .position(|r| matches!(r.item, TreeItem::ArchiveRoot(42)))
+            .unwrap();
+
+        app.apply(Action::Drill).await.unwrap();
 
         assert!(!app.archive_expanded.contains(&42));
         assert!(!app.tree_rows().iter().any(|r| matches!(
@@ -6172,7 +6227,7 @@ mod tests {
     }
 
     #[test]
-    fn given_archive_root_when_capabilities_requested_then_access_hint_is_explicit() {
+    fn given_archive_root_when_capabilities_requested_then_enter_is_not_fold_hint() {
         let mut app = test_app();
         app.projects = vec![test_project()];
         app.expanded.insert(42);
@@ -6191,18 +6246,18 @@ mod tests {
 
         let closed_hints = app.capabilities();
 
-        assert!(closed_hints
+        assert!(!closed_hints
             .hints
             .iter()
-            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) open archive"));
+            .any(|hint| hint.key == "Enter" && hint.label.contains("archive")));
 
         app.archive_expanded.insert(42);
         let open_hints = app.capabilities();
 
-        assert!(open_hints
+        assert!(!open_hints
             .hints
             .iter()
-            .any(|hint| format_key_hint(&hint.key, &hint.label) == "(Enter) close archive"));
+            .any(|hint| hint.key == "Enter" && hint.label.contains("archive")));
     }
 
     #[test]

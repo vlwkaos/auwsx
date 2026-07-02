@@ -216,10 +216,10 @@ Useful keys:
   issue, or archive/cleanup terminal issue worktree state.
 - `E`: execute the selected project/backlog/issue/routine now.
 - `[` / `]`: move selection to the previous/next project.
+- `h` / `l`: collapse or expand the highlighted project/archive row.
 - `Ctrl-,`: open global Settings.
 - `m`: move project order/profile when a project row is selected.
-- `⏎`: enter project kanban, toggle section roots including Archive, open issue
-  detail, or edit the selected Settings row.
+- `⏎`: enter project kanban, open issue detail, or edit the selected Settings row.
 - `?`: ask a one-shot project question.
 - `Tab` / `BackTab`: switch compatibility views.
 - In issue detail focus: select a section with `j/k` or `h/l`, press `Enter`,

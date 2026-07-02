@@ -268,6 +268,7 @@ impl FooterContext {
             Self::Overview => with_capabilities(
                 vec![
                     FooterHint::key("j/k", "move"),
+                    FooterHint::key("h/l", "collapse/expand"),
                     FooterHint::key("[/]", "project"),
                 ],
                 app,
