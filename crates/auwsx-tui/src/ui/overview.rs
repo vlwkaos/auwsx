@@ -694,6 +694,16 @@ mod tests {
         assert!(text.iter().any(|line| line == "  beta"));
         assert!(text.iter().any(|line| line == "  gamma"));
     }
+
+    #[test]
+    fn given_issue_log_height_when_capped_then_never_exceeds_sixty_percent() {
+        for height in [20, 40, 80] {
+            let cap = issue_log_height_cap(height);
+
+            assert!(cap <= ((height as usize * 60).div_ceil(100) as u16));
+            assert!(cap <= height.saturating_sub(20).max(3));
+        }
+    }
 }
 
 fn render_routines(frame: &mut Frame, app: &App, area: Rect) {
@@ -813,6 +823,8 @@ fn render_issue_summary(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_archive_summary(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
+    let visible_issue_rows = area.height.saturating_sub(6) as usize;
+    let limit = app.archive_visible_limit().min(visible_issue_rows.max(1));
     let done = app
         .archived_issues()
         .iter()
@@ -840,12 +852,15 @@ fn render_archive_summary(frame: &mut Frame, app: &App, area: Rect, focused: boo
         ),
         sep(),
     ];
-    for issue in app.archived_issues().iter().take(3) {
+    for issue in app.archived_issues().iter().take(limit) {
         lines.push(Line::raw(super::vm::issue_tree_label(issue)));
     }
-    if app.archived_issues().len() > 3 {
+    if app.archived_issues().len() > limit {
         lines.push(Line::styled(
-            format!("... {} more", app.archived_issues().len() - 3),
+            format!(
+                "showing latest {limit} of {} archived",
+                app.archived_issues().len()
+            ),
             theme::dim(),
         ));
     }
@@ -859,9 +874,15 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(issue_section_constraints(app.selected_issue_section()))
+        .constraints(issue_section_constraints(
+            app.selected_issue_section(),
+            area.height,
+        ))
         .split(area);
-    let mut lines = vec![kv("title", &issue.title)];
+    let mut lines = vec![
+        kv("summary", &quick_issue_summary(issue)),
+        kv("title", &issue.title),
+    ];
     if let Some(desc) = &issue.description {
         lines.extend(scrolling_text_lines(
             "description",
@@ -894,7 +915,7 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
         issue_section_title(
             app,
             crate::app::IssueDetailSection::Summary,
-            &format!("Issue #{}", issue.id),
+            &format!("Summary #{}", issue.id),
         ),
         issue_section_selected(app, crate::app::IssueDetailSection::Summary),
         issue_section_scroll(app, crate::app::IssueDetailSection::Summary),
@@ -963,42 +984,73 @@ fn render_issue(frame: &mut Frame, app: &App, area: Rect) {
         work,
     );
 
-    super::issue::log_block_with_title_focused(
+    let verify = issue_verify_lines(issue);
+    panel_with_focus_scrolled(
         frame,
         rows[3],
+        issue_section_title(app, crate::app::IssueDetailSection::Verify, "Verify"),
+        issue_section_selected(app, crate::app::IssueDetailSection::Verify),
+        issue_section_scroll(app, crate::app::IssueDetailSection::Verify),
+        "enter section to scroll",
+        verify,
+    );
+
+    super::issue::log_block_with_title_focused(
+        frame,
+        rows[4],
         app,
         issue_section_title(app, crate::app::IssueDetailSection::Log, "Log"),
         issue_section_selected(app, crate::app::IssueDetailSection::Log),
     );
 }
 
-fn issue_section_constraints(active: crate::app::IssueDetailSection) -> [Constraint; 4] {
+fn issue_section_constraints(
+    active: crate::app::IssueDetailSection,
+    height: u16,
+) -> [Constraint; 5] {
+    let log_cap = issue_log_height_cap(height);
     match active {
         crate::app::IssueDetailSection::Summary => [
             Constraint::Length(10),
             Constraint::Length(4),
             Constraint::Length(5),
-            Constraint::Min(3),
+            Constraint::Length(6),
+            Constraint::Length(8.min(log_cap)),
         ],
         crate::app::IssueDetailSection::Findings => [
             Constraint::Length(5),
             Constraint::Length(10),
             Constraint::Length(5),
-            Constraint::Min(3),
+            Constraint::Length(6),
+            Constraint::Length(8.min(log_cap)),
         ],
         crate::app::IssueDetailSection::WorkQueue => [
             Constraint::Length(5),
             Constraint::Length(4),
             Constraint::Length(10),
-            Constraint::Min(3),
+            Constraint::Length(6),
+            Constraint::Length(8.min(log_cap)),
+        ],
+        crate::app::IssueDetailSection::Verify => [
+            Constraint::Length(5),
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Length(12),
+            Constraint::Length(8.min(log_cap)),
         ],
         crate::app::IssueDetailSection::Log => [
             Constraint::Length(5),
             Constraint::Length(4),
             Constraint::Length(5),
-            Constraint::Min(8),
+            Constraint::Length(6),
+            Constraint::Length(log_cap),
         ],
     }
+}
+
+fn issue_log_height_cap(height: u16) -> u16 {
+    let viewport_cap = ((height as usize * 60).div_ceil(100) as u16).max(3);
+    viewport_cap.min(height.saturating_sub(20).max(3))
 }
 
 fn issue_section_selected(app: &App, section: crate::app::IssueDetailSection) -> bool {
@@ -1312,6 +1364,65 @@ fn kanban_issue_preview_lines(
         ));
     }
     append_issue_summary_lines(&mut lines, app, issue);
+    lines
+}
+
+fn quick_issue_summary(issue: &auwsx_core::db::issues::Issue) -> String {
+    issue
+        .agent_summary
+        .as_deref()
+        .or(issue.progress_report.as_deref())
+        .or(issue.description.as_deref())
+        .map(first_nonempty_line)
+        .filter(|line| !line.is_empty())
+        .unwrap_or(&issue.title)
+        .to_string()
+}
+
+fn first_nonempty_line(text: &str) -> &str {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+}
+
+fn issue_verify_lines(issue: &auwsx_core::db::issues::Issue) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        kv(
+            "worktree",
+            issue.worktree_path.as_deref().unwrap_or("(none yet)"),
+        ),
+        kv(
+            "shell",
+            &auwsx_core::worktree::issue_shell_attach_command(issue.id),
+        ),
+    ];
+    if let Some(path) = issue.worktree_path.as_deref() {
+        lines.push(kv("cwd", &format!("cd {path}")));
+    }
+    lines.push(kv(
+        "verify file",
+        ".auwsx/human-verify.md in the issue worktree",
+    ));
+    lines.push(sep());
+    match issue
+        .result_report
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        Some(report) => {
+            lines.push(Line::styled(
+                "Human verify",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(report.lines().map(|line| Line::raw(line.to_string())));
+        }
+        None => {
+            lines.push(Line::styled(
+                "No human verification report has been written yet.",
+                theme::dim(),
+            ));
+        }
+    }
     lines
 }
 

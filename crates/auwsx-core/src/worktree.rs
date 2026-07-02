@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
@@ -47,6 +47,60 @@ pub trait Worktrees: Send + Sync {
 /// project (issue ids are unique), and greppable as auwsx-managed.
 pub fn branch_for_issue(issue_id: i64) -> String {
     format!("{ISSUE_BRANCH_PREFIX}{issue_id}")
+}
+
+pub fn issue_shell_session_name(issue_id: i64) -> String {
+    format!("auwsx-issue-{issue_id}-shell")
+}
+
+pub fn issue_shell_attach_command(issue_id: i64) -> String {
+    format!("tmux attach -t {}", issue_shell_session_name(issue_id))
+}
+
+pub fn kill_issue_shell_session(issue_id: i64) -> Result<()> {
+    let session = issue_shell_session_name(issue_id);
+    let status = Command::new("tmux")
+        .args(["kill-session", "-t", &session])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("killing tmux session {session}")),
+    }
+}
+
+/// Best-effort human shell for an issue worktree.
+///
+/// Agent subprocesses remain daemon-owned. The tmux session is only for an
+/// operator who wants to inspect or run verification commands in the same
+/// worktree.
+pub fn ensure_issue_shell_session(issue_id: i64, worktree_path: &Path) -> Result<Option<String>> {
+    let session = issue_shell_session_name(issue_id);
+    let has = Command::new("tmux")
+        .args(["has-session", "-t", &session])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match has {
+        Ok(status) if status.success() => return Ok(Some(session)),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("checking tmux session {session}")),
+    }
+    let status = Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session, "-c"])
+        .arg(worktree_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("creating tmux session {session}"))?;
+    if !status.success() {
+        return Err(anyhow!("tmux new-session for {session} exited {status}"));
+    }
+    Ok(Some(session))
 }
 
 /// Parse the id from an auwsx-managed issue branch.

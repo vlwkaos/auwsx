@@ -33,7 +33,8 @@ use crate::routines::{self, Routine};
 use crate::routing;
 use crate::state::{IssueStatus, SchedulerClass};
 use crate::worktree::{
-    branch_for_issue, prune_orphaned_issue_worktrees, WorktreeHandle, Worktrees,
+    branch_for_issue, kill_issue_shell_session, prune_orphaned_issue_worktrees, WorktreeHandle,
+    Worktrees,
 };
 use crate::Result;
 use anyhow::{anyhow, bail, Context};
@@ -1788,6 +1789,9 @@ impl Scheduler {
             path: PathBuf::from(path),
         };
         self.worktrees.teardown(project, &handle).await?;
+        if let Err(e) = kill_issue_shell_session(issue.id) {
+            tracing::warn!("issue shell cleanup for issue {} failed: {e:#}", issue.id);
+        }
         issues::set_worktree(self.db.pool(), issue.id, None, None, self.clock.now_ms()).await
     }
 

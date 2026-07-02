@@ -32,7 +32,7 @@ use crate::events::Event;
 use crate::prompt::{self, PromptContext};
 use crate::state::IssueStatus;
 use crate::steering;
-use crate::worktree::{branch_for_issue, Worktrees};
+use crate::worktree::{branch_for_issue, ensure_issue_shell_session, Worktrees};
 use crate::Result;
 use anyhow::{anyhow, Context};
 use std::io::Read;
@@ -194,6 +194,38 @@ pub async fn execute(deps: &Deps<'_>, issue_id: i64) -> Result<()> {
             return Err(e).context("preparing issue run artifact paths");
         }
     };
+    match ensure_issue_shell_session(issue_id, &cwd) {
+        Ok(Some(session)) => append_system_event(
+            &log_path,
+            serde_json::json!({
+                "kind": "issue_shell",
+                "issue_id": issue_id,
+                "session": session,
+                "cwd": cwd.to_string_lossy(),
+            }),
+        ),
+        Ok(None) => append_system_event(
+            &log_path,
+            serde_json::json!({
+                "kind": "issue_shell",
+                "issue_id": issue_id,
+                "available": false,
+                "reason": "tmux not found",
+            }),
+        ),
+        Err(e) => {
+            tracing::warn!("ensuring issue shell for issue {issue_id} failed: {e:#}");
+            append_system_event(
+                &log_path,
+                serde_json::json!({
+                    "kind": "issue_shell",
+                    "issue_id": issue_id,
+                    "available": false,
+                    "reason": e.to_string(),
+                }),
+            );
+        }
+    }
     if let Err(e) = std::fs::write(&prompt_path, &prompt_text) {
         let error = anyhow!(e);
         mark_issue_failed_with_setup_log(

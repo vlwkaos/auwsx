@@ -192,10 +192,13 @@ The TUI is an operator console:
   child rows; collapsed project rows show compact `R/B/I/A` counts when archived
   issues exist.
 - Right pane: contextual detail for the highlighted tree row. Embedded issue
-  detail labels the issue plan checklist, review findings, queue messages, phase
-  reports, and latest agent log tail in a compact readable form. When issue log
-  focus is active, `k` scrolls older log lines, `j` returns toward the newest
-  lines, `PgUp`/`PgDn` page, and `Home`/`End` jump to oldest/newest.
+  detail has separate Summary, Findings, Subtasks / Queue, Verify, and Log
+  sections. Summary is the quick looking-glass description for deciding what the
+  issue is; Verify shows the worktree, tmux attach command, and human verification
+  report when present. When a section is active, `k` scrolls up, `j` scrolls
+  down, `PgUp`/`PgDn` page, and `Home`/`End` jump.
+- Archive expansion is capped to the latest 20 terminal issues by default. Set
+  `AUWSX_TUI_ARCHIVE_LIMIT=<n>` before starting the TUI to change that cap.
 - Ask view: project-level Q&A history. Each ask runs once with current project
   status plus either `recall` or `seek` mode, then stores the answer newest-first
   for later reading/copying.
@@ -219,8 +222,8 @@ Useful keys:
   detail, or edit the selected Settings row.
 - `?`: ask a one-shot project question.
 - `Tab` / `BackTab`: switch compatibility views.
-- In issue log focus: `k` / `j` scroll the agent log, `PgUp` / `PgDn` page it,
-  and `Home` / `End` jump oldest/newest.
+- In issue detail focus: select a section with `j/k` or `h/l`, press `Enter`,
+  then use `j/k`, `PgUp`/`PgDn`, and `Home`/`End` inside that section.
 
 Project config is edited from the project row with `e`; the project chooses one
 Arsenal preset and does not expose per-role command templates. Edit command

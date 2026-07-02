@@ -117,6 +117,7 @@ pub(crate) fn kanban_cards_with_runs(
     backlog: &[BacklogItem],
     issues: &[Issue],
     runs: &[AgentRun],
+    archived_issue_limit: usize,
 ) -> Vec<KanbanCard> {
     let mut cards = Vec::new();
     for item in backlog {
@@ -132,7 +133,7 @@ pub(crate) fn kanban_cards_with_runs(
     let mut archived = 0usize;
     for issue in issues {
         if issue.status.is_archive_status() {
-            if archived >= 10 {
+            if archived >= archived_issue_limit {
                 continue;
             }
             archived += 1;
@@ -662,15 +663,16 @@ mod tests {
             ],
             &[],
             &[],
+            20,
         );
         assert_eq!(cards.len(), 1);
     }
 
     #[test]
-    fn given_many_archived_issues_when_projected_then_archive_cards_are_capped_at_ten() {
+    fn given_many_archived_issues_when_projected_then_archive_cards_use_configured_cap() {
         let issues: Vec<Issue> = (0..12).map(|i| issue(i, IssueStatus::Done)).collect();
-        let cards = kanban_cards_with_runs(&[], &issues, &[]);
-        assert_eq!(cards.len(), 10);
+        let cards = kanban_cards_with_runs(&[], &issues, &[], 5);
+        assert_eq!(cards.len(), 5);
     }
 
     #[test]
@@ -684,6 +686,7 @@ mod tests {
                 issue(4, IssueStatus::Done),
             ],
             &[],
+            20,
         );
         for (id, lane) in [
             (1, KanbanLane::Plan),
@@ -701,7 +704,7 @@ mod tests {
 
     #[test]
     fn given_attention_status_when_projected_then_issue_card_marks_attention() {
-        let cards = kanban_cards_with_runs(&[], &[issue(1, IssueStatus::PlanBlocked)], &[]);
+        let cards = kanban_cards_with_runs(&[], &[issue(1, IssueStatus::PlanBlocked)], &[], 20);
         match &cards[0] {
             KanbanCard::Issue {
                 needs_attention, ..
@@ -716,6 +719,7 @@ mod tests {
             &[],
             &[issue(7, IssueStatus::Working)],
             &[agent_run(1, 7, None)],
+            20,
         );
 
         match &cards[0] {
@@ -730,6 +734,7 @@ mod tests {
             &[],
             &[issue(7, IssueStatus::Working)],
             &[agent_run(1, 7, Some(TS + 1))],
+            20,
         );
 
         match &cards[0] {
@@ -740,7 +745,7 @@ mod tests {
 
     #[test]
     fn given_waiting_issue_when_projected_then_card_has_no_activity_marker() {
-        let cards = kanban_cards_with_runs(&[], &[issue(7, IssueStatus::ReadyToMerge)], &[]);
+        let cards = kanban_cards_with_runs(&[], &[issue(7, IssueStatus::ReadyToMerge)], &[], 20);
 
         match &cards[0] {
             KanbanCard::Issue { activity, .. } => assert_eq!(*activity, None),

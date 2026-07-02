@@ -127,26 +127,35 @@ pub enum IssueDetailSection {
     Summary,
     Findings,
     WorkQueue,
+    Verify,
     Log,
 }
 
 impl IssueDetailSection {
-    pub const ALL: [Self; 4] = [Self::Summary, Self::Findings, Self::WorkQueue, Self::Log];
+    pub const ALL: [Self; 5] = [
+        Self::Summary,
+        Self::Findings,
+        Self::WorkQueue,
+        Self::Verify,
+        Self::Log,
+    ];
 
     pub fn index(self) -> usize {
         match self {
             Self::Summary => 0,
             Self::Findings => 1,
             Self::WorkQueue => 2,
-            Self::Log => 3,
+            Self::Verify => 3,
+            Self::Log => 4,
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::Summary => "Issue Detail",
+            Self::Summary => "Summary",
             Self::Findings => "Findings",
             Self::WorkQueue => "Subtasks / Queue",
+            Self::Verify => "Verify",
             Self::Log => "Log",
         }
     }
@@ -1235,6 +1244,24 @@ fn project_archive_count_label(children: &ProjectChildren) -> String {
     }
 }
 
+fn issue_verify_line_count(issue: &Issue) -> usize {
+    let report_lines = issue
+        .result_report
+        .as_deref()
+        .map(str::lines)
+        .map(Iterator::count)
+        .unwrap_or(0);
+    report_lines.saturating_add(8).max(1)
+}
+
+fn archive_issue_limit() -> usize {
+    std::env::var("AUWSX_TUI_ARCHIVE_LIMIT")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(20)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectAgentConfig {
     arsenal_preset_name: String,
@@ -1741,6 +1768,10 @@ impl App {
             .unwrap_or(&[])
     }
 
+    pub fn archive_visible_limit(&self) -> usize {
+        archive_issue_limit()
+    }
+
     pub fn remote_config(&self, project_id: i64) -> Option<&ProjectRemoteConfig> {
         self.remote_configs.get(&project_id)
     }
@@ -1956,11 +1987,15 @@ impl App {
 
             rows.push(TreeRow {
                 item: TreeItem::ArchiveRoot(p.id),
-                label: format!("Archive   {}", kids.archived_issues.len()),
+                label: format!(
+                    "Archive   {}  latest {}",
+                    kids.archived_issues.len(),
+                    archive_issue_limit().min(kids.archived_issues.len())
+                ),
                 depth: 1,
             });
             if self.archive_expanded.contains(&p.id) {
-                for i in &kids.archived_issues {
+                for i in kids.archived_issues.iter().take(archive_issue_limit()) {
                     rows.push(TreeRow {
                         item: TreeItem::ArchivedIssue {
                             project_id: p.id,
@@ -2296,7 +2331,12 @@ impl App {
     }
 
     pub(crate) fn kanban_cards(&self) -> Vec<ui::vm::KanbanCard> {
-        ui::vm::kanban_cards_with_runs(self.backlog(), self.issues(), &self.recent_agent_runs)
+        ui::vm::kanban_cards_with_runs(
+            self.backlog(),
+            self.issues(),
+            &self.recent_agent_runs,
+            self.archive_visible_limit(),
+        )
     }
 
     fn kanban_items_for_lane(&self, lane_idx: usize) -> Vec<ui::vm::KanbanItem> {
@@ -2793,6 +2833,10 @@ impl App {
                 .len()
                 .saturating_add(self.detail.steering.len())
                 .saturating_add(3),
+            IssueDetailSection::Verify => self
+                .selected_issue()
+                .map(|issue| issue_verify_line_count(issue))
+                .unwrap_or(1),
             IssueDetailSection::Log => self.log_tail.lines().count().max(1),
         }
     }
@@ -4858,7 +4902,7 @@ mod tests {
 
         app.apply(Action::Up).await?;
 
-        assert_eq!(app.selected_issue_section(), IssueDetailSection::WorkQueue);
+        assert_eq!(app.selected_issue_section(), IssueDetailSection::Verify);
         assert_eq!(app.issue_log_scroll, 0);
         assert_eq!(app.issue_section_mode, IssueSectionMode::Selected);
         Ok(())
@@ -5941,7 +5985,7 @@ mod tests {
         let labels = rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>();
 
         assert!(labels.contains(&"Issues    1"));
-        assert!(labels.contains(&"Archive   1"));
+        assert!(labels.contains(&"Archive   1  latest 1"));
         assert!(rows.iter().any(|r| r.item
             == TreeItem::Issue {
                 project_id: 42,
@@ -5981,6 +6025,31 @@ mod tests {
                 project_id: 42,
                 id: 2
             }));
+    }
+
+    #[test]
+    fn given_large_archive_when_tree_rows_then_only_default_latest_limit_is_visible() {
+        let mut app = test_app();
+        app.projects = vec![test_project()];
+        app.expanded.insert(42);
+        app.archive_expanded.insert(42);
+        app.children.insert(
+            42,
+            ProjectChildren {
+                archived_issues: (1..=25)
+                    .map(|id| test_issue(id, IssueStatus::Done, &format!("archived {id}")))
+                    .collect(),
+                ..ProjectChildren::default()
+            },
+        );
+
+        let rows = app.tree_rows();
+        let archived_rows = rows
+            .iter()
+            .filter(|row| matches!(row.item, TreeItem::ArchivedIssue { .. }))
+            .count();
+
+        assert_eq!(archived_rows, 20);
     }
 
     #[test]
